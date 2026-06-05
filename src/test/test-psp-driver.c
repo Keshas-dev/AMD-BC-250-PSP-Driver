@@ -259,7 +259,7 @@ int main(int argc, char *argv[])
     }
 
     Log("=== AMD BC-250 PSP Driver Test Tool ===\n");
-    Log("Opening driver: %S\n", PSP_DEVICE_NAME);
+    Log("Opening driver: %ls\n", PSP_DEVICE_NAME);
 
     HANDLE h = OpenPspDriver();
     if (h == INVALID_HANDLE_VALUE) {

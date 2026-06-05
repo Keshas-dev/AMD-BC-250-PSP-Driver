@@ -76,15 +76,19 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     KdPrint(("Mailbox: Wrote command 0x%08X to C2PMSG_35\n", command));
 
     // Wait for C2PMSG_81 to change
-    for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
-        KeStallExecutionProcessor(1000);
-        statusReg = READ_REGISTER_ULONG(
-            (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
-        );
-        if (statusReg != initialStatus) {
-            KdPrint(("Mailbox: C2PMSG_81 changed: 0x%08X -> 0x%08X after %u ms\n",
-                initialStatus, statusReg, timeout));
-            return STATUS_SUCCESS;
+    {
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000LL;
+        for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            statusReg = READ_REGISTER_ULONG(
+                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
+            );
+            if (statusReg != initialStatus) {
+                KdPrint(("Mailbox: C2PMSG_81 changed: 0x%08X -> 0x%08X after %u ms\n",
+                    initialStatus, statusReg, timeout));
+                return STATUS_SUCCESS;
+            }
         }
     }
 
@@ -196,7 +200,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     switch (ioctlCode) {
         case IOCTL_PSP_INIT_HW:
         {
-            if (inputLength < sizeof(ULONG) * 2) {
+            if (inputLength < sizeof(PSP_INIT_HW_REQUEST)) {
                 status = STATUS_INVALID_PARAMETER;
                 break;
             }
@@ -207,10 +211,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 devExt->MmioSize = 0;
             }
 
-            PULONG params = (PULONG)inputBuffer;
+            PSP_INIT_HW_REQUEST* req = (PSP_INIT_HW_REQUEST*)inputBuffer;
             PHYSICAL_ADDRESS physAddr;
-            physAddr.QuadPart = params[0];
-            ULONG size = params[1];
+            physAddr.QuadPart = req->PhysicalAddress;
+            ULONG size = req->Size;
 
             devExt->MmioBase = MmMapIoSpace(physAddr, size, MmNonCached);
             if (devExt->MmioBase == NULL) {
@@ -238,7 +242,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PULONG params = (PULONG)inputBuffer;
             ULONG offset = params[0];
 
-            if (offset >= devExt->MmioSize) {
+            if (offset + sizeof(ULONG) > devExt->MmioSize || (offset & 0x3)) {
                 status = STATUS_ARRAY_BOUNDS_EXCEEDED;
                 break;
             }
@@ -265,7 +269,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             ULONG offset = params[0];
             ULONG value = params[1];
 
-            if (offset >= devExt->MmioSize) {
+            if (offset + sizeof(ULONG) > devExt->MmioSize || (offset & 0x3)) {
                 status = STATUS_ARRAY_BOUNDS_EXCEEDED;
                 break;
             }

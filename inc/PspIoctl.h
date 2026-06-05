@@ -51,7 +51,7 @@ typedef struct _PSP_WRITE_REG_RESPONSE {
 
 // For IOCTL_PSP_INIT_HW, input is physical address + size
 typedef struct _PSP_INIT_HW_REQUEST {
-    ULONG PhysicalAddress;     // Physical address of BAR0
+    ULONG64 PhysicalAddress;   // Physical address of BAR5
     ULONG Size;                // Size to map
 } PSP_INIT_HW_REQUEST, *PPSP_INIT_HW_REQUEST;
 
