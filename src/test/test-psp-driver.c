@@ -127,7 +127,7 @@ BOOL SendCommand(HANDLE hDevice, ULONG command)
     return ok;
 }
 
-BOOL InitHardware(HANDLE hDevice, ULONG physAddr, ULONG size)
+BOOL InitHardware(HANDLE hDevice, ULONG64 physAddr, ULONG size)
 {
     PSP_INIT_HW_REQUEST req = { physAddr, size };
     ULONG resp = 0;
