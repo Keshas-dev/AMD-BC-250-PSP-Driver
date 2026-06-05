@@ -1,5 +1,7 @@
 # AMD BC-250 PSP Windows Driver
 
+> "If you need a tool and nobody has built it yet, then build it yourself."
+
 Windows kernel-mode driver for AMD BC-250 Platform Security Processor (PSP) interface.
 
 ## Overview
