@@ -165,41 +165,94 @@ echo  SIGNING DRIVER (Test Certificate)
 echo ==========================================
 echo.
 
-if not exist "%PROJECT_DIR%%CERT_NAME%.cer" (
-    echo Creating test certificate...
-    if exist "%SIGNTOOLS%\makecert.exe" (
-        "%SIGNTOOLS%\makecert.exe" /r /pe /ss PrivateCertStore /n "CN=%CERT_NAME%" "%PROJECT_DIR%%CERT_NAME%.cer" >nul 2>&1
-        if exist "%PROJECT_DIR%%CERT_NAME%.cer" (
-            echo   Test certificate created
-        ) else (
-            echo   WARNING: Failed to create test certificate
+set "CERT_PATH=%PROJECT_DIR%\%CERT_NAME%.cer"
+set "PFX_PATH=%PROJECT_DIR%\%CERT_NAME%.pfx"
+
+if not exist "%CERT_PATH%" (
+    echo Creating test certificate for driver signing...
+    
+    :: Method 1: New-SelfSignedCertificate (PowerShell - modern Windows)
+    echo   Trying PowerShell New-SelfSignedCertificate...
+    powershell -Command "New-SelfSignedCertificate -Type Custom -Subject 'CN=%CERT_NAME%' -KeyUsage DigitalSignature -CertStoreLocation Cert:\\CurrentUser\\My -NotAfter (Get-Date).AddYears(10) -OutFile '%CERT_PATH%'" >nul 2>&1
+    
+    if not exist "%CERT_PATH%" (
+        :: Method 2: makecert (legacy WDK tool)
+        if exist "%SIGNTOOLS%\makecert.exe" (
+            echo   Trying makecert (legacy)...
+            "%SIGNTOOLS%\makecert.exe" /r /pe /ss PrivateCertStore /n "CN=%CERT_NAME%" "%CERT_PATH%" >nul 2>&1
         )
-    ) else (
-        echo   WARNING: makecert.exe not found, cannot create certificate
     )
+    
+    if exist "%CERT_PATH%" (
+        echo   Test certificate created: %CERT_NAME%
+    ) else (
+        echo   WARNING: Failed to create test certificate automatically.
+        echo            You can still use bcdedit /set testsigning on
+    )
+) else (
+    echo   Using existing certificate: %CERT_NAME%
+)
+
+:: --- Check if testsigning is enabled ---
+for /f "tokens=2* delims=" %%A in ('bcdedit /enum {current} ^| findstr "testsigning"') do (
+    echo   Test Signing: %%A
 )
 
 :: --- Sign driver ---
 if not "%SIGNTOOLS%"=="" (
+    echo.
     echo Signing PspDriver.sys...
-    "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s PrivateCertStore /n "%CERT_NAME%" ^
+    
+    :: Try with store certificate first
+    "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" ^
       "%OUTPUT_DIR%\PspDriver.sys" >nul 2>&1
+    
     if errorlevel 1 (
-        echo   WARNING: Driver signing failed (driver may not load without test signing)
-        echo   Make sure test signing is enabled: bcdedit /set testsigning on
+        :: Try with test certificate file
+        if exist "%CERT_PATH%" (
+            "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /f "%CERT_PATH%" ^
+              "%OUTPUT_DIR%\PspDriver.sys" >nul 2>&1
+        )
+    )
+    
+    if errorlevel 1 (
+        echo   WARNING: Driver signing failed!
+        echo   ----------------------------------------------------
+        echo   To load unsigned drivers, run as Administrator:
+        echo     bcdedit /set testsigning on
+        echo   Then REBOOT
+        echo   ----------------------------------------------------
     ) else (
         echo   Driver signed OK
+        
+        :: Verify signature
+        "%SIGNTOOLS%\signtool.exe" verify /pa "%OUTPUT_DIR%\PspDriver.sys" >nul 2>&1
+        if not errorlevel 1 (
+            echo   Signature verified
+        ) else (
+            echo   Signature verification failed (may still work in test mode)
+        )
     )
     
     if exist "%OUTPUT_DIR%\PspDriver.cat" (
         echo Signing catalog file...
-        "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s PrivateCertStore /n "%CERT_NAME%" ^
+        "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" ^
           "%OUTPUT_DIR%\PspDriver.cat" >nul 2>&1
+        if errorlevel 1 (
+            if exist "%CERT_PATH%" (
+                "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /f "%CERT_PATH%" ^
+                  "%OUTPUT_DIR%\PspDriver.cat" >nul 2>&1
+            )
+        )
         if not errorlevel 1 echo   Catalog signed OK
     )
 ) else (
-    echo WARNING: No signing tools found - driver is UNSIGNED
-    echo          Enable testsigning or sign manually before installation
+    echo WARNING: No signing tools found - driver is UNSIGNED!
+    echo ----------------------------------------------------
+    echo To load this driver, run as Administrator:
+    echo   bcdedit /set testsigning on
+    echo Then REBOOT
+    echo ----------------------------------------------------
 )
 
 echo.

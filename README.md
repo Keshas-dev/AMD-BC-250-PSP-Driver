@@ -27,9 +27,12 @@ This driver provides low-level access to the AMD BC-250 PSP hardware via:
 │   └── PspIoctl.h
 ├── inf/                 # Device installation files
 │   └── PspDriver.inf
-├── scripts/             # Build scripts
+├── scripts/             # Build + setup scripts
 │   ├── build.bat        # Driver build + sign
-│   └── compile-test.bat # Test tool compiler
+│   ├── compile-test.bat # Test tool compiler
+│   ├── enable-testsigning.cmd  # Enable Windows Test Mode
+│   ├── install-driver.cmd      # Install driver via pnputil
+│   └── uninstall-driver.cmd    # Remove driver
 ├── docs/                # Documentation
 │   ├── tikslas.txt      # Design specification (LT)
 │   └── AGENTS.md        # Developer notes
@@ -41,11 +44,30 @@ This driver provides low-level access to the AMD BC-250 PSP hardware via:
 
 - Visual Studio 2022 (with "Desktop development with C++" workload)
 - Windows 11 SDK + Windows Driver Kit (WDK)
-- Test signing enabled:
-  ```cmd
-  bcdedit /set testsigning on
-  ```
-  (Reboot required)
+- Test signing enabled (see [Signing Requirements](#signing-requirements))
+
+### Signing Requirements
+
+Windows 10/11 requires drivers to be **digitally signed** to load. This project uses test certificates for development.
+
+**Step 1: Enable Test Mode**
+```cmd
+scripts\enable-testsigning.cmd
+```
+Or manually (as Administrator):
+```cmd
+bcdedit /set testsigning on
+```
+**REBOOT required.** After reboot, you should see "Test Mode" watermark.
+
+**Step 2: Build + Sign**
+```cmd
+cd scripts
+build.bat
+```
+The build script automatically creates a test certificate and signs the driver. If signing fails, the driver can still be loaded with Test Mode enabled.
+
+**Production**: For production use, drivers must be WHQL-signed or have an EV certificate from Microsoft-approved CA.
 
 ## Building
 
@@ -67,11 +89,22 @@ Output: `output\test-psp-driver.exe`
 
 ## Installation
 
+**Option 1: Automated (pnputil)**
+```cmd
+scripts\install-driver.cmd
+```
+
+**Option 2: Manual via Device Manager**
 1. Build the driver (see above)
 2. Open Device Manager
 3. Find "AMD BC-250 PSP" device (or unknown device with PCI\VEN_1022&DEV_143E)
 4. Update Driver → Browse → `output\`
 5. Reboot if prompted
+
+**Uninstall:**
+```cmd
+scripts\uninstall-driver.cmd
+```
 
 ## Testing
 

@@ -6,12 +6,15 @@ This is a **new/separate project** for a PSP (Platform Security Processor) drive
 
 This directory contains:
 - `tikslas.txt` — design specification (in Lithuanian), the authoritative design document
-- `PspDriver.c` — KMDF driver source
-- `PspDriver.inf` — device installation file
-- `PspIoctl.h` — shared IOCTL definitions (driver + user-mode tools)
-- `test-psp-driver.c` — user-mode test tool
-- `build.bat` — compile + test-sign script
-- `compile-test.bat` — compile test tool script
+- `src/driver/PspDriver.c` — KMDF driver source
+- `inf/PspDriver.inf` — device installation file
+- `inc/PspIoctl.h` — shared IOCTL definitions (driver + user-mode tools)
+- `src/test/test-psp-driver.c` — user-mode test tool
+- `scripts/build.bat` — compile + test-sign script
+- `scripts/compile-test.bat` — compile test tool script
+- `scripts/enable-testsigning.cmd` — enable Windows Test Mode
+- `scripts/install-driver.cmd` — driver installer (pnputil)
+- `scripts/uninstall-driver.cmd` — driver remover
 
 ## Architecture
 
@@ -30,15 +33,38 @@ This directory contains:
 
 - Visual Studio 2022 with "Desktop development with C++"
 - Windows 11 SDK + Windows Driver Kit (WDK) with `ntddk.h` and WDF libraries
-- Build produces `PspDriver.sys` and `PspDriver.cat`
+- Test signing enabled (see below)
+- Build produces `PspDriver.sys`, `PspDriver.inf`, `PspDriver.cat`
 
-## Test Signing (Required)
+## Digital Signature (CRITICAL)
 
-Test machines must have test signing enabled or the driver will not load:
-```cmd
-bcdedit /set testsigning on
-```
-Reboot required.
+Windows 10/11 **requires** kernel drivers to be digitally signed. This project uses test signing for development.
+
+### Setup Steps (in order):
+
+1. **Enable Test Mode** (run as Administrator, then reboot):
+   ```cmd
+   scripts\enable-testsigning.cmd
+   ```
+   Or manually: `bcdedit /set testsigning on`
+
+2. **Build + Sign** (auto-generates test certificate):
+   ```cmd
+   cd scripts
+   build.bat
+   ```
+
+3. **Install**:
+   ```cmd
+   scripts\install-driver.cmd
+   ```
+
+### Signing Details
+
+- `build.bat` automatically creates a test certificate via PowerShell or makecert
+- If auto-signing fails, driver can still load with Test Mode enabled
+- Production drivers require WHQL certification or EV certificate from Microsoft-approved CA
+- **Never disable Secure Boot** if you need it for other security features
 
 ## Key Technical Details
 
