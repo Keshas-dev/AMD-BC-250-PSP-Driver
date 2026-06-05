@@ -1,100 +1,112 @@
 # Agent Notes: AMD BC-250 PSP Windows Driver
 
-## What This Repo Is
+## Repo Overview
 
-This is a **new/separate project** for a PSP (Platform Security Processor) driver for AMD BC-250. It is NOT the main GPU driver project. The mature GPU driver lives in the sibling directory `../AMD-BC-250-Windows-Driver-main`.
-
-This directory contains:
-- `tikslas.txt` — design specification (in Lithuanian), the authoritative design document
-- `src/driver/PspDriver.c` — KMDF driver source
-- `inf/PspDriver.inf` — device installation file
-- `inc/PspIoctl.h` — shared IOCTL definitions (driver + user-mode tools)
-- `src/test/test-psp-driver.c` — user-mode test tool
-- `scripts/build.bat` — compile + test-sign script
-- `scripts/compile-test.bat` — compile test tool script
-- `scripts/enable-testsigning.cmd` — enable Windows Test Mode
-- `scripts/install-driver.cmd` — driver installer (pnputil)
-- `scripts/uninstall-driver.cmd` — driver remover
+Separate PSP (Platform Security Processor) driver for AMD BC-250. NOT the main GPU driver — that lives in `../AMD-BC-250-Windows-Driver-main/`.
 
 ## Architecture
 
-- **Target hardware**: PCI device `VEN_1022&DEV_143E` (AMD PSP on BC-250)
-- **Driver type**: KMDF (Kernel-Mode Driver Framework), NOT WDM
-- **Interface**: IOCTL-based communication with user-mode test tools
-- **MMIO**: Maps BAR0 for register access, uses Mailbox registers (C2PMSG) for firmware loading
-- **Key source files**:
-  - `PspDriver.c` — KMDF driver (DriverEntry, EvtDeviceAdd, IOCTL dispatch)
-  - `PspDriver.inf` — Device installation file
-  - `PspIoctl.h` — Shared IOCTL codes and structures
-  - `test-psp-driver.c` — User-mode test tool
-  - `build.bat` — Compile + test-sign script
-
-## Build Requirements
-
-- Visual Studio 2022 with "Desktop development with C++"
-- Windows 11 SDK + Windows Driver Kit (WDK) with `ntddk.h` and WDF libraries
-- Test signing enabled (see below)
-- Build produces `PspDriver.sys`, `PspDriver.inf`, `PspDriver.cat`
-
-## Digital Signature (CRITICAL)
-
-Windows 10/11 **requires** kernel drivers to be digitally signed. This project uses test signing for development.
-
-### Setup Steps (in order):
-
-1. **Enable Test Mode** (run as Administrator, then reboot):
-   ```cmd
-   scripts\enable-testsigning.cmd
-   ```
-   Or manually: `bcdedit /set testsigning on`
-
-2. **Build + Sign** (auto-generates test certificate):
-   ```cmd
-   cd scripts
-   build.bat
-   ```
-
-3. **Install**:
-   ```cmd
-   scripts\install-driver.cmd
-   ```
-
-### Signing Details
-
-- `build.bat` automatically creates a test certificate via PowerShell or makecert
-- If auto-signing fails, driver can still load with Test Mode enabled
-- Production drivers require WHQL certification or EV certificate from Microsoft-approved CA
-- **Never disable Secure Boot** if you need it for other security features
-
-## Key Technical Details
-
-- **IOCTL codes** (defined in `PspIoctl.h`):
-  - `IOCTL_PSP_READ_REG` (0x800) — read BAR0 register
-  - `IOCTL_PSP_WRITE_REG` (0x801) — write BAR0 register
-  - `IOCTL_PSP_LOAD_FW` (0x802) — firmware load via Mailbox (fully implemented)
-- **Mailbox registers**: C2PMSG_35 (command, ~0x1056C), C2PMSG_36 (data, ~0x10570), C2PMSG_81 (status)
+- **Driver type**: **WDM** (native NT). NOT KMDF — KMDF caused Code 0x7e.
+- **Target**: PCI `VEN_1022&DEV_143E` (AMD PSP on BC-250)
+- **MMIO**: Maps **Graphics BAR5** (`0xFE800000`), NOT PSP BAR0. C2PMSG registers live in BAR5.
+- **IOCTL**: METHOD_BUFFERED, user-mode via `\\Device\\AmdBcPsp`
 - **Device symlink**: `\\DosDevices\\AmdBcPsp`
-- **User-mode access**: `\\Device\\AmdBcPsp`
 
-### Firmware Loading Flow (IOCTL_PSP_LOAD_FW)
+## Building
 
-1. User-mode sends firmware blob via `DeviceIoControl`
-2. Driver allocates contiguous physical memory (`MmAllocateContiguousMemory`, <4GB)
-3. Copies firmware blob to contiguous buffer
-4. Gets physical address (`MmGetPhysicalAddress`)
-5. Writes PA to C2PMSG_36 (data register)
-6. Writes command `0x1` to C2PMSG_35 (command register)
-7. Polls C2PMSG_81 status register for 10 seconds (1ms intervals)
-8. Returns status code to user-mode
-9. Cleans up allocated memory (`MmFreeContiguousMemory`)
+### Prerequisites
+- VS2022 (Community/Professional/Enterprise) + WDK 10.0.26100+ on any of C-H drives
+- `bcdedit /set testsigning on` + **Reboot** (must see "Test Mode" watermark)
+- **Secure Boot must be OFF** in BIOS. Test signing is blocked if Secure Boot is ON.
+- **Critical**: Use `AMD-BC250-Signer` certificate (from sibling project). It is pre-installed in Trusted Root store. Do NOT generate a new cert.
 
-## Reference Sibling Project
+### Build steps
+```cmd
+# Set VS environment
+call "E:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 
-For working build.bat patterns, signing scripts, IOCTL conventions, and hardware register access patterns, see:
-- `../AMD-BC-250-Windows-Driver-main/build.bat`
-- `../AMD-BC-250-Windows-Driver-main/src/kmd/`
-- `../AMD-BC-250-Windows-Driver-main/inc/`
+# Compile driver
+cl.exe /c /kernel /W3 /Zi /Od /DAMD64 /I"<WDK>\km" /I"<WDK>\km\crt" /I"<WDK>\shared" /Iinc /Fo:output\PspDriver.obj src\driver\PspDriver.c
+
+# Link (no WDF libs — WDM driver)
+link.exe /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /OUT:output\PspDriver.sys output\PspDriver.obj ntoskrnl.lib wdm.lib hal.lib ntstrsafe.lib BufferOverflowK.lib /LIBPATH:"<WDK>\km\x64"
+
+# Compile test tool
+cl.exe /W3 /Zi /O2 /DAMD64 /I"<SDK>\um" /I"<SDK>\shared" /I"<SDK>\ucrt" /Iinc src\test\test-psp-driver.c /Fe:output\test-psp-driver.exe /link /LIBPATH:"<SDK>\um\x64" /LIBPATH:"<SDK>\ucrt\x64"
+
+# Sign
+signtool sign /fd SHA256 /a /s My /n "AMD-BC250-Signer" output\PspDriver.sys
+
+# Generate INF catalog
+Inf2Cat /driver:output /os:10_x64
+signtool sign /fd SHA256 /a /s My /n "AMD-BC250-Signer" output\pspdriver.cat
+```
+
+## Installation & Testing
+
+### Uninstall old driver first (CRITICAL)
+Device Manager → find device → **Uninstall** → check "Delete the driver software for this device" → **Reboot**
+
+### Install
+Device Manager → Scan → unknown device → Update Driver → Browse → `output\`
+
+### Test sequence
+```cmd
+cd output
+test-psp-driver.exe -i 0xFE800000 0x200000   # Init BAR5 MMIO mapping
+test-psp-driver.exe -t                        # Connectivity test
+test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin  # FW load
+```
+
+## Known Hardware Facts (Verified)
+
+| Address | Register | Value | Meaning |
+|---------|----------|-------|---------|
+| MMIO `0xFE800000` | BAR5 base | — | Graphics BAR, C2PMSG mailbox lives here |
+| BAR5+`0x1056C` | **C2PMSG_35** | `0x00000000` | Command register (idle) |
+| BAR5+`0x10570` | **C2PMSG_36** | `0x00000000` | Data register (PA) |
+| BAR5+`0x10614` | **C2PMSG_81** | `0xF0000010` | PSP SOS status (alive and ready) |
+| BAR5+`0x2004` | **GRBM_STATUS** | `0xFFFFFFFF` | BLOCKED by NBIO firewall |
+| PSP BAR0 | B0:D8:F0 | `0xFD600000` | Native PSP BAR (not used by this driver) |
+
+## Firmware Loading (IOCTL_PSP_LOAD_FW)
+
+**Flow:**
+1. User sends firmware blob via DeviceIoControl
+2. Driver allocates contiguous memory (`MmAllocateContiguousMemory`, <4GB)
+3. Copies firmware blob, gets PA (`MmGetPhysicalAddress`)
+4. Writes PA to C2PMSG_36, command `0x1` to C2PMSG_35
+5. **Waits for C2PMSG_81 to CHANGE** (not just become non-zero — it starts at `0xF0000010`)
+6. Times out after 10s if unchanged
+
+**Critical bug fixed:** Original code checked `statusReg != 0` but C2PMSG_81 is already `0xF0000010` when SOS is alive, so the wait loop exited immediately. Fixed to check `statusReg != initialStatus`.
+
+**Current limitation:** GRBM_STATUS still returns `0xFFFFFFFF` after FW load. NBIO unlock needs intact SOS firmware with valid signature/CSUM, not a truncated file.
+
+## Signing
+
+- Use `AMD-BC250-Signer` cert already in Trusted Root store (from sibling project)
+- PFX at `../AMD-BC-250-Windows-Driver-main/testcert.pfx`
+- Do NOT create new certs — they won't be trusted by Windows
+- Self-signed certs must be added to `Cert:\CurrentUser\Root` store to pass `signtool verify /pa`
+
+## Common Errors
+
+| Code | Error | Fix |
+|------|-------|-----|
+| **Code 52** | Unsigned driver | Sign with AMD-BC250-Signer OR disable Secure Boot |
+| **0x7e** | KMDF init failed | Use WDM, not KMDF (no WDF libs in link) |
+| **Error 2** | Device not found | Driver not installed or not loaded |
+| **`0xFFFFFFFF` on GRBM** | NBIO firewall | Need proper SOS firmware to unlock |
+
+## Sibling Project Reference
+
+`../AMD-BC-250-Windows-Driver-main/` has working examples of:
+- Manual PCI config access patterns
+- NBIO register map (blocked/allowed regions)
+- IOCTL dispatch with WDM driver
+- PSP v11 initialization flow
 
 ## Source of Truth
 
-`tikslas.txt` contains the complete specification (in Lithuanian) including the driver C code skeleton, INF file template, and build.bat template. When implementing, treat it as the authoritative design document.
+`docs/tikslas.txt` — original spec in Lithuanian with driver skeleton code.
