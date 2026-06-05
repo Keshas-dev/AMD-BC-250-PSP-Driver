@@ -53,9 +53,13 @@ Device Manager → Scan → unknown device → Update Driver → Browse → `out
 ### Test sequence
 ```cmd
 cd output
-test-psp-driver.exe -i 0xFE800000 0x200000   # Init BAR5 MMIO mapping
-test-psp-driver.exe -t                        # Connectivity test
-test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin  # FW load
+test-psp-driver.exe -i 0xFE800000 0x200000                     # Init BAR5 MMIO
+test-psp-driver.exe -t                                          # Connectivity test
+test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin        # Load FW (persistent)
+test-psp-driver.exe -C 0x00000004                                # SYSDRV command
+test-psp-driver.exe -C 0x00000008                                # SOS command
+test-psp-driver.exe -t                                           # Check C2PMSG_81
+test-psp-driver.exe -r 0x2004                                    # GRBM_STATUS
 ```
 
 ## Known Hardware Facts (Verified)
@@ -69,19 +73,27 @@ test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin  # FW load
 | BAR5+`0x2004` | **GRBM_STATUS** | `0xFFFFFFFF` | BLOCKED by NBIO firewall |
 | PSP BAR0 | B0:D8:F0 | `0xFD600000` | Native PSP BAR (not used by this driver) |
 
-## Firmware Loading (IOCTL_PSP_LOAD_FW)
+## Firmware Loading (IOCTL_PSP_LOAD_FW + IOCTL_PSP_SEND_CMD)
 
-**Flow:**
-1. User sends firmware blob via DeviceIoControl
-2. Driver allocates contiguous memory (`MmAllocateContiguousMemory`, <4GB)
-3. Copies firmware blob, gets PA (`MmGetPhysicalAddress`)
-4. Writes PA to C2PMSG_36, command `0x1` to C2PMSG_35
-5. **Waits for C2PMSG_81 to CHANGE** (not just become non-zero — it starts at `0xF0000010`)
-6. Times out after 10s if unchanged
+The PSP boot on BC-250 requires TWO commands: `0x4` (SYSDRV) then `0x8` (SOS).
 
-**Critical bug fixed:** Original code checked `statusReg != 0` but C2PMSG_81 is already `0xF0000010` when SOS is alive, so the wait loop exited immediately. Fixed to check `statusReg != initialStatus`.
+### Key design decisions from sibling project (`amdbc250_psp_v11.c`):
+1. **PA >> 20 format** — C2PMSG_36 receives `PhysicalAddress >> 20` (1MB-aligned), NOT full PA
+2. **Persistent buffer** — firmware memory is NOT freed after LOAD_FW IOCTL. It stays allocated until DriverUnload, so subsequent `-C` commands reuse the same physical address
+3. **C2PMSG_36 re-written before each command** — PSP clears it after processing, so `-C` re-writes PA>>20 before writing command to C2PMSG_35
+4. **Wait for CHANGE** — polls C2PMSG_81 until value differs from initial (was `statusReg != 0` bug — C2PMSG_81 starts at `0xF0000010`)
 
-**Current limitation:** GRBM_STATUS still returns `0xFFFFFFFF` after FW load. NBIO unlock needs intact SOS firmware with valid signature/CSUM, not a truncated file.
+### PSP mailbox protocol (from Linux amdgpu analysis):
+```
+-f <fw.bin>:        Allocates → copies → stores PA>>20 → C2PMSG_36=PA>>20 → C2PMSG_35=0x1 → wait
+-C 0x00000004:      C2PMSG_36=PA>>20 → C2PMSG_35=0x4 (SYSDRV) → wait
+-C 0x00000008:      C2PMSG_36=PA>>20 → C2PMSG_35=0x8 (SOS) → wait
+```
+
+### NBIO unlock status (verified on real HW):
+- NBIO signature regs `0xC100/0xC180` = `0xFEDCBAEF`/`0xFEDCBADF` (already set)
+- MMHUB (0x5000+), GC (0x3000+), HDP (0x05A0+), DF, NBIO blocks = **readable/writable**
+- **GRBM/CP (0x2000-0x2FFF) = `0xFFFFFFFF`** — hardware-level PS5 NBIO restriction. NOT a driver bug.
 
 ## Signing
 
@@ -97,7 +109,8 @@ test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin  # FW load
 | **Code 52** | Unsigned driver | Sign with AMD-BC250-Signer OR disable Secure Boot |
 | **0x7e** | KMDF init failed | Use WDM, not KMDF (no WDF libs in link) |
 | **Error 2** | Device not found | Driver not installed or not loaded |
-| **`0xFFFFFFFF` on GRBM** | NBIO firewall | Need proper SOS firmware to unlock |
+| **Error 31** | NBIO unlock failed | MMHUB unchanged after sig write (already unlocked) |
+| **`0xFFFFFFFF` on GRBM** | NBIO firewall | Hardware-level PS5 restriction (GRBM/CP blocked) |
 
 ## Sibling Project Reference
 

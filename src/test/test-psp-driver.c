@@ -75,6 +75,58 @@ BOOL WriteRegister(HANDLE hDevice, ULONG offset, ULONG value)
     return ok;
 }
 
+BOOL UnlockNbio(HANDLE hDevice)
+{
+    ULONG resp[3] = {0};
+    DWORD returned = 0;
+
+    Log("NBIO_UNLOCK...\n");
+
+    BOOL ok = DeviceIoControl(
+        hDevice,
+        IOCTL_PSP_NBIO_UNLOCK,
+        NULL, 0,
+        &resp, sizeof(resp),
+        &returned,
+        NULL
+    );
+
+    if (ok) {
+        Log("NBIO unlock: SIG1=0x%08X SIG2=0x%08X MMHUB=0x%08X\n", resp[0], resp[1], resp[2]);
+        if (returned >= sizeof(ULONG) * 3) {
+            Log("(write values returned, not verification - try GRBM_STATUS check)\n");
+        }
+    } else {
+        Log("NBIO unlock FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
+BOOL SendCommand(HANDLE hDevice, ULONG command)
+{
+    DWORD returned = 0;
+    ULONG resp = 0;
+
+    Log("SEND_CMD(0x%08X)...\n", command);
+
+    BOOL ok = DeviceIoControl(
+        hDevice,
+        IOCTL_PSP_SEND_CMD,
+        &command, sizeof(command),
+        &resp, sizeof(resp),
+        &returned,
+        NULL
+    );
+
+    if (ok) {
+        Log("Command 0x%08X sent OK\n", resp);
+    } else {
+        Log("Command 0x%08X FAILED (err=%lu)\n", command, GetLastError());
+    }
+
+    return ok;
+}
+
 BOOL InitHardware(HANDLE hDevice, ULONG physAddr, ULONG size)
 {
     PSP_INIT_HW_REQUEST req = { physAddr, size };
@@ -167,16 +219,18 @@ void PrintUsage(const char *prog)
     printf("Options:\n");
     printf("  -r <offset>        Read register at offset (hex)\n");
     printf("  -w <offset> <val>  Write value to register at offset (hex)\n");
-    printf("  -i <phys> <size>   Init hardware (map BAR0 physical address and size)\n");
-    printf("  -f <file>          Load firmware file via Mailbox (C2PMSG_35/36/81)\n");
+    printf("  -i <phys> <size>   Init hardware (map BAR5 physical address and size)\n");
+    printf("  -f <file>          Load firmware file (persistent buffer, keeps allocated)\n");
+    printf("  -C <cmd>           Send mailbox command to PSP (uses loaded firmware PA)\n");
+    printf("  -u                 NBIO unlock (write signature registers)\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -l <logfile>       Write log to file\n");
     printf("\nExamples:\n");
-    printf("  %s -i 0xFE800000 0x100000     Init HW with BAR0 at 0xFE800000\n", prog);
+    printf("  %s -i 0xFE800000 0x100000     Init HW with BAR5 at 0xFE800000\n", prog);
     printf("  %s -r 0x1056C                  Read C2PMSG_35\n", prog);
+    printf("  %s -u                          NBIO unlock\n", prog);
     printf("  %s -m                          Read C2PMSG_81\n", prog);
-    printf("  %s -f fw.bin                   Load firmware\n", prog);
     printf("  %s -t                          Run connectivity test\n", prog);
 }
 
@@ -253,6 +307,19 @@ int main(int argc, char *argv[])
             ULONG physAddr = (ULONG)strtoul(argv[++i], NULL, 0);
             ULONG size = (ULONG)strtoul(argv[++i], NULL, 0);
             ok = InitHardware(h, physAddr, size);
+            if (!ok) {
+                ret = 1;
+            }
+        }
+        else if (strcmp(argv[i], "-C") == 0 && i + 1 < argc) {
+            ULONG cmd = (ULONG)strtoul(argv[++i], NULL, 0);
+            ok = SendCommand(h, cmd);
+            if (!ok) {
+                ret = 1;
+            }
+        }
+        else if (strcmp(argv[i], "-u") == 0) {
+            ok = UnlockNbio(h);
             if (!ok) {
                 ret = 1;
             }
