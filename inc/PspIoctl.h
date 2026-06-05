@@ -13,9 +13,10 @@ extern "C" {
 #define PSP_DEVICE_NAME    L"\\\\.\\AmdBcPsp"
 
 // IOCTL codes (must match driver definitions)
-#define IOCTL_PSP_READ_REG   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_PSP_WRITE_REG  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_PSP_LOAD_FW    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_READ_REG    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_WRITE_REG   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_LOAD_FW     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_INIT_HW     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
@@ -46,9 +47,15 @@ typedef struct _PSP_WRITE_REG_RESPONSE {
     ULONG Reserved;
 } PSP_WRITE_REG_RESPONSE, *PPSP_WRITE_REG_RESPONSE;
 
+// For IOCTL_PSP_INIT_HW, input is physical address + size
+typedef struct _PSP_INIT_HW_REQUEST {
+    ULONG PhysicalAddress;     // Physical address of BAR0
+    ULONG Size;                // Size to map
+} PSP_INIT_HW_REQUEST, *PPSP_INIT_HW_REQUEST;
+
 // For IOCTL_PSP_LOAD_FW, input buffer contains the firmware blob
 // Output buffer receives status
-#define PSP_MAX_FW_SIZE       (256 * 1024)  // 256KB max firmware size
+#define PSP_MAX_FW_SIZE       (512 * 1024)  // 512KB max firmware size
 
 typedef struct _PSP_LOAD_FW_RESPONSE {
     ULONG Status;           // NTSTATUS equivalent

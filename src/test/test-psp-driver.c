@@ -75,6 +75,32 @@ BOOL WriteRegister(HANDLE hDevice, ULONG offset, ULONG value)
     return ok;
 }
 
+BOOL InitHardware(HANDLE hDevice, ULONG physAddr, ULONG size)
+{
+    PSP_INIT_HW_REQUEST req = { physAddr, size };
+    ULONG resp = 0;
+    DWORD returned = 0;
+
+    Log("INIT_HW(PA=0x%08X, size=%u)...\n", physAddr, size);
+
+    BOOL ok = DeviceIoControl(
+        hDevice,
+        IOCTL_PSP_INIT_HW,
+        &req, sizeof(req),
+        &resp, sizeof(resp),
+        &returned,
+        NULL
+    );
+
+    if (ok) {
+        Log("Hardware initialized OK (VA=0x%08X)\n", resp);
+    } else {
+        Log("Hardware init FAILED (err=%lu)\n", GetLastError());
+    }
+
+    return ok;
+}
+
 BOOL LoadFirmware(HANDLE hDevice, const char* filename)
 {
     FILE* f = fopen(filename, "rb");
@@ -141,15 +167,17 @@ void PrintUsage(const char *prog)
     printf("Options:\n");
     printf("  -r <offset>        Read register at offset (hex)\n");
     printf("  -w <offset> <val>  Write value to register at offset (hex)\n");
+    printf("  -i <phys> <size>   Init hardware (map BAR0 physical address and size)\n");
     printf("  -f <file>          Load firmware file via Mailbox (C2PMSG_35/36/81)\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -l <logfile>       Write log to file\n");
     printf("\nExamples:\n");
-    printf("  %s -r 0x1056C     Read C2PMSG_35 (command register)\n", prog);
-    printf("  %s -m             Read C2PMSG_81 (status register)\n", prog);
-    printf("  %s -f fw.bin      Load firmware file\n", prog);
-    printf("  %s -t             Run connectivity test\n", prog);
+    printf("  %s -i 0xFE800000 0x100000     Init HW with BAR0 at 0xFE800000\n", prog);
+    printf("  %s -r 0x1056C                  Read C2PMSG_35\n", prog);
+    printf("  %s -m                          Read C2PMSG_81\n", prog);
+    printf("  %s -f fw.bin                   Load firmware\n", prog);
+    printf("  %s -t                          Run connectivity test\n", prog);
 }
 
 int main(int argc, char *argv[])
@@ -218,6 +246,14 @@ int main(int argc, char *argv[])
                 Log("OK\n");
             } else {
                 Log("FAILED (err=%lu)\n", GetLastError());
+                ret = 1;
+            }
+        }
+        else if (strcmp(argv[i], "-i") == 0 && i + 2 < argc) {
+            ULONG physAddr = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG size = (ULONG)strtoul(argv[++i], NULL, 0);
+            ok = InitHardware(h, physAddr, size);
+            if (!ok) {
                 ret = 1;
             }
         }
