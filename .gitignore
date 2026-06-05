@@ -1,0 +1,43 @@
+# Build artifacts
+*.obj
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.idb
+
+# Output directory
+/output/
+/build/
+/Debug/
+/Release/
+/x64/
+/x86/
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.user
+*.vcxproj.filters
+
+# Certificates
+*.cer
+*.pfx
+*.pvk
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

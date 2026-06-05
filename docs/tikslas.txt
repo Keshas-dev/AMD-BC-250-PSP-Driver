@@ -1,0 +1,262 @@
+I. Architektūrinis planas: Kaip veiks driveris?
+Šis driveris neturi bendrauti su „Windows“ grafine sistema (WDDM). Jis veiks kaip programinis tiltas:
+
+Branduolio lygmenyje (Kernel-mode, Ring 0): Driveris užgrobs įrenginio atminties regionus (BAR0/BAR1), gaus tiesioginę fizinę prieigą prie MMIO registrų ir valdys Mailbox (C2PMSG) registrus.
+
+Vartotojo lygmenyje (User-mode, Ring 3): Jūsų sukurta testavimo programa (pvz., test-psp-init.exe) siųs komandas driveriui per IOCTL (Input/Output Control) užklausas (pavyzdžiui: „įrašyk firmwarę“, „perskaityk registrą X“).
+
+II. Ko reikia darbui (Aparatūros ir kodo aplinka)
+Kad kompiliacija ir testavimas vyktų sklandžiai, jūsų sistemoje privalo būti:
+
+Visual Studio 2022 (su pasirinktu „Desktop development with C++“).
+
+Windows 11 SDK ir Windows Driver Kit (WDK) (kurie prideda ntddk.h ir WDF bibliotekas).
+
+Testavimo kompiuteryje įjungtas Test Mode (bcdedit /set testsigning on), nes jūsų sukurta tvarkyklė bus pasirašyta vietiniu (nesertifikuotu) parašu.
+
+III. Pilnas tvarkyklės kodo karkasas (PspDiagDriver.c)
+Štai paruoštas C kalbos kodas jūsų KMDF driveriui. Jis atlieka svarbiausius veiksmus: inicializuoja įrenginį, randa MMIO adresų erdvę (BAR) ir sukuria IOCTL sąsają bendravimui su vartotojo programa.
+
+C
+#include <ntddk.h>
+#include <wdf.h>
+
+// Apibrėžiame IOCTL kodus bendravimui su Ring 3 programa
+#define IOCTL_PSP_READ_REG   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_WRITE_REG  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_LOAD_FW    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Driverio konteksto struktūra (čia saugomi įrenginio duomenys)
+typedef struct _DEVICE_CONTEXT {
+    PVOID       MmioBase;       // Saugosime sumapintą BAR0 bazinį adresą
+    ULONG       MmioSize;       // BAR0 dydis
+} DEVICE_CONTEXT, *PDEVICE_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)
+
+// Funkcijų prototipai
+EVT_WDF_DRIVER_DEVICE_ADD EvtDeviceAdd;
+EVT_WDF_DEVICE_PREPARE_HARDWARE EvtDevicePrepareHardware;
+EVT_WDF_DEVICE_RELEASE_HARDWARE EvtDeviceReleaseHardware;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
+
+// Driverio įėjimo taškas (DriverEntry)
+NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath) {
+    WDF_DRIVER_CONFIG config;
+    NTSTATUS status;
+
+    KdPrint(("=== AMD BC-250 PSP Diag Driver: DriverEntry ===\n"));
+
+    WDF_DRIVER_CONFIG_INIT(&config, EvtDeviceAdd);
+    status = WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
+
+    return status;
+}
+
+// Iškviečiama, kai Windows randa PnP įrenginį (DEV_143E)
+NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _In_ PWDFDEVICE_INIT DeviceInit) {
+    UNREFERENCED_PARAMETER(Driver);
+    NTSTATUS status;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDFDEVICE device;
+    WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
+    WDF_IO_QUEUE_CONFIG queueConfig;
+    DECLARE_CONST_UNICODE_STRING(userModeName, L"\\Device\\AmdBcPspDiag");
+    DECLARE_CONST_UNICODE_STRING(symLinkName, L"\\DosDevices\\AmdBcPspDiag");
+
+    KdPrint(("=== EvtDeviceAdd: Įrenginys aptiktas ===\n"));
+
+    // Nastatome PnP (Plug and Play) iškvietas aparatūros alokacijai
+    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
+    pnpCallbacks.EvtDevicePrepareHardware = EvtDevicePrepareHardware;
+    pnpCallbacks.EvtDeviceReleaseHardware = EvtDeviceReleaseHardware;
+    WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpCallbacks);
+
+    // Sukuriame kontekstą įrenginio duomenims saugoti
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
+    status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
+    if (!NT_SUCCESS(status)) return status;
+
+    // Sukuriame simbolinę nuorodą, kad Ring 3 programa matytų driverį
+    status = WdfDeviceCreateSymbolicLink(device, &symLinkName);
+    if (!NT_SUCCESS(status)) return status;
+
+    // Sukuriame I/O eilę IOCTL užklausoms gaudyti
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
+    queueConfig.EvtIoDeviceControl = EvtIoDeviceControl;
+    status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+
+    return status;
+}
+
+// Ši funkcija ištraukia fizinius BAR adresus ir sumapina juos į Kernel atmintį
+NTSTATUS EvtDevicePrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesRaw, _In_ WDFCMRESLIST ResourcesTranslated) {
+    PDEVICE_CONTEXT ctx = DeviceGetContext(Device);
+    BOOLEAN foundMmio = FALSE;
+
+    UNREFERENCED_PARAMETER(ResourcesRaw);
+
+    for (ULONG i = 0; i < WdfCmResourceListGetCount(ResourcesTranslated); i++) {
+        PCM_PARTIAL_RESOURCE_DESCRIPTOR desc = WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
+        
+        if (desc->Type == CmResourceTypeMemory) {
+            // Radome BAR registrų sritį
+            ctx->MmioSize = desc->u.Memory.Length;
+            ctx->MmioBase = MmMapIoSpace(desc->u.Memory.Start, ctx->MmioSize, MmNonCached);
+            
+            if (ctx->MmioBase != NULL) {
+                foundMmio = TRUE;
+                KdPrint(("=== BAR0 Sumapintas sėkmingai! Bazė: %p, Dydis: %X ===\n", ctx->MmioBase, ctx->MmioSize));
+                break;
+            }
+        }
+    }
+
+    return foundMmio ? STATUS_SUCCESS : STATUS_DEVICE_CONFIGURATION_ERROR;
+}
+
+// Atlaisviname resursus, kai įrenginys stabdomas
+NTSTATUS EvtDeviceReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourcesTranslated) {
+    PDEVICE_CONTEXT ctx = DeviceGetContext(Device);
+    UNREFERENCED_PARAMETER(ResourcesTranslated);
+
+    if (ctx->MmioBase != NULL) {
+        MmUnmapIoSpace(ctx->MmioBase, ctx->MmioSize);
+        ctx->MmioBase = NULL;
+        KdPrint(("=== BAR0 resursai atlaisvinti ===\n"));
+    }
+    return STATUS_SUCCESS;
+}
+
+// IOCTL valdiklis: Čia vyksta registrų skaitymas/rašymas pagal užklausas iš test-psp-init.exe
+VOID EvtIoDeviceControl(_In_ WDFQUEUE Queue, _In_ WDFREQUEST Request, _In_ size_t OutputBufferLength, _In_ size_t InputBufferLength, _In_ ULONG IoControlCode) {
+    PDEVICE_CONTEXT ctx = DeviceGetContext(WdfIoQueueGetDevice(Queue));
+    NTSTATUS status = STATUS_SUCCESS;
+    size_t bytesReturned = 0;
+    PULONG buffer = NULL;
+
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(ULONG) * 2, (PVOID*)&buffer, NULL);
+    
+    if (NT_SUCCESS(status) && ctx->MmioBase != NULL) {
+        // buffer[0] - registro offsetas, buffer[1] - reikšmė (rašymui)
+        ULONG offset = buffer[0];
+
+        switch (IoControlCode) {
+            case IOCTL_PSP_READ_REG:
+                if (offset < ctx->MmioSize) {
+                    ULONG regVal = READ_REGISTER_ULONG((PULONG)((PUCHAR)ctx->MmioBase + offset));
+                    WdfRequestRetrieveOutputBuffer(Request, sizeof(ULONG), (PVOID*)&buffer, NULL);
+                    buffer[0] = regVal;
+                    bytesReturned = sizeof(ULONG);
+                } else {
+                    status = STATUS_ARRAY_BOUNDS_EXCEEDED;
+                }
+                break;
+
+            case IOCTL_PSP_WRITE_REG:
+                if (offset < ctx->MmioSize) {
+                    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)ctx->MmioBase + offset), buffer[1]);
+                    bytesReturned = sizeof(ULONG);
+                } else {
+                    status = STATUS_ARRAY_BOUNDS_EXCEEDED;
+                }
+                break;
+
+            case IOCTL_PSP_LOAD_FW:
+                // TODO: Čia bus integruota jūsų alokacijos ir Mailbox (C2PMSG_35) stūmimo logika
+                KdPrint(("=== IOCTL: Gauta komanda rankiniam FW krovimui ===\n"));
+                break;
+
+            default:
+                status = STATUS_INVALID_DEVICE_REQUEST;
+                break;
+        }
+    }
+
+    WdfRequestCompleteWithInformation(Request, status, bytesReturned);
+}
+IV. Konfigūracinis failas (PspDiagDriver.inf)
+Tam, kad „Windows“ suprastų, jog šis naujas driveris priklauso būtent jūsų BC-250 PSP įrenginiui, paruoškite šį .inf failą.
+
+Ini, TOML
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = PspDiagDriver.cat
+DriverVer   = 06/05/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = PspDiag_Device_Install, PCI\VEN_1022&DEV_143E&SUBSYS_00001022&REV_00
+
+[PspDiag_Device_Install.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+PspDiagDriver.sys
+
+[PspDiag_Device_Install.NT.Services]
+AddService = PspDiagDriver,%SPSVCINST_ASSOCSERVICE%,PspDiag_Service_Inst
+
+[PspDiag_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\PspDiagDriver.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "AMD BC-250 Custom Lab"
+DeviceDesc             = "AMD BC-250 PSP Hardware Diagnostic Interface"
+ServiceDesc            = "AMD BC-250 PSP Diagnostic Driver Service"
+V. Automatizuotas kompiliavimo skriptas (build.bat)
+Šis skriptas automatizuoja driverio kompiliavimą, katalogo sugeneravimą (.cat) ir pasirašymą testiniu sertifikatu, kad sistema neblokuotų diegimo.
+
+DOS
+@echo off
+echo ===================================================
+echo  Kompiliuojamas ir pasirašomas PSP Diag Driveris
+echo ===================================================
+
+:: Nustatykite teisingus kelius pagal savo VS2022 / WDK versiją
+set WDK_PATH=C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64
+
+echo [1] Generuojamas katalogo failas (.cat)...
+"%WDK_PATH%\inf2cat.exe" /driver:. /os:10_X64,11_X64
+
+echo [2] Sukuriamas vietinis bandomasis sertifikatas...
+"%WDK_PATH%\makecert.exe" /r /pe /ss PrivateCertStore /n "CN=PspDiagTestCert" PspDiagTestCert.cer
+
+echo [3] Tvarkyklė pasirašoma skaitmeniniu parašu...
+"%WDK_PATH%\signtool.exe" sign /s PrivateCertStore /n "PspDiagTestCert" /t http://timestamp.digicert.com PspDiagDriver.sys PspDiagDriver.cat
+
+echo.
+echo === DARBAS BAIGTAS. Driveris paruoštas diegimui! ===
+pause
+VI. Užduotis dirbtiniam intelektui (AI Prompt) darbo pratęsimui
+Nukopijuokite žemiau esantį tekstą ir pateikite jį savo inžineriniam AI modeliui, kad jis galėtų autonomiškai pratęsti kodo rašymą:
+
+Užduotis AI asistentui:
+„Aš pateikiu tau veikiantį KMDF diagnostinio driverio karkasą, skirtą įrenginiui PCI\VEN_1022&DEV_143E. Šiuo metu driveris jau sėkmingai atlieka BAR0 MMIO mapinimą ir priima pagrindines IOCTL užklausas.
+
+Tavo užduotis: Išplėsk case IOCTL_PSP_LOAD_FW: sekciją funkcijoje EvtIoDeviceControl. Reikia realizuoti šią logiką:
+
+Paimti iš User-mode perduotą cyan_skillfish2_sos.bin failo buferį.
+
+Panaudoti branduolio funkciją MmAllocateContiguousMemory (arba MDL alokaciją), kad sukurtum nepertraukiamą fizinės atminties bloką, į kurį nukopijuosi šį .bin blobą.
+
+Išgauti šio buferio fizinį adresą naudojant MmGetPhysicalAddress.
+
+Įrašyti gautą fizinį adresą į AMD PSP Mailbox duomenų registrą C2PMSG_36 (offsetas 0x10570 arba pagal tavo žinomą jūsų architektūros SMU specifikaciją).
+
+Įrašyti įkrovos komandos kodą (pvz., 0x1 arba įkrovos komandą) į komandų registrą C2PMSG_35 (offsetas 0x1056C), taip paleidžiant fizinį aparatūros Mailbox ciklą.
+
+Pridėti trumpą KeStallExecutionProcessor laukimo ciklą, kuris stebėtų statuso registrą C2PMSG_81, tikrinant, ar grąžinama reikšmė pasikeitė iš 0 į sėkmingo starto kodą. Žingsnis po žingsnio sugeneruok papildytą C kodą.“

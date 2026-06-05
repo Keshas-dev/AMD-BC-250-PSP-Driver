@@ -1,0 +1,38 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = PspDriver.cat
+DriverVer   = 06/05/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = Psp_Device_Install, PCI\VEN_1022&DEV_143E&SUBSYS_00001022&REV_00
+
+[Psp_Device_Install.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+PspDriver.sys
+
+[Psp_Device_Install.NT.Services]
+AddService = PspDriver,%SPSVCINST_ASSOCSERVICE%,Psp_Service_Inst
+
+[Psp_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\PspDriver.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "AMD BC-250 Custom Lab"
+DeviceDesc             = "AMD BC-250 PSP Driver Interface"
+ServiceDesc            = "AMD BC-250 PSP Driver Service"
