@@ -2,7 +2,7 @@
 
 ## Ką darėme
 
-Sukūrėme Windows WDM branduolio tvarkyklę AMD BC-250 (PS5 Oberon) Platform Security Processor (PSP) valdymui. Tikslas: tiesioginė prieiga prie PSP MMIO registrų per BAR5, mailbox (C2PMSG) registrų skaitymas/rašymas, firmware įkėlimas, ir NBIO apsaugos atrakinimas.
+Sukūrėme Windows WDM branduolio tvarkyklę **ASRock AMD BC-250** plokštės PSP (Platform Security Processor) valdymui. Procesorius: AMD Oberon (tas pats lustas kaip PS5, bet kitoks BIOS — ASRock `BC250_3.00_CHIPSETMENU.ROM`). Tikslas: tiesioginė prieiga prie PSP MMIO registrų per Graphics BAR5, C2PMSG mailbox registrų skaitymas/rašymas, PSP firmware įkėlimas per mailbox protokolą, ir NBIO apsaugos analizė.
 
 Pilnas kelias nuo tuščio .txt failo iki veikiančio draiverio su pilnu IOCTL interfeisu.
 
@@ -113,7 +113,7 @@ Amdbc250PspBootloaderLoadSos();     // C2PMSG_36 = PA>>20, C2PMSG_35 = 0x8
 
 **Problema:** Net ir po sėkmingo firmware įkėlimo ir abiejų komandų (0x4 + 0x8), GRBM_STATUS (0x2004) visada grąžina `0xFFFFFFFF`.
 
-**Analizė:** Sibling projekto README aiškiai dokumentuoja, kad PS5 NBIO yra **selektyvinis**:
+**Analizė:** Sibling projekto README dokumentuoja, kad BC-250 NBIO yra **selektyvinis** (ASRock BIOS nustatymuose NBIO firewall aktyvus — tai ne PS5 specifika, o paties Oberon lusto NBIO elgesys su ASRock BIOS konfigūracija):
 - Leidžia: GPU_ID, HDP, GC (0x3000+), MMHUB (0x5000+), DF, NBIO registrus
 - Blokuoja: GRBM (0x2004), CP (0x2000-0x2FFF), CLK, Scratch, SDMA, RSMU
 
