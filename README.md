@@ -109,41 +109,58 @@ scripts\uninstall-driver.cmd
 ## Testing
 
 ```cmd
-# Read mailbox command register
-output\test-psp-driver.exe -r 0x1056C
+# Hardware init (map BAR5 MMIO at 0xFE800000, 2MB)
+output\test-psp-driver.exe -i 0xFE800000 0x200000
 
-# Read mailbox status register
-output\test-psp-driver.exe -m
-
-# Run connectivity test
+# Connectivity test (reads C2PMSG mailbox registers)
 output\test-psp-driver.exe -t
 
-# Write value to register
-output\test-psp-driver.exe -w 0x1056C 0x1
+# Load firmware (persistent buffer, not freed after load)
+output\test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin
+
+# Two-stage PSP boot sequence (from sibling project PSP v11 code)
+output\test-psp-driver.exe -C 0x00000004      # SYSDRV command
+output\test-psp-driver.exe -C 0x00000008      # SOS command
+
+# Check GRBM_STATUS after firmware load
+output\test-psp-driver.exe -r 0x2004
+
+# Read any register
+output\test-psp-driver.exe -r 0xC100           # NBIO signature reg 1
+output\test-psp-driver.exe -r 0x50D0           # MMHUB register
+output\test-psp-driver.exe -w 0x1056C 0x1      # Write to register
+
+# Quick help
+output\test-psp-driver.exe
 ```
 
 ## IOCTL Interface
 
 See `inc/PspIoctl.h` for full definitions:
 
-- `IOCTL_PSP_READ_REG` (0x800) - Read BAR0 register
-- `IOCTL_PSP_WRITE_REG` (0x801) - Write BAR0 register  
-- `IOCTL_PSP_LOAD_FW` (0x802) - Load firmware via Mailbox
+| IOCTL | Code | Description |
+|-------|------|-------------|
+| `PSP_INIT_HW` | 0x803 | Map BAR5 MMIO (physical address + size) |
+| `PSP_READ_REG` | 0x800 | Read register at offset |
+| `PSP_WRITE_REG` | 0x801 | Write value to register |
+| `PSP_LOAD_FW` | 0x802 | Load firmware blob (persistent buffer) |
+| `PSP_SEND_CMD` | 0x805 | Send mailbox command (0x4=SYSDRV, 0x8=SOS) |
+| `PSP_NBIO_UNLOCK` | 0x804 | Write NBIO signature registers |
 
 ## Architecture
 
 ```
-User Mode                    Kernel Mode
------------                  -------------
+User Mode                    Kernel Mode (WDM)
+-----------                  -----------------
 test-psp-driver.exe  ---->   PspDriver.sys
-DeviceIoControl              ├─ DriverEntry
-                             ├─ EvtDeviceAdd (PnP)
-                             ├─ EvtDevicePrepareHardware (BAR0 map)
+DeviceIoControl              ├─ DriverEntry (IoCreateDevice)
                              ├─ IOCTL dispatch
-                             │   ├─ READ_REG
-                             │   ├─ WRITE_REG
-                             │   └─ LOAD_FW (Mailbox C2PMSG)
-                             └─ EvtDeviceReleaseHardware
+                             │   ├─ INIT_HW (MmMapIoSpace BAR5 0xFE800000)
+                             │   ├─ READ_REG / WRITE_REG
+                             │   ├─ LOAD_FW (persistent contiguous buffer)
+                             │   ├─ SEND_CMD (PSP mailbox C2PMSG_35/36)
+                             │   └─ NBIO_UNLOCK
+                             └─ DriverUnload (free buffer + MMIO)
 ```
 
 ## Related Projects

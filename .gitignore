@@ -38,6 +38,9 @@
 .vscode/
 .idea/
 
+# Firmware files (large binaries)
+/Firmware/
+
 # OS
 .DS_Store
 Thumbs.db
