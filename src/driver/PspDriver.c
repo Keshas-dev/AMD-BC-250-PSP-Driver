@@ -48,25 +48,20 @@ static BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
     if (FirmwareData == NULL || FirmwareSize < 256)
         return FALSE;
 
-    // Validate firmware header: first 4 bytes should be the total size
-    ULONG headerSize = *(volatile ULONG*)FirmwareData;
-    if (headerSize == 0 || headerSize > FirmwareSize + 256)
-        return FALSE;
-    if (headerSize > 256 * 1024)
-        return FALSE;
-
-    // Verify size range
+    // Check firmware is non-empty and within reasonable size range
     if (FirmwareSize < 1024 || FirmwareSize > 512 * 1024)
         return FALSE;
 
-    // Check signature bytes near the end of actual data
-    ULONG checkOffset = headerSize > 256 ? headerSize - 256 : 0;
-    if (checkOffset > 0 && checkOffset < FirmwareSize) {
-        ULONG sig = *(volatile ULONG*)(FirmwareData + checkOffset);
-        KdPrint(("FW validation: headerSize=%u sig@0x%X=0x%08X\n",
-            headerSize, checkOffset, sig));
-    }
+    // Check firmware is not all zeros or all FFs
+    ULONG sampleStart = *(volatile ULONG*)FirmwareData;
+    ULONG sampleMid = *(volatile ULONG*)(FirmwareData + FirmwareSize / 2);
+    if (sampleStart == 0 && sampleMid == 0)
+        return FALSE;
+    if (sampleStart == 0xFFFFFFFF && sampleMid == 0xFFFFFFFF)
+        return FALSE;
 
+    KdPrint(("FW validation: size=%u first=0x%08X mid=0x%08X -> OK\n",
+        FirmwareSize, sampleStart, sampleMid));
     return TRUE;
 }
 
