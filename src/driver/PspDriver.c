@@ -577,6 +577,51 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
 
+        case IOCTL_PSP_BOOT_SEQUENCE:
+        {
+            NTSTATUS stepStatus;
+            ULONG results[4] = {0};
+
+            // Step 1: Load embedded firmware
+            PspFreeFirmware(devExt);
+            {
+                PHYSICAL_ADDRESS highAddr;
+                highAddr.QuadPart = 0xFFFFFFFF;
+                devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
+                if (devExt->FwBuffer == NULL) {
+                    KdPrint(("BOOT_SEQ: Alloc failed\n"));
+                    status = STATUS_INSUFFICIENT_RESOURCES;
+                    break;
+                }
+                RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
+                devExt->FwSize = g_SosFirmwareSize;
+                devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
+                devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
+            }
+            results[0] = devExt->FwPaShifted;
+
+            // Step 2: Send SYSDRV command (0x4)
+            stepStatus = PspSendMailboxCommand(devExt, 0x00000004);
+            results[1] = NT_SUCCESS(stepStatus) ? 1 : 0;
+
+            // Step 3: Send SOS command (0x8)
+            stepStatus = PspSendMailboxCommand(devExt, 0x00000008);
+            results[2] = NT_SUCCESS(stepStatus) ? 1 : 0;
+
+            // Step 4: Read GRBM
+            results[3] = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
+
+            KdPrint(("BOOT_SEQ: FW=%d SYSDRV=%d SOS=%d GRBM=0x%08X\n",
+                results[0] != 0, results[1], results[2], results[3]));
+
+            if (outputLength >= sizeof(results)) {
+                RtlCopyMemory(outputBuffer, results, sizeof(results));
+                bytesReturned = sizeof(results);
+            }
+            status = STATUS_SUCCESS;  /* Always succeed - user checks GRBM in results */
+            break;
+        }
+
         default:
             status = STATUS_INVALID_DEVICE_REQUEST;
             break;

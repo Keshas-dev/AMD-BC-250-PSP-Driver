@@ -168,6 +168,27 @@ BOOL GetPspStatus(HANDLE hDevice)
     return ok;
 }
 
+BOOL BootSequence(HANDLE hDevice)
+{
+    ULONG results[4] = {0};
+    DWORD returned = 0;
+
+    Log("BOOT_SEQUENCE (embedded FW + SYSDRV + SOS)...\n");
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_BOOT_SEQUENCE,
+        NULL, 0, results, sizeof(results), &returned, NULL);
+
+    if (ok && returned >= sizeof(results)) {
+        Log("  FW PA>>20      = 0x%08X\n", results[0]);
+        Log("  SYSDRV (0x4)   = %s\n", results[1] ? "SENT" : "FAIL");
+        Log("  SOS    (0x8)   = %s\n", results[2] ? "SENT" : "FAIL");
+        Log("  GRBM_STATUS    = 0x%08X%s\n", results[3],
+            (results[3] != 0xFFFFFFFF) ? " *** NBIO UNLOCKED ***" : " (BLOCKED)");
+    } else {
+        Log("BOOT_SEQUENCE FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
 BOOL LoadEmbeddedFirmware(HANDLE hDevice)
 {
     DWORD returned = 0;
@@ -311,6 +332,7 @@ void PrintUsage(const char *prog)
     printf("  -U                 NBIO unlock via ring (uses ring to send command)\n");
     printf("  -s                 PSP status snapshot (comprehensive driver + HW state)\n");
     printf("  -E                 Load embedded firmware (compiled into driver)\n");
+    printf("  -B                 Full boot sequence (embedded FW + SYSDRV 0x4 + SOS 0x8)\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -l <logfile>       Write log to file\n");
@@ -420,6 +442,10 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "-s") == 0) {
             ok = GetPspStatus(h);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-B") == 0) {
+            ok = BootSequence(h);
             if (!ok) { ret = 1; }
         }
         else if (strcmp(argv[i], "-E") == 0) {
