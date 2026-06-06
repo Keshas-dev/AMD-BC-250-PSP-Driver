@@ -238,7 +238,8 @@ BOOL InitHardware(HANDLE hDevice, ULONG64 physAddr, ULONG size)
     ULONG resp = 0;
     DWORD returned = 0;
 
-    Log("INIT_HW(PA=0x%08X, size=%u)...\n", physAddr, size);
+    // FIX #8: Use correct format specifier for 64-bit physical address
+    Log("INIT_HW(PA=0x%016llX, size=%u)...\n", physAddr, size);
 
     BOOL ok = DeviceIoControl(
         hDevice,

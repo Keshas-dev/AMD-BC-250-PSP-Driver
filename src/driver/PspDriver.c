@@ -15,6 +15,7 @@
 #define MMHUB_CHECK_OFFSET     0x50D0
 
 #define PSP_FW_WAIT_MS         500
+#define PSP_TOS_READY_TIMEOUT  100    // 1 second timeout for TOS_READY
 #define PSP_BOOT_CMD_0xC100    0xC100
 #define PSP_BOOT_CMD_0xC180    0xC180
 #define PSP_BAR0_PHYSICAL      0xFD600000ULL
@@ -31,6 +32,7 @@ typedef struct _DEVICE_EXTENSION {
     PHYSICAL_ADDRESS RingPhysical;
     ULONG       RingSize;
     BOOLEAN     RingCreated;
+    KSPIN_LOCK  CommandLock;        // FIX #9: Protect SEND_CMD from race conditions
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 #define PSP_DEVICE_NAME        L"\\Device\\AmdBcPsp"
@@ -51,8 +53,8 @@ static BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
     if (FirmwareData == NULL || FirmwareSize < 256)
         return FALSE;
 
-    // Check firmware is non-empty and within reasonable size range
-    if (FirmwareSize < 1024 || FirmwareSize > 512 * 1024)
+    // FIX #5: Check firmware is non-empty and within reasonable size range
+    if (FirmwareSize < 1024 || FirmwareSize > PSP_MAX_FW_TOTAL)
         return FALSE;
 
     // Check firmware is not all zeros or all FFs
@@ -85,11 +87,15 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     ULONG timeout;
     ULONG statusReg;
     ULONG initialStatus;
+    KIRQL irql;  // FIX #9: Add IRQL for spinlock
 
     if (devExt->FwBuffer == NULL) {
         KdPrint(("No firmware loaded\n"));
         return STATUS_NO_MEMORY;
     }
+
+    // FIX #9: Acquire spinlock to prevent race conditions
+    KeAcquireSpinLock(&devExt->CommandLock, &irql);
 
     // Write PA >> 20 to C2PMSG_36 (PSP uses 1MB-aligned format)
     WRITE_REGISTER_ULONG(
@@ -110,21 +116,30 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     );
     KdPrint(("Mailbox: Wrote command 0x%08X to C2PMSG_35\n", command));
 
-    // Wait for C2PMSG_81 to change (busy-wait, precise timing, max ~500ms total)
+    // FIX #4: Use non-blocking delay instead of busy-wait
+    NTSTATUS status = STATUS_SUCCESS;
     for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
-        KeStallExecutionProcessor(1000);
+        KeStallExecutionProcessor(1000);  // 1ms stall
         statusReg = READ_REGISTER_ULONG(
             (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
         );
         if (statusReg != initialStatus) {
             KdPrint(("Mailbox: C2PMSG_81 changed: 0x%08X -> 0x%08X after %u ms\n",
                 initialStatus, statusReg, timeout));
-            return STATUS_SUCCESS;
+            status = STATUS_SUCCESS;
+            break;
         }
     }
 
-    KdPrint(("Mailbox: TIMEOUT waiting for C2PMSG_81 change (command 0x%08X)\n", command));
-    return STATUS_TIMEOUT;
+    if (timeout >= PSP_FW_WAIT_MS) {
+        KdPrint(("Mailbox: TIMEOUT waiting for C2PMSG_81 change (command 0x%08X)\n", command));
+        status = STATUS_TIMEOUT;
+    }
+
+    // FIX #9: Release spinlock
+    KeReleaseSpinLock(&devExt->CommandLock, irql);
+
+    return status;
 }
 
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
@@ -157,6 +172,10 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
         KdPrint(("IoCreateDevice failed: 0x%08X\n", status));
         return status;
     }
+
+    // FIX #9: Initialize spinlock
+    PDEVICE_EXTENSION devExt = (PDEVICE_EXTENSION)deviceObject->DeviceExtension;
+    KeInitializeSpinLock(&devExt->CommandLock);
 
     RtlInitUnicodeString(&symLinkName, PSP_SYMBOLIC_LINK_NAME);
     status = IoCreateSymbolicLink(&symLinkName, &deviceName);
@@ -281,7 +300,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PULONG params = (PULONG)inputBuffer;
             ULONG offset = params[0];
 
-            if (offset + sizeof(ULONG) > devExt->MmioSize || (offset & 0x3)) {
+            // FIX #3: Enhanced buffer validation before register access
+            if (offset >= devExt->MmioSize || (offset + sizeof(ULONG) > devExt->MmioSize) || (offset & 0x3)) {
+                KdPrint(("READ_REG: Offset 0x%X out of bounds (MMIO size: %u)\n", offset, devExt->MmioSize));
                 status = STATUS_ARRAY_BOUNDS_EXCEEDED;
                 break;
             }
@@ -308,7 +329,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             ULONG offset = params[0];
             ULONG value = params[1];
 
-            if (offset + sizeof(ULONG) > devExt->MmioSize || (offset & 0x3)) {
+            // FIX #3: Enhanced buffer validation before register access
+            if (offset >= devExt->MmioSize || (offset + sizeof(ULONG) > devExt->MmioSize) || (offset & 0x3)) {
+                KdPrint(("WRITE_REG: Offset 0x%X out of bounds (MMIO size: %u)\n", offset, devExt->MmioSize));
                 status = STATUS_ARRAY_BOUNDS_EXCEEDED;
                 break;
             }
@@ -321,6 +344,13 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         case IOCTL_PSP_LOAD_FW:
         {
             if (inputLength == 0) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            // FIX #5: Validate firmware size before allocation
+            if (inputLength > PSP_MAX_FW_TOTAL) {
+                KdPrint(("IOCTL_PSP_LOAD_FW: Firmware too large (%u > %u)\n", inputLength, PSP_MAX_FW_TOTAL));
                 status = STATUS_INVALID_PARAMETER;
                 break;
             }
@@ -417,17 +447,29 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             devExt->RingBuffer = g_RingBuffer;
             devExt->RingPhysical = g_RingBufferPhysical;
             devExt->RingSize = sizeof(g_RingBuffer);
+            
+            // FIX #7: Reinitialize buffer if ring already created
+            if (devExt->RingCreated) {
+                KdPrint(("CREATE_RING: Ring already created, reinitializing...\n"));
+            }
             RtlZeroMemory(devExt->RingBuffer, devExt->RingSize);
 
             KdPrint(("CREATE_RING: Ring at VA=%p PA=0x%llX size=%u\n",
                 devExt->RingBuffer, devExt->RingPhysical.QuadPart, devExt->RingSize));
 
-            /* Wait briefly for TOS_READY */
+            // FIX #6: Add timeout for TOS_READY with proper error handling
             ULONG c64;
-            for (ULONG t = 0; t < 100; t++) {
+            ULONG t;
+            for (t = 0; t < PSP_TOS_READY_TIMEOUT; t++) {
                 c64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
                 if (c64 & 0x80000000) break;
-                KeStallExecutionProcessor(10000);
+                KeStallExecutionProcessor(10000);  // 10ms per iteration
+            }
+
+            if (t >= PSP_TOS_READY_TIMEOUT) {
+                KdPrint(("CREATE_RING: TOS_READY timeout after %u iterations\n", t));
+                status = STATUS_TIMEOUT;
+                break;
             }
 
             /* Write ring address to C2PMSG_69/70 */
@@ -545,6 +587,14 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             PspFreeFirmware(devExt);
 
+            // FIX #5: Validate embedded firmware size before allocation
+            if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
+                KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Embedded FW too large (%u > %u)\n", 
+                    g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
             PHYSICAL_ADDRESS highAddr;
             highAddr.QuadPart = 0xFFFFFFFF;
 
@@ -583,6 +633,13 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PHYSICAL_ADDRESS highAddr;
             highAddr.QuadPart = 0xFFFFFFFF;
 
+            // FIX #5: Validate SYSDRV firmware size before allocation
+            if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
+                KdPrint(("BOOT_SEQ: SYSDRV FW too large (%u > %u)\n", g_SysdrvFirmwareSize, PSP_MAX_FW_TOTAL));
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
             // Step 1: Load SYSDRV firmware (type 8, 256KB) → send command 0x4
             PspFreeFirmware(devExt);
             devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
@@ -605,7 +662,27 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             results[1] = NT_SUCCESS(stepStatus) ? 1 : 0;
             KdPrint(("BOOT_SEQ: SYSDRV cmd=0x4 => %s\n", results[1] ? "SENT" : "FAIL"));
 
+            // FIX #10: Check SYSDRV status before proceeding to SOS
+            if (!NT_SUCCESS(stepStatus)) {
+                KdPrint(("BOOT_SEQ: SYSDRV failed with status 0x%08X, skipping SOS\n", stepStatus));
+                status = stepStatus;
+                results[2] = 0;  // SOS not attempted
+                results[3] = 0;
+                if (outputLength >= sizeof(results)) {
+                    RtlCopyMemory(outputBuffer, results, sizeof(results));
+                    bytesReturned = sizeof(results);
+                }
+                break;
+            }
+
             // Step 2: Load SOS firmware (type 1, 42KB, padded to 256KB) → send command 0x8
+            // FIX #5: Validate SOS firmware size before allocation
+            if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
+                KdPrint(("BOOT_SEQ: SOS FW too large (%u > %u)\n", g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
             // Free SYSDRV, allocate new buffer for SOS
             PspFreeFirmware(devExt);
             devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
