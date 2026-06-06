@@ -80,7 +80,7 @@ typedef struct _PSP_INIT_HW_REQUEST {
 
 // For IOCTL_PSP_LOAD_FW, input buffer contains the firmware blob
 // Output buffer receives status
-#define PSP_MAX_FW_SIZE       (512 * 1024)  // 512KB max firmware size
+#define PSP_MAX_FW_SIZE       (1024 * 1024) // 1MB max firmware size
 
 typedef struct _PSP_LOAD_FW_RESPONSE {
     ULONG Status;           // NTSTATUS equivalent
