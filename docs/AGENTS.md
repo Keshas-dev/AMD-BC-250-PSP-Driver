@@ -75,21 +75,31 @@ test-psp-driver.exe -r 0x2004                                    # GRBM_STATUS
 | BAR5+`0x2004` | **GRBM_STATUS** | `0xFFFFFFFF` | BLOCKED by NBIO firewall |
 | PSP BAR0 | B0:D8:F0 | `0xFD600000` | Native PSP BAR (not used by this driver) |
 
-## Firmware Loading (IOCTL_PSP_LOAD_FW + IOCTL_PSP_SEND_CMD)
+## Firmware Loading
 
-The PSP boot on BC-250 requires TWO commands: `0x4` (SYSDRV) then `0x8` (SOS).
+The PSP boot on BC-250 requires TWO separate firmware files with correct commands:
+- `0x4` → **SYSDRV** (type 8, 256KB from BIOS 0x8FF000)
+- `0x8` → **SOS** (type 1, 42KB from BIOS 0x8E0400, padded to 256KB)
 
-### Key design decisions from sibling project (`amdbc250_psp_v11.c`):
-1. **PA >> 20 format** — C2PMSG_36 receives `PhysicalAddress >> 20` (1MB-aligned), NOT full PA
-2. **Persistent buffer** — firmware memory is NOT freed after LOAD_FW IOCTL. It stays allocated until DriverUnload, so subsequent `-C` commands reuse the same physical address
-3. **C2PMSG_36 re-written before each command** — PSP clears it after processing, so `-C` re-writes PA>>20 before writing command to C2PMSG_35
-4. **Wait for CHANGE** — polls C2PMSG_81 until value differs from initial (was `statusReg != 0` bug — C2PMSG_81 starts at `0xF0000010`)
+CRITICAL: PSP rejects the command if the wrong firmware type is sent. The `-B` boot sequence handles this automatically.
 
-### PSP mailbox protocol (from Linux amdgpu analysis):
+### $PSP BIOS Table (BC250_3.00_CHIPSETMENU.ROM at offset 0x8E0000):
+| Entry | PSP Type | Size | ROM Offset | Purpose |
+|-------|----------|------|------------|---------|
+| 0 | **1** | 42 KB | 0x8E0400 | **SOS firmware** |
+| 1 | **8** | 256 KB | 0x8FF000 | **SYSDRV firmware** |
+| 2 | 18 | 256 KB | 0x93F700 | Other module |
+| 5 | 49 | 48 KB | 0x99FC00 | Other module |
+
+### Embedded firmware arrays (firmware_data.h):
+- `g_SysdrvFirmwareData` — 256KB, type 8, used for 0x4 command
+- `g_SosFirmwareData` — 42KB, type 1, used for 0x8 command
+
+### -B boot sequence flow:
 ```
--f <fw.bin>:        Allocates → copies → stores PA>>20 → C2PMSG_36=PA>>20 → C2PMSG_35=0x1 → wait
--C 0x00000004:      C2PMSG_36=PA>>20 → C2PMSG_35=0x4 (SYSDRV) → wait
--C 0x00000008:      C2PMSG_36=PA>>20 → C2PMSG_35=0x8 (SOS) → wait
+1. Allocate → copy SYSDRV → C2PMSG_36=PA>>20 → C2PMSG_35=0x4 → wait
+2. Free → allocate 256KB → copy SOS (zeros-padded) → C2PMSG_36=PA>>20 → C2PMSG_35=0x8 → wait
+3. Read GRBM_STATUS
 ```
 
 ## PSP Ring Buffer (+ IOCTL_PSP_CREATE_RING + IOCTL_PSP_NBIO_VIA_RING)

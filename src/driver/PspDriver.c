@@ -14,7 +14,10 @@
 #define NBIO_SIG2_VALUE        0xFEDCBADF
 #define MMHUB_CHECK_OFFSET     0x50D0
 
-#define PSP_FW_WAIT_MS         10000
+#define PSP_FW_WAIT_MS         500
+#define PSP_BOOT_CMD_0xC100    0xC100
+#define PSP_BOOT_CMD_0xC180    0xC180
+#define PSP_BAR0_PHYSICAL      0xFD600000ULL
 
 // Device context stored in device extension
 typedef struct _DEVICE_EXTENSION {
@@ -107,20 +110,16 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     );
     KdPrint(("Mailbox: Wrote command 0x%08X to C2PMSG_35\n", command));
 
-    // Wait for C2PMSG_81 to change
-    {
-        LARGE_INTEGER delay;
-        delay.QuadPart = -10000LL;
-        for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
-            KeDelayExecutionThread(KernelMode, FALSE, &delay);
-            statusReg = READ_REGISTER_ULONG(
-                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
-            );
-            if (statusReg != initialStatus) {
-                KdPrint(("Mailbox: C2PMSG_81 changed: 0x%08X -> 0x%08X after %u ms\n",
-                    initialStatus, statusReg, timeout));
-                return STATUS_SUCCESS;
-            }
+    // Wait for C2PMSG_81 to change (busy-wait, precise timing, max ~500ms total)
+    for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
+        KeStallExecutionProcessor(1000);
+        statusReg = READ_REGISTER_ULONG(
+            (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
+        );
+        if (statusReg != initialStatus) {
+            KdPrint(("Mailbox: C2PMSG_81 changed: 0x%08X -> 0x%08X after %u ms\n",
+                initialStatus, statusReg, timeout));
+            return STATUS_SUCCESS;
         }
     }
 
@@ -581,32 +580,53 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         {
             NTSTATUS stepStatus;
             ULONG results[4] = {0};
+            PHYSICAL_ADDRESS highAddr;
+            highAddr.QuadPart = 0xFFFFFFFF;
 
-            // Step 1: Load embedded firmware
+            // Step 1: Load SYSDRV firmware (type 8, 256KB) → send command 0x4
             PspFreeFirmware(devExt);
-            {
-                PHYSICAL_ADDRESS highAddr;
-                highAddr.QuadPart = 0xFFFFFFFF;
-                devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
-                if (devExt->FwBuffer == NULL) {
-                    KdPrint(("BOOT_SEQ: Alloc failed\n"));
-                    status = STATUS_INSUFFICIENT_RESOURCES;
-                    break;
-                }
-                RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
-                devExt->FwSize = g_SosFirmwareSize;
-                devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
-                devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            if (devExt->FwBuffer == NULL) {
+                KdPrint(("BOOT_SEQ: SYSDRV alloc failed\n"));
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
             }
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
+            devExt->FwSize = g_SysdrvFirmwareSize;
+            devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
+            devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
             results[0] = devExt->FwPaShifted;
 
-            // Step 2: Send SYSDRV command (0x4)
+            KdPrint(("BOOT_SEQ: SYSDRV loaded PA=0x%llX PA>>20=0x%08X\n",
+                devExt->FwPhysical.QuadPart, devExt->FwPaShifted));
+
+            // Send SYSDRV command (0x4) to PSP
             stepStatus = PspSendMailboxCommand(devExt, 0x00000004);
             results[1] = NT_SUCCESS(stepStatus) ? 1 : 0;
+            KdPrint(("BOOT_SEQ: SYSDRV cmd=0x4 => %s\n", results[1] ? "SENT" : "FAIL"));
 
-            // Step 3: Send SOS command (0x8)
+            // Step 2: Load SOS firmware (type 1, 42KB, padded to 256KB) → send command 0x8
+            // Free SYSDRV, allocate new buffer for SOS
+            PspFreeFirmware(devExt);
+            devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
+            if (devExt->FwBuffer == NULL) {
+                KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            RtlZeroMemory(devExt->FwBuffer, 262144);
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
+            devExt->FwSize = 262144;
+            devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
+            devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
+
+            KdPrint(("BOOT_SEQ: SOS loaded PA=0x%llX PA>>20=0x%08X\n",
+                devExt->FwPhysical.QuadPart, devExt->FwPaShifted));
+
+            // Send SOS command (0x8) to PSP
             stepStatus = PspSendMailboxCommand(devExt, 0x00000008);
             results[2] = NT_SUCCESS(stepStatus) ? 1 : 0;
+            KdPrint(("BOOT_SEQ: SOS cmd=0x8 => %s\n", results[2] ? "SENT" : "FAIL"));
 
             // Step 4: Read GRBM
             results[3] = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
