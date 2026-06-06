@@ -640,7 +640,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 break;
             }
 
-            // Step 1: Load SYSDRV firmware (type 8, 256KB) → send command 0x4
+            // Step 1: Load SYSDRV firmware (type 8, 256KB) -> send command 0x4
             PspFreeFirmware(devExt);
             devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
             if (devExt->FwBuffer == NULL) {
@@ -675,7 +675,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 break;
             }
 
-            // Step 2: Load SOS firmware (type 1, 42KB, padded to 256KB) → send command 0x8
+            // Step 2: Load SOS firmware (type 1, 42KB, padded to 256KB) -> send command 0x8
             // FIX #5: Validate SOS firmware size before allocation
             if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
                 KdPrint(("BOOT_SEQ: SOS FW too large (%u > %u)\n", g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
