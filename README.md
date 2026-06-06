@@ -176,7 +176,7 @@ DeviceIoControl              ├─ DriverEntry (IoCreateDevice)
 
 ## Related Projects
 
-- [AMD BC-250 Windows GPU Driver](../AMD-BC-250-Windows-Driver-main) - Main GPU driver project
+- [AMD BC-250 Windows GPU Driver](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver) - Main GPU driver project
 
 ## License
 
