@@ -1,6 +1,13 @@
 # AMD BC-250 PSP Windows Driver
 
-Windows kernel-mode driver for AMD BC-250 Platform Security Processor (PSP) interface.
+> "If you need a tool and nobody has built it yet, then build it yourself."
+
+Windows kernel-mode (WDM) diagnostic driver for the AMD BC-250 Platform Security Processor (PSP).
+Companion to the [AMD BC-250 GPU Driver](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver).
+
+This driver provides low-level PSP access required by the GPU driver for NBIO firewall management,
+firmware loading, and hardware register diagnostics on the ASRock BC-250 platform (AMD Oberon SoC).
+Designed to coexist alongside the GPU driver — both use the same certificate and signing infrastructure.
 
 ## Overview
 
@@ -146,6 +153,10 @@ See `inc/PspIoctl.h` for full definitions:
 | `PSP_LOAD_FW` | 0x802 | Load firmware blob (persistent buffer) |
 | `PSP_SEND_CMD` | 0x805 | Send mailbox command (0x4=SYSDRV, 0x8=SOS) |
 | `PSP_NBIO_UNLOCK` | 0x804 | Write NBIO signature registers |
+| `PSP_CREATE_RING` | 0x806 | Create PSP ring buffer (C2PMSG_69/70/71/64) |
+| `PSP_NBIO_VIA_RING` | 0x807 | NBIO unlock via ring command (0x00020000) |
+| `PSP_GET_STATUS` | 0x808 | Comprehensive PSP status snapshot |
+| `PSP_LOAD_EMBEDDED_FW` | 0x809 | Load compiled-in firmware (no .bin needed) |
 
 ## Architecture
 

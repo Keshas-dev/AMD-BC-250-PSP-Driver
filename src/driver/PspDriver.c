@@ -1,5 +1,6 @@
 #include <ntddk.h>
 #include "PspIoctl.h"
+#include "firmware_data.h"
 
 // PSP Mailbox register offsets (BAR5-relative)
 #define PSP_C2PMSG_35_OFFSET  0x1056C
@@ -41,6 +42,33 @@ DRIVER_DISPATCH PspDeviceControl;
 static UCHAR g_RingBuffer[0x1000];
 static BOOLEAN g_RingBufferInitialized = FALSE;
 static PHYSICAL_ADDRESS g_RingBufferPhysical;
+
+static BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
+{
+    if (FirmwareData == NULL || FirmwareSize < 256)
+        return FALSE;
+
+    // Validate firmware header: first 4 bytes should be the total size
+    ULONG headerSize = *(volatile ULONG*)FirmwareData;
+    if (headerSize == 0 || headerSize > FirmwareSize + 256)
+        return FALSE;
+    if (headerSize > 256 * 1024)
+        return FALSE;
+
+    // Verify size range
+    if (FirmwareSize < 1024 || FirmwareSize > 512 * 1024)
+        return FALSE;
+
+    // Check signature bytes near the end of actual data
+    ULONG checkOffset = headerSize > 256 ? headerSize - 256 : 0;
+    if (checkOffset > 0 && checkOffset < FirmwareSize) {
+        ULONG sig = *(volatile ULONG*)(FirmwareData + checkOffset);
+        KdPrint(("FW validation: headerSize=%u sig@0x%X=0x%08X\n",
+            headerSize, checkOffset, sig));
+    }
+
+    return TRUE;
+}
 
 static VOID PspFreeFirmware(PDEVICE_EXTENSION devExt)
 {
@@ -474,6 +502,83 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 bytesReturned = sizeof(ULONG) * 3;
             }
             status = (grbm != 0xFFFFFFFF) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        case IOCTL_PSP_GET_STATUS:
+        {
+            if (outputLength < sizeof(PSP_STATUS_INFO)) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            PSP_STATUS_INFO* info = (PSP_STATUS_INFO*)outputBuffer;
+            RtlZeroMemory(info, sizeof(PSP_STATUS_INFO));
+
+            // Mailbox status
+            info->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
+            info->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
+            info->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET));
+            info->PspAlive = (info->C2PMSG_81 != 0 && info->C2PMSG_81 != 0xFFFFFFFF) ? 1 : 0;
+
+            // Firmware info
+            info->FwLoaded = (devExt->FwBuffer != NULL) ? 1 : 0;
+            info->FwSize = devExt->FwSize;
+            info->FwPaShifted = devExt->FwPaShifted;
+
+            // NBIO status
+            info->NbioSig1 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET));
+            info->NbioSig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
+            info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
+            info->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
+
+            // MMIO and ring info
+            info->MmioVA = (ULONG)(ULONG_PTR)devExt->MmioBase;
+            info->MmioSize = devExt->MmioSize;
+            info->RingCreated = devExt->RingCreated ? 1 : 0;
+
+            bytesReturned = sizeof(PSP_STATUS_INFO);
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        case IOCTL_PSP_LOAD_EMBEDDED_FW:
+        {
+            if (outputLength < sizeof(ULONG)) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            PspFreeFirmware(devExt);
+
+            PHYSICAL_ADDRESS highAddr;
+            highAddr.QuadPart = 0xFFFFFFFF;
+
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
+            if (devExt->FwBuffer == NULL) {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Failed to allocate\n"));
+                break;
+            }
+
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
+            devExt->FwSize = g_SosFirmwareSize;
+            devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
+            devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
+
+            if (!PspValidateFirmware((PUCHAR)devExt->FwBuffer, devExt->FwSize)) {
+                KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Validation FAILED\n"));
+                PspFreeFirmware(devExt);
+                status = STATUS_IMAGE_CHECKSUM_MISMATCH;
+                break;
+            }
+
+            KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Embedded FW loaded PA=0x%llX PA>>20=0x%08X size=%u\n",
+                devExt->FwPhysical.QuadPart, devExt->FwPaShifted, devExt->FwSize));
+
+            ((PULONG)outputBuffer)[0] = devExt->FwPaShifted;
+            bytesReturned = sizeof(ULONG);
+            status = STATUS_SUCCESS;
             break;
         }
 

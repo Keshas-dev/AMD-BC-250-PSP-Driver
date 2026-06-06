@@ -19,8 +19,10 @@ extern "C" {
 #define IOCTL_PSP_INIT_HW     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_NBIO_UNLOCK CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_SEND_CMD    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_PSP_CREATE_RING CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_PSP_NBIO_VIA_RING CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_CREATE_RING      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_NBIO_VIA_RING     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_GET_STATUS        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_LOAD_EMBEDDED_FW  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
@@ -50,6 +52,24 @@ typedef struct _PSP_WRITE_REG_RESPONSE {
     ULONG Status;           // NTSTATUS equivalent (0 = success)
     ULONG Reserved;
 } PSP_WRITE_REG_RESPONSE, *PPSP_WRITE_REG_RESPONSE;
+
+// For IOCTL_PSP_GET_STATUS, output is comprehensive PSP snapshot
+typedef struct _PSP_STATUS_INFO {
+    ULONG C2PMSG_81;           // Raw C2PMSG_81 value
+    ULONG C2PMSG_35;           // Raw C2PMSG_35 value
+    ULONG C2PMSG_36;           // Raw C2PMSG_36 value
+    ULONG PspAlive;            // 1 if C2PMSG_81 is valid (not 0, not 0xFFFFFFFF)
+    ULONG FwLoaded;            // 1 if firmware buffer active
+    ULONG FwSize;              // Firmware size in bytes
+    ULONG FwPaShifted;         // PA>>20 of firmware buffer
+    ULONG NbioSig1;            // NBIO signature register 0xC100
+    ULONG NbioSig2;            // NBIO signature register 0xC180
+    ULONG GrbmStatus;          // GRBM_STATUS (0x2004)
+    ULONG MmhubCheck;          // MMHUB check register (0x50D0)
+    ULONG MmioVA;              // BAR5 virtual address
+    ULONG MmioSize;            // BAR5 mapped size
+    ULONG RingCreated;         // 1 if PSP ring is active
+} PSP_STATUS_INFO, *PPSP_STATUS_INFO;
 
 // For IOCTL_PSP_INIT_HW, input is physical address + size
 typedef struct _PSP_INIT_HW_REQUEST {

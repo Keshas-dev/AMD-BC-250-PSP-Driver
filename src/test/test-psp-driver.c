@@ -144,6 +144,48 @@ BOOL NbioViaRing(HANDLE hDevice)
     return ok;
 }
 
+BOOL GetPspStatus(HANDLE hDevice)
+{
+    PSP_STATUS_INFO info = {0};
+    DWORD returned = 0;
+
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_GET_STATUS,
+        NULL, 0, &info, sizeof(info), &returned, NULL);
+
+    if (ok && returned >= sizeof(PSP_STATUS_INFO)) {
+        Log("=== PSP STATUS ===\n");
+        Log("  C2PMSG_81=0x%08X  C2PMSG_35=0x%08X  C2PMSG_36=0x%08X\n", info.C2PMSG_81, info.C2PMSG_35, info.C2PMSG_36);
+        Log("  PSP Alive: %s\n", info.PspAlive ? "YES" : "NO");
+        Log("  FW Loaded: %s (%u bytes, PA>>20=0x%08X)\n", info.FwLoaded ? "YES" : "NO", info.FwSize, info.FwPaShifted);
+        Log("  NBIO SIG1=0x%08X SIG2=0x%08X\n", info.NbioSig1, info.NbioSig2);
+        Log("  GRBM_STATUS=0x%08X%s\n", info.GrbmStatus,
+            (info.GrbmStatus != 0xFFFFFFFF) ? " *** UNLOCKED ***" : " (BLOCKED)");
+        Log("  MMHUB=0x%08X  MMIO VA=0x%08X  Size=%u\n", info.MmhubCheck, info.MmioVA, info.MmioSize);
+        Log("  Ring Created: %s\n", info.RingCreated ? "YES" : "NO");
+    } else {
+        Log("GET_STATUS FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
+BOOL LoadEmbeddedFirmware(HANDLE hDevice)
+{
+    DWORD returned = 0;
+    ULONG resp = 0;
+
+    Log("LOAD_EMBEDDED_FW...\n");
+
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_LOAD_EMBEDDED_FW,
+        NULL, 0, &resp, sizeof(resp), &returned, NULL);
+
+    if (ok) {
+        Log("Embedded FW loaded: PA>>20=0x%08X\n", resp);
+    } else {
+        Log("LOAD_EMBEDDED_FW FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
 BOOL SendCommand(HANDLE hDevice, ULONG command)
 {
     DWORD returned = 0;
@@ -267,6 +309,8 @@ void PrintUsage(const char *prog)
     printf("  -u                 NBIO unlock (write signature registers)\n");
     printf("  -R                 Create PSP ring (allocates ring buffer, programs regs)\n");
     printf("  -U                 NBIO unlock via ring (uses ring to send command)\n");
+    printf("  -s                 PSP status snapshot (comprehensive driver + HW state)\n");
+    printf("  -E                 Load embedded firmware (compiled into driver)\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -l <logfile>       Write log to file\n");
@@ -372,6 +416,14 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "-U") == 0) {
             ok = NbioViaRing(h);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-s") == 0) {
+            ok = GetPspStatus(h);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-E") == 0) {
+            ok = LoadEmbeddedFirmware(h);
             if (!ok) { ret = 1; }
         }
         else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
