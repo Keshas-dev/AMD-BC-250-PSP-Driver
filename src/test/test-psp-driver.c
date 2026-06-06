@@ -102,6 +102,48 @@ BOOL UnlockNbio(HANDLE hDevice)
     return ok;
 }
 
+BOOL CreateRing(HANDLE hDevice)
+{
+    ULONG resp[2] = {0};
+    DWORD returned = 0;
+
+    Log("CREATE_RING...\n");
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_CREATE_RING,
+        NULL, 0, &resp, sizeof(resp), &returned, NULL);
+
+    if (ok && returned >= sizeof(ULONG) * 2) {
+        Log("Ring created: PA=0x%08X C2PMSG_64=0x%08X%s\n",
+            resp[0], resp[1],
+            (resp[1] & 0x80000000) ? " TOS_RESPONSE" : "");
+    } else if (ok) {
+        Log("Ring created (partial response)\n");
+    } else {
+        Log("CREATE_RING FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
+BOOL NbioViaRing(HANDLE hDevice)
+{
+    ULONG resp[3] = {0};
+    DWORD returned = 0;
+
+    Log("NBIO_VIA_RING...\n");
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_NBIO_VIA_RING,
+        NULL, 0, &resp, sizeof(resp), &returned, NULL);
+
+    if (ok && returned >= sizeof(ULONG) * 3) {
+        Log("MMHUB=0x%08X GRBM=0x%08X ringCreated=%u%s\n",
+            resp[0], resp[1], resp[2],
+            (resp[1] != 0xFFFFFFFF) ? " *** NBIO UNLOCKED ***" : "");
+    } else if (ok) {
+        Log("NBIO via ring (partial response)\n");
+    } else {
+        Log("NBIO_VIA_RING FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
 BOOL SendCommand(HANDLE hDevice, ULONG command)
 {
     DWORD returned = 0;
@@ -223,6 +265,8 @@ void PrintUsage(const char *prog)
     printf("  -f <file>          Load firmware file (persistent buffer, keeps allocated)\n");
     printf("  -C <cmd>           Send mailbox command to PSP (uses loaded firmware PA)\n");
     printf("  -u                 NBIO unlock (write signature registers)\n");
+    printf("  -R                 Create PSP ring (allocates ring buffer, programs regs)\n");
+    printf("  -U                 NBIO unlock via ring (uses ring to send command)\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -l <logfile>       Write log to file\n");
@@ -320,9 +364,15 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "-u") == 0) {
             ok = UnlockNbio(h);
-            if (!ok) {
-                ret = 1;
-            }
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-R") == 0) {
+            ok = CreateRing(h);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-U") == 0) {
+            ok = NbioViaRing(h);
+            if (!ok) { ret = 1; }
         }
         else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             const char* filename = argv[++i];

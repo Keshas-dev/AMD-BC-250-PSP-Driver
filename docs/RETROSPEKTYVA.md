@@ -132,6 +132,8 @@ Mūsų testai patvirtino — visi "leidžiami" registrai veikia, visi "blokuojam
 | PSP komandų siuntimas | `SEND_CMD` (0x805) | ✅ Veikia |
 | NBIO signature rašymas | `NBIO_UNLOCK` (0x804) | ✅ Veikia |
 | C2PMSG mailbox skaitymas | `-m` / `-t` | ✅ Veikia |
+| PSP ring kūrimas | `CREATE_RING` (0x806) | ✅ Veikia |
+| NBIO per ring komandą | `NBIO_VIA_RING` (0x807) | ✅ Veikia |
 | GC/MMHUB/HDP/DF registrai | `-r <offset>` | ✅ Veikia |
 | GRBM/CP registrai | `-r <offset>` | ❌ HW blokas |
 
@@ -143,15 +145,15 @@ User Mode                          Kernel Mode (WDM)
 test-psp-driver.exe               PspDriver.sys
 ├─ -i 0xFE800000 0x200000  ──→    MmMapIoSpace (BAR5)
 ├─ -f sos.bin              ──→    MmAllocateContiguousMemory (PERSISTENT)
-│                                 C2PMSG_36 = PA>>20
-│                                 C2PMSG_35 = 0x1
-│                                 wait C2PMSG_81 change
+│                                 (no command sent, user sends via -C)
 ├─ -C 0x00000004 (SYSDRV)  ──→    C2PMSG_36 = PA>>20 (re-write)
-│                                 C2PMSG_35 = 0x4
-│                                 wait C2PMSG_81 change
+│                                 C2PMSG_35 = 0x4 → wait C2PMSG_81 change
 ├─ -C 0x00000008 (SOS)     ──→    C2PMSG_36 = PA>>20 (re-write)
-│                                 C2PMSG_35 = 0x8
-│                                 wait C2PMSG_81 change
+│                                 C2PMSG_35 = 0x8 → wait C2PMSG_81 change
+├─ -R (PSP Ring)           ──→    C2PMSG_69/70 = Ring PA, C2PMSG_71 = 4KB
+│                                 C2PMSG_64 = 0 (trigger)
+├─ -U (NBIO via Ring)      ──→    Ring[0] = 0x00020000 → C2PMSG_67 wptr
+│                                 Also: NBIO sig regs 0xC100/0xC180
 ├─ -t                      ──→    Read C2PMSG_35/36/81
 ├─ -r 0x2004               ──→    READ_REGISTER_ULONG (0xFFFFFFFF)
 └─ DriverUnload                     MmFreeContiguousMemory
@@ -165,6 +167,8 @@ Sukūrėme pilnai veikiančią WDM tvarkyklę su:
 - Persistent firmware buffer'iu PSP mailbox protokolui
 - Dviejų etapų PSP boot seka (SYSDRV 0x4 + SOS 0x8)
 - Teisingu C2PMSG_81 laukimo ciklu (tikrina pokytį, ne nulį)
+- PSP ring buffer'iu (4KB) su C2PMSG_64/67/69/70/71 programavimu
+- NBIO atrakinimu per ring komandą (0x00020000) + signature registrus
 - Signing'u su tuo pačiu sertifikatu kaip sibling projektas
 
 GRBM/CP registrų blokavimas yra aparatinis PS5 NBIO apribojimas — patvirtintas ir sibling projekto dokumentacijoje.

@@ -23,6 +23,10 @@ typedef struct _DEVICE_EXTENSION {
     PHYSICAL_ADDRESS FwPhysical;    // Physical address of firmware buffer
     ULONG       FwSize;             // Firmware size in bytes
     ULONG       FwPaShifted;        // PA >> 20 (1MB-aligned format for PSP)
+    PVOID       RingBuffer;         // PSP ring buffer
+    PHYSICAL_ADDRESS RingPhysical;
+    ULONG       RingSize;
+    BOOLEAN     RingCreated;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 #define PSP_DEVICE_NAME        L"\\Device\\AmdBcPsp"
@@ -32,6 +36,11 @@ DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD DriverUnload;
 DRIVER_DISPATCH PspCreateClose;
 DRIVER_DISPATCH PspDeviceControl;
+
+/* Static 4KB ring buffer - one physical page, always contiguous */
+static UCHAR g_RingBuffer[0x1000];
+static BOOLEAN g_RingBufferInitialized = FALSE;
+static PHYSICAL_ADDRESS g_RingBufferPhysical;
 
 static VOID PspFreeFirmware(PDEVICE_EXTENSION devExt)
 {
@@ -225,6 +234,14 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             devExt->MmioSize = size;
             KdPrint(("MMIO mapped: PA=0x%llX VA=%p size=%u\n", physAddr.QuadPart, devExt->MmioBase, size));
+
+            /* Initialize global ring buffer physical address (once) */
+            if (!g_RingBufferInitialized) {
+                g_RingBufferPhysical = MmGetPhysicalAddress(g_RingBuffer);
+                g_RingBufferInitialized = TRUE;
+                KdPrint(("Ring buffer at PA=0x%llX\n", g_RingBufferPhysical.QuadPart));
+            }
+
             bytesReturned = sizeof(ULONG);
             if (outputLength >= sizeof(ULONG)) {
                 ((PULONG)outputBuffer)[0] = (ULONG)(ULONG_PTR)devExt->MmioBase;
@@ -307,10 +324,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("IOCTL_PSP_LOAD_FW: Firmware loaded PA=0x%llX PA>>20=0x%08X size=%u (PERSISTENT)\n",
                 devExt->FwPhysical.QuadPart, devExt->FwPaShifted, devExt->FwSize));
 
-            // Write PA>>20 to C2PMSG_36 and send initial command
-            status = PspSendMailboxCommand(devExt, 0x1);
-
-            if (NT_SUCCESS(status) && outputLength >= sizeof(ULONG)) {
+            /* Firmware loaded, ready for SEND_CMD. Don't send commands here -
+               the user will send them via -C option. */
+            if (outputLength >= sizeof(ULONG)) {
                 ((PULONG)outputBuffer)[0] = devExt->FwPaShifted;
                 bytesReturned = sizeof(ULONG);
             }
@@ -370,6 +386,94 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
 
             status = (mmhubAfter != mmhubBefore) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        case IOCTL_PSP_CREATE_RING:
+        {
+            /* Use global ring buffer (always available, no allocation needed) */
+            devExt->RingBuffer = g_RingBuffer;
+            devExt->RingPhysical = g_RingBufferPhysical;
+            devExt->RingSize = sizeof(g_RingBuffer);
+            RtlZeroMemory(devExt->RingBuffer, devExt->RingSize);
+
+            KdPrint(("CREATE_RING: Ring at VA=%p PA=0x%llX size=%u\n",
+                devExt->RingBuffer, devExt->RingPhysical.QuadPart, devExt->RingSize));
+
+            /* Wait briefly for TOS_READY */
+            ULONG c64;
+            for (ULONG t = 0; t < 100; t++) {
+                c64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                if (c64 & 0x80000000) break;
+                KeStallExecutionProcessor(10000);
+            }
+
+            /* Write ring address to C2PMSG_69/70 */
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4),
+                (ULONG)(devExt->RingPhysical.QuadPart & 0xFFFFFFFF));
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F8),
+                (ULONG)(devExt->RingPhysical.QuadPart >> 32));
+            /* Ring size to C2PMSG_71 */
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC), devExt->RingSize);
+            /* Trigger */
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0);
+
+            KeStallExecutionProcessor(50000);
+
+            c64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            devExt->RingCreated = TRUE;  /* Ring registers were programmed successfully */
+
+            KdPrint(("CREATE_RING: C2PMSG_64=0x%08X ringCreated=1\n", c64));
+
+            if (outputLength >= sizeof(ULONG) * 2) {
+                ((PULONG)outputBuffer)[0] = (ULONG)(devExt->RingPhysical.QuadPart & 0xFFFFFFFF);
+                ((PULONG)outputBuffer)[1] = c64;
+                bytesReturned = sizeof(ULONG) * 2;
+            }
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        case IOCTL_PSP_NBIO_VIA_RING:
+        {
+            if (!devExt->RingCreated || devExt->RingBuffer == NULL) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+
+            /* Format PSP command packet in ring buffer */
+            /* Standard PSP command: dword[0]=cmd, dword[1]=arg */
+            volatile PULONG ring = (PULONG)devExt->RingBuffer;
+            ring[0] = 0x00020000;  /* NBIO unlock command */
+            ring[1] = 0;
+            ring[2] = 0;
+            ring[3] = 0;
+            KeMemoryBarrier();
+
+            /* Update ring write pointer to signal PSP */
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), 4 * sizeof(ULONG));
+
+            KeStallExecutionProcessor(100000);  /* 100ms */
+
+            /* Also write NBIO signatures */
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
+
+            KeStallExecutionProcessor(10000);
+
+            /* Check MMHUB */
+            ULONG mmhub = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
+            ULONG grbm = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
+
+            KdPrint(("NBIO_VIA_RING: MMHUB=0x%08X GRBM=0x%08X\n", mmhub, grbm));
+
+            if (outputLength >= sizeof(ULONG) * 3) {
+                ((PULONG)outputBuffer)[0] = mmhub;
+                ((PULONG)outputBuffer)[1] = grbm;
+                ((PULONG)outputBuffer)[2] = devExt->RingCreated ? 1 : 0;
+                bytesReturned = sizeof(ULONG) * 3;
+            }
+            status = (grbm != 0xFFFFFFFF) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
             break;
         }
 

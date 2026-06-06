@@ -53,11 +53,13 @@ Device Manager → Scan → unknown device → Update Driver → Browse → `out
 ### Test sequence
 ```cmd
 cd output
-test-psp-driver.exe -i 0xFE800000 0x200000                     # Init BAR5 MMIO
+test-psp-driver.exe -i 0xFE800000 0x200000                     # Init BAR5 MMIO (also inits ring buffer PA)
 test-psp-driver.exe -t                                          # Connectivity test
-test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin        # Load FW (persistent)
-test-psp-driver.exe -C 0x00000004                                # SYSDRV command
-test-psp-driver.exe -C 0x00000008                                # SOS command
+test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin        # Load FW (persistent, no command sent)
+test-psp-driver.exe -C 0x00000004                                # SYSDRV mailbox command
+test-psp-driver.exe -C 0x00000008                                # SOS mailbox command
+test-psp-driver.exe -R                                           # Create PSP ring (C2PMSG_69/70/71/64)
+test-psp-driver.exe -U                                           # NBIO unlock via ring + signature regs
 test-psp-driver.exe -t                                           # Check C2PMSG_81
 test-psp-driver.exe -r 0x2004                                    # GRBM_STATUS
 ```
@@ -89,6 +91,14 @@ The PSP boot on BC-250 requires TWO commands: `0x4` (SYSDRV) then `0x8` (SOS).
 -C 0x00000004:      C2PMSG_36=PA>>20 → C2PMSG_35=0x4 (SYSDRV) → wait
 -C 0x00000008:      C2PMSG_36=PA>>20 → C2PMSG_35=0x8 (SOS) → wait
 ```
+
+## PSP Ring Buffer (+ IOCTL_PSP_CREATE_RING + IOCTL_PSP_NBIO_VIA_RING)
+
+Following the sibling project's PSP v11 init flow, the driver can create a PSP communication ring:
+
+1. **CREATE_RING** (`-R`): Programs PSP C2PMSG_69/70 (ring PA), C2PMSG_71 (ring size 4KB), C2PMSG_64 (trigger). Uses a static 4KB buffer, no allocation overhead.
+
+2. **NBIO_VIA_RING** (`-U`): Writes command `0x00020000` (GFX_CTRL_CMD_ID_DESTROY_RINGS / NBIO unlock) to ring, updates ring write pointer (C2PMSG_67), then also writes NBIO signature registers. Checks MMHUB and GRBM_STATUS in response.
 
 ### NBIO unlock status (verified on real HW):
 - NBIO signature regs `0xC100/0xC180` = `0xFEDCBAEF`/`0xFEDCBADF` (already set)
