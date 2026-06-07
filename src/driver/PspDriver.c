@@ -711,10 +711,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PspFreeFirmware(devExt);
 
             // FIX #5: Validate embedded firmware size before allocation
-            // NOTE: g_SysdrvFirmwareData contains Type 1 (SOS) content, suitable for CMD 0x8
-            if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
+            // NOTE: g_SosFirmwareData contains Type 1 (SOS) content, suitable for CMD 0x8
+            if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
                 KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Embedded FW too large (%u > %u)\n", 
-                    g_SysdrvFirmwareSize, PSP_MAX_FW_TOTAL));
+                    g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
                 status = STATUS_INVALID_PARAMETER;
                 break;
             }
@@ -722,15 +722,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PHYSICAL_ADDRESS highAddr;
             highAddr.QuadPart = 0xFFFFFFFF;
 
-            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
             if (devExt->FwBuffer == NULL) {
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Failed to allocate\n"));
                 break;
             }
 
-            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
-            devExt->FwSize = g_SysdrvFirmwareSize;
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
+            devExt->FwSize = g_SosFirmwareSize;
             devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
             devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
 
@@ -764,21 +764,21 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 break;
             }
 
-            // Step 1: Load SYSDRV firmware (type 8, from BIOS offset 0x8E0400) -> send command 0x4
+            // Step 1: Load SYSDRV firmware (type 8, 256KB from BIOS 0x8FEE00) -> send command 0x4
             PspFreeFirmware(devExt);
-            devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
             if (devExt->FwBuffer == NULL) {
                 KdPrint(("BOOT_SEQ: SYSDRV alloc failed\n"));
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 break;
             }
-            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
-            devExt->FwSize = g_SosFirmwareSize;
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
+            devExt->FwSize = g_SysdrvFirmwareSize;
             devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
             devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
             results[0] = devExt->FwPaShifted;
 
-            KdPrint(("BOOT_SEQ: SYSDRV (from g_SosFirmwareData) loaded PA=0x%llX PA>>20=0x%08X\n",
+            KdPrint(("BOOT_SEQ: SYSDRV loaded PA=0x%llX PA>>20=0x%08X\n",
                 devExt->FwPhysical.QuadPart, devExt->FwPaShifted));
 
             // Send SYSDRV command (0x4) to PSP
@@ -790,7 +790,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             if (!NT_SUCCESS(stepStatus)) {
                 KdPrint(("BOOT_SEQ: SYSDRV failed with status 0x%08X, skipping SOS\n", stepStatus));
                 status = stepStatus;
-                results[2] = 0;  // SOS not attempted
+                results[2] = 0;
                 results[3] = 0;
                 if (outputLength >= sizeof(results)) {
                     RtlCopyMemory(outputBuffer, results, sizeof(results));
@@ -799,29 +799,28 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 break;
             }
 
-            // Step 2: Load SOS firmware (type 1, from BIOS offset 0x99FC00) -> send command 0x8
-            // FIX #5: Validate SOS firmware size before allocation
-            if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
-                KdPrint(("BOOT_SEQ: SOS FW too large (%u > %u)\n", g_SysdrvFirmwareSize, PSP_MAX_FW_TOTAL));
+            // Step 2: Load SOS firmware (type 1, 46KB, padded to 256KB) -> send command 0x8
+            if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
+                KdPrint(("BOOT_SEQ: SOS FW too large (%u > %u)\n", g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
                 status = STATUS_INVALID_PARAMETER;
                 break;
             }
 
             // Free SYSDRV, allocate new buffer for SOS
             PspFreeFirmware(devExt);
-            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
             if (devExt->FwBuffer == NULL) {
                 KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 break;
             }
-            RtlZeroMemory(devExt->FwBuffer, g_SysdrvFirmwareSize);
-            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
-            devExt->FwSize = g_SysdrvFirmwareSize;
+            RtlZeroMemory(devExt->FwBuffer, 262144);
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
+            devExt->FwSize = 262144;
             devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
             devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
 
-            KdPrint(("BOOT_SEQ: SOS (from g_SysdrvFirmwareData) loaded PA=0x%llX PA>>20=0x%08X\n",
+            KdPrint(("BOOT_SEQ: SOS loaded PA=0x%llX PA>>20=0x%08X\n",
                 devExt->FwPhysical.QuadPart, devExt->FwPaShifted));
 
             // Send SOS command (0x8) to PSP
