@@ -103,26 +103,37 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     // FIX #9: Acquire spinlock to prevent race conditions
     KeAcquireSpinLock(&devExt->CommandLock, &irql);
 
-    // Write PA >> 20 to C2PMSG_36 (PSP uses 1MB-aligned format)
-    WRITE_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET),
-        devExt->FwPaShifted
-    );
-    KdPrint(("Mailbox: Wrote PA>>20=0x%08X to C2PMSG_36\n", devExt->FwPaShifted));
+    // FIX #12: Write physical address (low 32 bits, assumes <4GB) to C2PMSG_36,
+    // then write command to C2PMSG_35.
+    // CRITICAL: Must clear C2PMSG_81 first by writing 0, or PSP ignores command.
+    ULONG paLo = (ULONG)(devExt->FwPhysical.QuadPart & 0xFFFFFFFF);
 
-    // Save initial C2PMSG_81
+    // Clear previous response in C2PMSG_81
+    WRITE_REGISTER_ULONG(
+        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET),
+        0
+    );
+
+    // Save initial C2PMSG_81 (should be 0 after clearing)
     initialStatus = READ_REGISTER_ULONG(
         (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
     );
 
-    // Write command to C2PMSG_35
+    // Write PA (low 32 bits, PSP sees <4GB physical) to C2PMSG_36
+    WRITE_REGISTER_ULONG(
+        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET),
+        paLo
+    );
+    KdPrint(("Mailbox: Wrote PA=0x%08X to C2PMSG_36\n", paLo));
+
+    // Write command to C2PMSG_35 (triggers PSP execution)
     WRITE_REGISTER_ULONG(
         (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET),
         command
     );
     KdPrint(("Mailbox: Wrote command 0x%08X to C2PMSG_35\n", command));
 
-    // FIX #4: Use non-blocking delay instead of busy-wait
+        // FIX #4: Use non-blocking delay instead of busy-wait
     NTSTATUS status = STATUS_SUCCESS;
     for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
         KeStallExecutionProcessor(1000);  // 1ms stall
@@ -132,7 +143,16 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
         if (statusReg != initialStatus) {
             KdPrint(("Mailbox: C2PMSG_81 changed: 0x%08X -> 0x%08X after %u ms\n",
                 initialStatus, statusReg, timeout));
-            status = STATUS_SUCCESS;
+            // FIX #11: Decode C2PMSG_81 response: bit 31 set = response valid,
+            // bits [27:0] = status code. 0x00 = success, anything else = error.
+            if (statusReg & 0x80000000) {
+                ULONG pspStatus = statusReg & 0x0FFFFFFF;
+                if (pspStatus != 0) {
+                    KdPrint(("Mailbox: PSP returned error 0x%03X for command 0x%08X\n",
+                        pspStatus, command));
+                    status = STATUS_UNSUCCESSFUL;
+                }
+            }
             break;
         }
     }
@@ -141,6 +161,12 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
         KdPrint(("Mailbox: TIMEOUT waiting for C2PMSG_81 change (command 0x%08X)\n", command));
         status = STATUS_TIMEOUT;
     }
+
+    // FIX #12: Acknowledge command completion by clearing C2PMSG_81
+    WRITE_REGISTER_ULONG(
+        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET),
+        0
+    );
 
     // FIX #9: Release spinlock
     KeReleaseSpinLock(&devExt->CommandLock, irql);
@@ -595,42 +621,44 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
         case IOCTL_PSP_NBIO_VIA_RING:
         {
-            if (!devExt->RingCreated || devExt->RingBuffer == NULL) {
-                status = STATUS_DEVICE_NOT_READY;
-                break;
+            ULONG results[3] = {0};
+
+            // Send GFX_CTRL_CMD_ID_DESTROY_RINGS to C2PMSG_64 (from GPU driver's Amdbc250PspTryUnlockNbio)
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00020000);
+            results[0] = 0x00020000;
+
+            // Wait 500ms for PSP to process
+            {
+                LARGE_INTEGER delay;
+                delay.QuadPart = -5000000LL;  // 500ms
+                KeDelayExecutionThread(KernelMode, FALSE, &delay);
             }
 
-            /* Format PSP command packet in ring buffer */
-            /* Standard PSP command: dword[0]=cmd, dword[1]=arg */
-            volatile PULONG ring = (PULONG)devExt->RingBuffer;
-            ring[0] = 0x00020000;  /* NBIO unlock command */
-            ring[1] = 0;
-            ring[2] = 0;
-            ring[3] = 0;
-            KeMemoryBarrier();
+            // Read C2PMSG_64 response
+            ULONG c64resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            results[1] = c64resp;
 
-            /* Update ring write pointer to signal PSP */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), 4 * sizeof(ULONG));
-
-            KeStallExecutionProcessor(100000);  /* 100ms */
-
-            /* Also write NBIO signatures */
+            // Write NBIO signatures directly to BAR5 (not through PSP)
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
 
-            KeStallExecutionProcessor(10000);
+            // Wait 100ms
+            {
+                LARGE_INTEGER delay;
+                delay.QuadPart = -1000000LL;
+                KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            }
 
-            /* Check MMHUB */
             ULONG mmhub = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
             ULONG grbm = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
+            results[2] = mmhub;
 
-            KdPrint(("NBIO_VIA_RING: MMHUB=0x%08X GRBM=0x%08X\n", mmhub, grbm));
+            KdPrint(("NBIO_VIA_RING: cmd=0x%08X c64=0x%08X MMHUB=0x%08X GRBM=0x%08X\n",
+                0x00020000, c64resp, mmhub, grbm));
 
-            if (outputLength >= sizeof(ULONG) * 3) {
-                ((PULONG)outputBuffer)[0] = mmhub;
-                ((PULONG)outputBuffer)[1] = grbm;
-                ((PULONG)outputBuffer)[2] = devExt->RingCreated ? 1 : 0;
-                bytesReturned = sizeof(ULONG) * 3;
+            if (outputLength >= sizeof(results)) {
+                RtlCopyMemory(outputBuffer, results, sizeof(results));
+                bytesReturned = sizeof(results);
             }
             status = (grbm != 0xFFFFFFFF) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
             break;
@@ -683,9 +711,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PspFreeFirmware(devExt);
 
             // FIX #5: Validate embedded firmware size before allocation
-            if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
+            // NOTE: g_SysdrvFirmwareData contains Type 1 (SOS) content, suitable for CMD 0x8
+            if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
                 KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Embedded FW too large (%u > %u)\n", 
-                    g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
+                    g_SysdrvFirmwareSize, PSP_MAX_FW_TOTAL));
                 status = STATUS_INVALID_PARAMETER;
                 break;
             }
@@ -693,15 +722,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PHYSICAL_ADDRESS highAddr;
             highAddr.QuadPart = 0xFFFFFFFF;
 
-            devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
             if (devExt->FwBuffer == NULL) {
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Failed to allocate\n"));
                 break;
             }
 
-            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
-            devExt->FwSize = g_SosFirmwareSize;
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
+            devExt->FwSize = g_SysdrvFirmwareSize;
             devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
             devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
 
@@ -735,21 +764,21 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 break;
             }
 
-            // Step 1: Load SYSDRV firmware (type 8, 256KB) -> send command 0x4
+            // Step 1: Load SYSDRV firmware (type 8, from BIOS offset 0x8E0400) -> send command 0x4
             PspFreeFirmware(devExt);
-            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
             if (devExt->FwBuffer == NULL) {
                 KdPrint(("BOOT_SEQ: SYSDRV alloc failed\n"));
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 break;
             }
-            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
-            devExt->FwSize = g_SysdrvFirmwareSize;
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
+            devExt->FwSize = g_SosFirmwareSize;
             devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
             devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
             results[0] = devExt->FwPaShifted;
 
-            KdPrint(("BOOT_SEQ: SYSDRV loaded PA=0x%llX PA>>20=0x%08X\n",
+            KdPrint(("BOOT_SEQ: SYSDRV (from g_SosFirmwareData) loaded PA=0x%llX PA>>20=0x%08X\n",
                 devExt->FwPhysical.QuadPart, devExt->FwPaShifted));
 
             // Send SYSDRV command (0x4) to PSP
@@ -770,29 +799,29 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 break;
             }
 
-            // Step 2: Load SOS firmware (type 1, 42KB, padded to 256KB) -> send command 0x8
+            // Step 2: Load SOS firmware (type 1, from BIOS offset 0x99FC00) -> send command 0x8
             // FIX #5: Validate SOS firmware size before allocation
-            if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
-                KdPrint(("BOOT_SEQ: SOS FW too large (%u > %u)\n", g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
+            if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
+                KdPrint(("BOOT_SEQ: SOS FW too large (%u > %u)\n", g_SysdrvFirmwareSize, PSP_MAX_FW_TOTAL));
                 status = STATUS_INVALID_PARAMETER;
                 break;
             }
 
             // Free SYSDRV, allocate new buffer for SOS
             PspFreeFirmware(devExt);
-            devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
             if (devExt->FwBuffer == NULL) {
                 KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 break;
             }
-            RtlZeroMemory(devExt->FwBuffer, 262144);
-            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
-            devExt->FwSize = 262144;
+            RtlZeroMemory(devExt->FwBuffer, g_SysdrvFirmwareSize);
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
+            devExt->FwSize = g_SysdrvFirmwareSize;
             devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
             devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
 
-            KdPrint(("BOOT_SEQ: SOS loaded PA=0x%llX PA>>20=0x%08X\n",
+            KdPrint(("BOOT_SEQ: SOS (from g_SysdrvFirmwareData) loaded PA=0x%llX PA>>20=0x%08X\n",
                 devExt->FwPhysical.QuadPart, devExt->FwPaShifted));
 
             // Send SOS command (0x8) to PSP

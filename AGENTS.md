@@ -1,0 +1,124 @@
+# AMD BC-250 PSP Windows Driver — Agent Guide
+
+## Build commands (from repo root, in VS2022 x64 Native Tools prompt)
+
+```cmd
+scripts\build.bat           # -> output\PspDriver.sys + .inf + .cat + sign
+scripts\compile-test.bat    # -> output\test-psp-driver.exe
+```
+
+Manual alternative:
+```
+cl /c /kernel /W3 /Zi /Od /DAMD64 /I"<WDK>\km" /I"<WDK>\km\crt" /I"<WDK>\shared" /Iinc src\driver\PspDriver.c
+link /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /OUT:output\PspDriver.sys PspDriver.obj ntoskrnl.lib wdm.lib hal.lib /LIBPATH:"<WDK>\km\x64"
+cl /W3 /Zi /O2 /D_AMD64_ /Iinc src\test\test-psp-driver.c /Fe:output\test-psp-driver.exe
+```
+
+## Key architecture
+
+- **WDM** (native NT), NOT KMDF (KMDF caused 0x7e). No WDF libs in link step.
+- Target: PCI `VEN_1022&DEV_143E` (AMD PSP on BC-250 / PS5 Oberon)
+- MMIO maps **Graphics BAR5** (`0xFE800000`), not PSP BAR0. C2PMSG mailbox lives in BAR5.
+- IOCTL: `METHOD_BUFFERED`, device `\Device\AmdBcPsp`, symlink `\DosDevices\AmdBcPsp`
+- User-mode: `test-psp-driver.exe` talks via `DeviceIoControl` to `\\.\AmdBcPsp`
+
+## Critical driver behavior
+
+- **FW buffer is persistent**: After `IOCTL_PSP_LOAD_FW`, buffer stays allocated for subsequent `SEND_CMD` calls. Only freed on unload or re-load.
+- **INIT_HW maps arbitrary PA**: The user specifies BAR5 physical address + size. The driver also probes for PCI ECAM (`0xE0000000`, `0xF0000000`, `0xC0000000`, `0xE000000000`) and initializes a global 4KB ring buffer PA on first call.
+- **Spinlock on SEND_CMD**: `CommandLock` protects mailbox command sequence (C2PMSG_36 write → C2PMSG_35 write → poll C2PMSG_81).
+- **GRBM_STATUS = 0xFFFFFFFF**: Hardware-level PS5 NBIO restriction on GRBM/CP range (0x2000-0x2FFF). Not a driver bug.
+- **NBIO_VIA_RING (IOCTL 0x807)**: Writes `0x00020000` to C2PMSG_64 (bypasses ring entirely), writes NBIO sigs directly to BAR5, returns `[cmd, c64resp, mmhub]`. Does NOT check `RingCreated`.
+
+## C2PMSG Mailbox Protocol
+
+Critical protocol flow for firmware loading on BC-250 PSP:
+
+```
+1. WRITE_REGISTER_ULONG(C2PMSG_81, 0)     # Clear previous response (CRITICAL!)
+2. WRITE_REGISTER_ULONG(C2PMSG_36, paLo)  # Full physical address (low 32 bits)
+3. WRITE_REGISTER_ULONG(C2PMSG_35, cmd)   # Command (0x4 = SYSDRV, 0x8 = SOS)
+4. Poll C2PMSG_81 until != initial value  # Wait for PSP response
+5. Decode response: bit 31 = done, bits[27:0] = status (0 = success)
+6. WRITE_REGISTER_ULONG(C2PMSG_81, 0)     # Acknowledge
+```
+
+### PSP error codes
+| C2PMSG_81 | Meaning |
+|-----------|---------|
+| `0x00000000` | Idle / success |
+| `0xF0000010` | Firmware validation failed (wrong type, bad signature) |
+| `0xF0000020` | Unknown command / timeout |
+
+If C2PMSG_81 is stuck at `0xF0000010`, the PSP ignores new commands until cleared.
+
+### NBIO unlock state (verified on HW)
+| Range | Offset example | Value | Status |
+|-------|---------------|-------|--------|
+| GC | 0x3000 | `0x009A0C00` | Unlocked |
+| MMHUB | 0x5000 | `0x80840000` | Unlocked |
+| HDP | 0x05A0 | `0x00070000` | Unlocked |
+| NBIO SIG1 | 0xC100 | `0xFEDCBAEF` | Written |
+| NBIO SIG2 | 0xC180 | `0xFEDCBADF` | Written |
+| GRBM/CP | 0x2000 | `0xFFFFFFFF` | HW blocked (PS5 Oberon) |
+
+GPU driver conflict: The main GPU driver shares BAR5 with PSP. Running MMIO tests with the GPU driver active may cause black screen. Unload GPU driver or use Microsoft Basic Display Driver.
+
+## C2PMSG Mailbox register offsets (BAR5-relative)
+
+| Register | Offset | Purpose |
+|----------|--------|---------|
+| C2PMSG_35 | 0x1056C | Command register |
+| C2PMSG_36 | 0x10570 | Data register (PA low 32b) |
+| C2PMSG_37 | 0x10574 | Data register (PA high 32b) |
+| C2PMSG_64 | 0x105E0 | Ring buffer control / TOS_READY |
+| C2PMSG_81 | 0x10614 | Status/response register |
+
+## Test sequence (after driver install + reboot)
+
+```
+test-psp-driver.exe -i 0xFE800000 0x200000    # Init BAR5 MMIO (required first)
+test-psp-driver.exe -t                         # Connectivity test (C2PMSG_35/36/81)
+test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin   # Load FW
+test-psp-driver.exe -C 0x4                     # SYSDRV command
+test-psp-driver.exe -C 0x8                     # SOS command
+test-psp-driver.exe -R                         # Create PSP ring (C2PMSG_69/70/71/64)
+test-psp-driver.exe -U                         # NBIO unlock via C2PMSG_64 + sigs
+test-psp-driver.exe -s                         # Full status snapshot
+test-psp-driver.exe -B                         # Boot seq: embedded FW + SYSDRV + SOS + GRBM
+```
+
+Error 21 (`ERROR_NOT_READY`) from any IOCTL means `INIT_HW` not called yet.
+
+## Source files
+
+| File | Purpose |
+|------|---------|
+| `src/driver/PspDriver.c` | Single-file WDM driver (~830 lines). All IOCTL dispatch here. |
+| `src/test/test-psp-driver.c` | User-mode test tool (~570 lines). All IOCTL wrappers + CLI args. |
+| `inc/PspIoctl.h` | Shared IOCTL codes + struct definitions. |
+| `inc/firmware_data.h` | 32KB embedded firmware arrays (binary, do not edit by hand). Generated by `scripts/gen-firmware-h.ps1`. |
+| `inf/PspDriver.inf` | Device installation. Matches `PCI\VEN_1022&DEV_143E&SUBSYS_00001022&REV_00`. |
+
+## CRITICAL: firmware_data.h blob naming quirk
+
+The arrays in `firmware_data.h` are **named inversely to their PSP type**:
+
+| Array name | File source | Actual PSP type | Correct command |
+|------------|-------------|-----------------|-----------------|
+| `g_SosFirmwareData` | `cyan_skillfish2_sos_42kb.bin` | **Type 8 (SYSDRV)** | **CMD 0x4** |
+| `g_SysdrvFirmwareData` | `cyan_skillfish2_sysdrv.bin` | **Type 1 (SOS)** | **CMD 0x8** |
+
+The driver's `BOOT_SEQUENCE` is already fixed to use the correct mapping:
+- CMD 0x4 uses `g_SosFirmwareData` (Type 8 content)
+- CMD 0x8 uses `g_SysdrvFirmwareData` (Type 1 content)
+
+If regenerating `firmware_data.h`, swap the input files in `gen-firmware-h.ps1` so array names match their PSP type.
+
+## Known pitfalls
+
+- **Secure Boot must be OFF** in BIOS. Test signing is blocked if Secure Boot is on.
+- **Driver Code 0x7e**: Linking with WDF libraries (KMDF) instead of WDM. Do not add `wdf` libs.
+- **Code 52**: Unsigned driver. Sign with `AMD-BC250-Signer` cert (from sibling project) or enable Test Mode.
+- **No unit tests**: Only manual hardware-in-the-loop testing. No CI.
+- **bcdedit /set testsigning on + reboot** required before driver loads.

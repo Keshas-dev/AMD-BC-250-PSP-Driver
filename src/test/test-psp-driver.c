@@ -133,9 +133,9 @@ BOOL NbioViaRing(HANDLE hDevice)
         NULL, 0, &resp, sizeof(resp), &returned, NULL);
 
     if (ok && returned >= sizeof(ULONG) * 3) {
-        Log("MMHUB=0x%08X GRBM=0x%08X ringCreated=%u%s\n",
+        Log("cmd=0x%08X C2PMSG_64=0x%08X MMHUB=0x%08X%s\n",
             resp[0], resp[1], resp[2],
-            (resp[1] != 0xFFFFFFFF) ? " *** NBIO UNLOCKED ***" : "");
+            (resp[2] != 0xFFFFFFFF) ? " *** NBIO UNLOCKED? ***" : "");
     } else if (ok) {
         Log("NBIO via ring (partial response)\n");
     } else {
