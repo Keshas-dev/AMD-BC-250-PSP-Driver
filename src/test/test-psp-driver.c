@@ -168,6 +168,35 @@ BOOL GetPspStatus(HANDLE hDevice)
     return ok;
 }
 
+BOOL PciRead(HANDLE hDevice, ULONG bus, ULONG devFn, ULONG offset)
+{
+    ULONG args[3] = { bus, devFn, offset };
+    ULONG resp = 0;
+    DWORD returned = 0;
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_PCI_READ,
+        args, sizeof(args), &resp, sizeof(resp), &returned, NULL);
+    if (ok) {
+        Log("PCI_READ B%d.D%d.F%d[0x%X] = 0x%08X\n", bus, (devFn>>3)&0x1F, devFn&7, offset, resp);
+    } else {
+        Log("PCI_READ FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
+BOOL PciWrite(HANDLE hDevice, ULONG bus, ULONG devFn, ULONG offset, ULONG value)
+{
+    ULONG args[4] = { bus, devFn, offset, value };
+    DWORD returned = 0;
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_PCI_WRITE,
+        args, sizeof(args), NULL, 0, &returned, NULL);
+    if (ok) {
+        Log("PCI_WRITE B%d.D%d.F%d[0x%X] = 0x%08X\n", bus, (devFn>>3)&0x1F, devFn&7, offset, value);
+    } else {
+        Log("PCI_WRITE FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
 BOOL BootSequence(HANDLE hDevice)
 {
     ULONG results[4] = {0};
@@ -334,6 +363,8 @@ void PrintUsage(const char *prog)
     printf("  -s                 PSP status snapshot (comprehensive driver + HW state)\n");
     printf("  -E                 Load embedded firmware (compiled into driver)\n");
     printf("  -B                 Full boot sequence (embedded FW + SYSDRV 0x4 + SOS 0x8)\n");
+    printf("  -pb <bus> <df> <off>  PCI config read (bus, device<<3|func, offset hex)\n");
+    printf("  -pw <bus> <df> <off> <val>  PCI config write\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -l <logfile>       Write log to file\n");
@@ -447,6 +478,21 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "-B") == 0) {
             ok = BootSequence(h);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-pb") == 0 && i + 3 < argc) {
+            ULONG bus = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG df = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG off = (ULONG)strtoul(argv[++i], NULL, 0);
+            ok = PciRead(h, bus, df, off);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-pw") == 0 && i + 4 < argc) {
+            ULONG bus = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG df = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG off = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG val = (ULONG)strtoul(argv[++i], NULL, 0);
+            ok = PciWrite(h, bus, df, off, val);
             if (!ok) { ret = 1; }
         }
         else if (strcmp(argv[i], "-E") == 0) {

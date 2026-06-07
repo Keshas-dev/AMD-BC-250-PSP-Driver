@@ -1,6 +1,10 @@
 #include <ntddk.h>
+#include <wdm.h>
 #include "PspIoctl.h"
 #include "firmware_data.h"
+
+// BUS_DATA_TYPE for PCI config access via HAL
+#define PCIConfiguration 0
 
 // PSP Mailbox register offsets (BAR5-relative)
 #define PSP_C2PMSG_35_OFFSET  0x1056C
@@ -33,6 +37,8 @@ typedef struct _DEVICE_EXTENSION {
     ULONG       RingSize;
     BOOLEAN     RingCreated;
     KSPIN_LOCK  CommandLock;        // FIX #9: Protect SEND_CMD from race conditions
+    PVOID       PciCfgBase;          // Mapped PCI ECAM region
+    ULONG       PciCfgSize;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 #define PSP_DEVICE_NAME        L"\\Device\\AmdBcPsp"
@@ -202,6 +208,11 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 
     PspFreeFirmware(devExt);
 
+    if (devExt->PciCfgBase != NULL) {
+        MmUnmapIoSpace(devExt->PciCfgBase, devExt->PciCfgSize);
+        devExt->PciCfgBase = NULL;
+    }
+
     if (devExt->MmioBase != NULL) {
         MmUnmapIoSpace(devExt->MmioBase, devExt->MmioSize);
         devExt->MmioBase = NULL;
@@ -239,7 +250,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     inputLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
     outputLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
 
-    if (ioctlCode != IOCTL_PSP_INIT_HW && devExt->MmioBase == NULL) {
+    if (ioctlCode != IOCTL_PSP_INIT_HW && ioctlCode != IOCTL_PSP_PCI_READ && ioctlCode != IOCTL_PSP_PCI_WRITE && devExt->MmioBase == NULL) {
         KdPrint(("MMIO not initialized\n"));
         Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
         Irp->IoStatus.Information = 0;
@@ -275,6 +286,36 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             devExt->MmioSize = size;
             KdPrint(("MMIO mapped: PA=0x%llX VA=%p size=%u\n", physAddr.QuadPart, devExt->MmioBase, size));
+
+            // Map PCI ECAM region for config space (try multiple common addresses)
+            if (devExt->PciCfgBase == NULL) {
+                ULONGLONG ecamCandidates[] = {
+                    0xE0000000ULL,  // AMD standard (256MB range from e820)
+                    0xF0000000ULL,  // AMD fallback
+                    0xC0000000ULL,  // VRAM base - unlikely but possible
+                    0xE000000000ULL // Above 4GB
+                };
+                for (int e = 0; e < 4 && devExt->PciCfgBase == NULL; e++) {
+                    PHYSICAL_ADDRESS ecamPhys;
+                    ecamPhys.QuadPart = ecamCandidates[e];
+                    PVOID mapped = MmMapIoSpace(ecamPhys, 0x100000, MmNonCached);
+                    if (mapped) {
+                        // Verify by reading Vendor/Device ID at B0D0F0 offset 0
+                        ULONG cfg0 = READ_REGISTER_ULONG((PULONG)mapped);
+                        if (cfg0 != 0 && cfg0 != 0xFFFFFFFF) {
+                            devExt->PciCfgBase = mapped;
+                            devExt->PciCfgSize = 0x100000;
+                            KdPrint(("PCI ECAM found at 0x%llX (Vendor=0x%08X)\n", ecamCandidates[e], cfg0));
+                        } else {
+                            MmUnmapIoSpace(mapped, 0x100000);
+                            KdPrint(("PCI ECAM candidate 0x%llX gave 0x%08X - not valid\n", ecamCandidates[e], cfg0));
+                        }
+                    }
+                }
+                if (devExt->PciCfgBase == NULL) {
+                    KdPrint(("PCI ECAM not found - config reads will fail\n"));
+                }
+            }
 
             /* Initialize global ring buffer physical address (once) */
             if (!g_RingBufferInitialized) {
@@ -409,6 +450,60 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 ((PULONG)outputBuffer)[0] = command;
                 bytesReturned = sizeof(ULONG);
             }
+            break;
+        }
+
+        case IOCTL_PSP_PCI_READ:
+        {
+            if (inputLength < sizeof(ULONG) * 3) { status = STATUS_INVALID_PARAMETER; break; }
+            PULONG params = (PULONG)inputBuffer;
+            ULONG bus = params[0];
+            ULONG devFn = params[1];
+            ULONG off = params[2];
+            ULONG value = 0xFFFFFFFF;
+
+            // Try ECAM first, fall back to HAL
+            if (devExt->PciCfgBase != NULL) {
+                ULONG addr = (bus * 0x100000) + (devFn * 0x1000) + (off & ~3);
+                if (addr + sizeof(ULONG) <= devExt->PciCfgSize) {
+                    value = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->PciCfgBase + addr));
+                }
+            }
+            if (value == 0xFFFFFFFF) {
+                // Try HAL
+                ULONG slot = (devFn >> 3) & 0x1F;
+                ULONG func = devFn & 7;
+                HalGetBusDataByOffset(PCIConfiguration, bus, (slot << 3) | func, &value, off & ~3, sizeof(ULONG));
+            }
+
+            KdPrint(("PCI_READ: B%d.D%d.F%d off=0x%X => 0x%08X\n", bus, (devFn>>3)&0x1F, devFn&7, off, value));
+            if (outputLength >= sizeof(ULONG)) {
+                ((PULONG)outputBuffer)[0] = value;
+                bytesReturned = sizeof(ULONG);
+            }
+            break;
+        }
+
+        case IOCTL_PSP_PCI_WRITE:
+        {
+            if (inputLength < sizeof(ULONG) * 4) { status = STATUS_INVALID_PARAMETER; break; }
+            PULONG params = (PULONG)inputBuffer;
+            ULONG bus = params[0];
+            ULONG devFn = params[1];
+            ULONG off = params[2];
+            ULONG value = params[3];
+
+            if (devExt->PciCfgBase != NULL) {
+                ULONG addr = (bus * 0x100000) + (devFn * 0x1000) + (off & ~3);
+                if (addr + sizeof(ULONG) <= devExt->PciCfgSize) {
+                    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->PciCfgBase + addr), value);
+                }
+            } else {
+                ULONG slot = (devFn >> 3) & 0x1F;
+                ULONG func = devFn & 7;
+                HalSetBusDataByOffset(PCIConfiguration, bus, (slot << 3) | func, &value, off & ~3, sizeof(ULONG));
+            }
+            KdPrint(("PCI_WRITE: B%d.D%d.F%d off=0x%X <= 0x%08X\n", bus, (devFn>>3)&0x1F, devFn&7, off, value));
             break;
         }
 
