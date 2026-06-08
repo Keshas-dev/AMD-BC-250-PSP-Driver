@@ -73,8 +73,75 @@ GPU driver conflict: The main GPU driver shares BAR5 with PSP. Running MMIO test
 | C2PMSG_35 | 0x1056C | Command register |
 | C2PMSG_36 | 0x10570 | Data register (PA low 32b) |
 | C2PMSG_37 | 0x10574 | Data register (PA high 32b) |
-| C2PMSG_64 | 0x105E0 | Ring buffer control / TOS_READY |
+| C2PMSG_64 | 0x105E0 | Ring cmd/resp (psp_gfx_ctrl.cmd_resp) |
+| C2PMSG_65 | 0x105E4 | RBI ring wptr (rbi_wptr) |
+| C2PMSG_66 | 0x105E8 | RBI ring rptr (rbi_rptr) |
+| C2PMSG_67 | 0x105EC | GPCOM ring wptr (gpcom_wptr) |
+| C2PMSG_68 | 0x105F0 | GPCOM ring rptr (gpcom_rptr) |
+| C2PMSG_69 | 0x105F4 | Ring buffer addr lo |
+| C2PMSG_70 | 0x105F8 | Ring buffer addr hi |
+| C2PMSG_71 | 0x105FC | Ring buffer size |
 | C2PMSG_81 | 0x10614 | Status/response register |
+
+## PSP Ring Buffer Protocol (psp_v11_0_8 for cyan_skillfish)
+
+Ring creation (from Linux `psp_v11_0_8_ring_create`):
+```
+1. WRITE C2PMSG_69 = ring_pa_lo
+2. WRITE C2PMSG_70 = ring_pa_hi
+3. WRITE C2PMSG_71 = ring_size
+4. WRITE C2PMSG_64 = 0x00020000  (GPCOM/KM ring = ring_type << 16)
+5. Poll C2PMSG_64 bit 31 (GFX_FLAG_RESPONSE) until set
+```
+
+Ring frame structure (64 bytes, `psp_gfx_rb_frame`):
+```
++0:  cmd_buf_addr_lo   (GPU address of command buffer)
++4:  cmd_buf_addr_hi
++8:  cmd_buf_size       (1024 bytes for cmd buffer)
++12: fence_addr_lo       (optional, 0 if unused)
++16: fence_addr_hi       (optional, 0 if unused)
++20: fence_value         (optional, 0 if unused)
+```
+
+Command buffer structure (1024 bytes, `psp_gfx_cmd_resp`):
+```
++0:  buf_size           (1024)
++4:  buf_version         (1)
++8:  cmd_id             (GFX_CMD_ID_LOAD_IP_FW = 0x06)
++28: cmd_load_ip_fw: fw_addr_lo, fw_addr_hi, fw_size, fw_type
++864: resp.status       (PSP writes response here)
+```
+
+Ring submission:
+```
+1. Build command buffer with firmware params
+2. Build ring frame pointing to command buffer
+3. Write frame to ring buffer at wptr offset
+4. WRITE C2PMSG_67 = new wptr value         (gpcom_wptr)
+5. Poll C2PMSG_64 bit 31 (response ready)
+6. Check cmd buffer +864 for resp.status (0 = success)
+```
+
+GPU FW type codes (from Linux `psp_gfx_if.h`):
+```
+FW type           Value
+CP_ME             1
+CP_PFP            2
+CP_CE             3
+CP_MEC            4
+CP_MEC1  (MEC2)   5
+RLC_G             8
+SDMA0             9
+SDMA1             10
+```
+
+Ring commands (from Linux `psp_gfx_if.h`):
+```
+GFX_CMD_ID_LOAD_IP_FW    0x06  (load GPU IP firmware)
+GFX_CMD_ID_LOAD_TOC      0x20  (load TOC + get TMR size)
+GFX_CMD_ID_AUTOLOAD_RLC  0x21  (start RLC autoload after all FW loaded)
+```
 
 ## Test sequence (after driver install + reboot)
 
@@ -88,6 +155,16 @@ test-psp-driver.exe -R                         # Create PSP ring (C2PMSG_69/70/7
 test-psp-driver.exe -U                         # NBIO unlock via C2PMSG_64 + sigs
 test-psp-driver.exe -s                         # Full status snapshot
 test-psp-driver.exe -B                         # Boot seq: embedded FW + SYSDRV + SOS + GRBM
+test-psp-driver.exe -A                         # Load ALL GPU FW via PSP ring (cyan_skillfish2, 8 files)
+test-psp-driver.exe -L <type> <file.bin>       # Load single GPU FW via PSP ring
+```
+
+Full GPU bring-up sequence (from output/ dir):
+```
+test-psp-driver.exe -i 0xFE800000 0x200000     # Init HW
+test-psp-driver.exe -B                          # Boot: SYSDRV + SOS
+test-psp-driver.exe -R                          # Create GPCOM ring
+test-psp-driver.exe -A                          # Load all 8 GPU FW components
 ```
 
 Error 21 (`ERROR_NOT_READY`) from any IOCTL means `INIT_HW` not called yet.
