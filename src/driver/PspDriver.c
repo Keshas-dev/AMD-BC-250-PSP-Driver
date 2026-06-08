@@ -108,13 +108,18 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     // CRITICAL: Must clear C2PMSG_81 first by writing 0, or PSP ignores command.
     ULONG paLo = (ULONG)(devExt->FwPhysical.QuadPart & 0xFFFFFFFF);
 
-    // Clear previous response in C2PMSG_81
+    // Save original C2PMSG_81 (SOS alive flag for GPU driver)
+    ULONG originalC2pmsg81 = READ_REGISTER_ULONG(
+        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
+    );
+
+    // Clear previous response in C2PMSG_81 so PSP accepts new command
     WRITE_REGISTER_ULONG(
         (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET),
         0
     );
 
-    // Save initial C2PMSG_81 (should be 0 after clearing)
+    // Save cleared C2PMSG_81 as initial for polling
     initialStatus = READ_REGISTER_ULONG(
         (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
     );
@@ -162,11 +167,21 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
         status = STATUS_TIMEOUT;
     }
 
-    // FIX #12: Acknowledge command completion by clearing C2PMSG_81
+    // FIX #12: Acknowledge command completion by writing 0 to C2PMSG_35
+    // (NOT C2PMSG_81 — that register holds SOS alive status and must be preserved)
     WRITE_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET),
+        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET),
         0
     );
+
+    // Restore original C2PMSG_81 value (SOS alive flag) if it was set,
+    // so GPU driver's Amdbc250PspInit() sees SOS is alive
+    if (originalC2pmsg81 != 0 && NT_SUCCESS(status)) {
+        WRITE_REGISTER_ULONG(
+            (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET),
+            originalC2pmsg81
+        );
+    }
 
     // FIX #9: Release spinlock
     KeReleaseSpinLock(&devExt->CommandLock, irql);
