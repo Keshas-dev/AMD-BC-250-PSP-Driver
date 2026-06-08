@@ -55,6 +55,7 @@ static BOOLEAN g_RingBufferInitialized = FALSE;
 static PHYSICAL_ADDRESS g_RingBufferPhysical;
 static UCHAR g_CmdBuffer[PSP_CMD_BUF_SIZE];  // 1024-byte command buffer for ring submissions
 static ULONG ringWriteOffset = 0;
+static ULONG g_RingFwCount = 0;              // Number of GPU FW loaded via ring
 
 static BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
 {
@@ -989,6 +990,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                     // Also check command buffer response status at +864
                     ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
                     status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+                    if (NT_SUCCESS(status)) g_RingFwCount++;
                     KdPrint(("RING: C2PMSG_64=0x%08X cmdResp=0x%08X\n", resp, cbStatus));
                     break;
                 }
@@ -1011,7 +1013,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             info->RingBufferPA = (ULONG)(g_RingBufferPhysical.QuadPart & 0xFFFFFFFF);
             info->FwLoaded = devExt->FwBuffer ? 1 : 0;
-            info->FwCount = 0;
+            info->FwCount = g_RingFwCount;
             info->TMRBase = 0xF40F800000;
             info->TMSSize = 0x400000;
             info->GfxVersion = 10;

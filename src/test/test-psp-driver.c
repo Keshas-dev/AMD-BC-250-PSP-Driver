@@ -493,7 +493,7 @@ BOOL GetGpuInfo(HANDLE hDevice)
     if (ok && returned >= sizeof(PSP_GPU_INFO)) {
         Log("=== GPU BRIDGE INFO ===\n");
         Log("  RingBuffer PA = 0x%08X\n", info.RingBufferPA);
-        Log("  TMR Base      = 0x%08X (size=%u)\n", info.TMRBase, info.TMSSize);
+        Log("  TMR Base      = 0x%016llX (size=%u)\n", info.TMRBase, info.TMSSize);
         Log("  GPU FW Loaded = %s (%u components)\n", info.FwLoaded ? "YES" : "NO", info.FwCount);
         Log("  GFX Version   = %u (cyan_skillfish2=gfx_v10_0_0)\n", info.GfxVersion);
         Log("  C2PMSG_64     = 0x%08X\n", info.C2pmsg64);

@@ -169,7 +169,7 @@ typedef struct _PSP_GPU_INFO {
     ULONG RingBufferPA;       // Physical address of the PSP ring buffer (low 32 bits)
     ULONG FwLoaded;           // 1 if GPU FW loaded via ring
     ULONG FwCount;            // Number of GPU FW components loaded (max 8)
-    ULONG TMRBase;            // TMR base address (Linux uses 0xF40F800000)
+    ULONGLONG TMRBase;        // TMR base address (Linux uses 0xF40F800000)
     ULONG TMSSize;            // TMR size (4MB)
     ULONG GfxVersion;         // GPU IP version (cyan_skillfish2 = 10)
     ULONG C2pmsg64;           // Current C2PMSG_64 value
