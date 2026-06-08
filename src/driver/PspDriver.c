@@ -19,7 +19,7 @@
 #define MMHUB_CHECK_OFFSET     0x50D0
 
 #define PSP_FW_WAIT_MS         500
-#define PSP_TOS_READY_TIMEOUT  100    // 1 second timeout for TOS_READY
+#define PSP_TOS_READY_TIMEOUT  10000  // 10 second timeout for TOS_READY (matches Linux adev->usec_timeout behavior)
 #define PSP_BOOT_CMD_0xC100    0xC100
 #define PSP_BOOT_CMD_0xC180    0xC180
 #define PSP_BAR0_PHYSICAL      0xFD600000ULL
@@ -56,6 +56,10 @@ static PHYSICAL_ADDRESS g_RingBufferPhysical;
 static UCHAR g_CmdBuffer[PSP_CMD_BUF_SIZE];  // 1024-byte command buffer for ring submissions
 static ULONG ringWriteOffset = 0;
 static ULONG g_RingFwCount = 0;              // Number of GPU FW loaded via ring
+static PVOID g_TmrBuffer = NULL;             // TMR (Trusted Memory Region) buffer
+static PHYSICAL_ADDRESS g_TmrPhysical;        // Physical address of TMR buffer
+static ULONG g_TmrSize = 0;                  // TMR size in bytes
+static BOOLEAN g_TmrInitialized = FALSE;     // Whether TMR has been initialized
 
 static BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
 {
@@ -192,6 +196,94 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     return status;
 }
 
+static NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)
+{
+    if (!devExt->RingCreated) {
+        KdPrint(("TMR: Ring not created\n"));
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (g_TmrInitialized) {
+        KdPrint(("TMR: Already initialized\n"));
+        return STATUS_SUCCESS;
+    }
+
+    // Allocate 4MB TMR buffer (matching Linux: reserve 0x400000 for PSP TMR)
+    g_TmrSize = 0x400000;
+    if (g_TmrBuffer == NULL) {
+        PHYSICAL_ADDRESS highAddr;
+        highAddr.QuadPart = 0x10000000000ULL;
+        g_TmrBuffer = MmAllocateContiguousMemory(g_TmrSize, highAddr);
+        if (g_TmrBuffer == NULL) {
+            highAddr.QuadPart = 0xFFFFFFFF;
+            g_TmrBuffer = MmAllocateContiguousMemory(g_TmrSize, highAddr);
+        }
+        if (g_TmrBuffer == NULL) {
+            KdPrint(("TMR: Failed to allocate 4MB buffer\n"));
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(g_TmrBuffer, g_TmrSize);
+        g_TmrPhysical = MmGetPhysicalAddress(g_TmrBuffer);
+        KdPrint(("TMR: Allocated 4MB at PA=0x%llX\n", g_TmrPhysical.QuadPart));
+    }
+
+    // Send INIT_TMR (0x01) via ring
+    RtlZeroMemory(g_CmdBuffer, PSP_CMD_BUF_SIZE);
+    PULONG cmd = (PULONG)g_CmdBuffer;
+    cmd[0] = PSP_CMD_BUF_SIZE;
+    cmd[1] = 1;
+    cmd[2] = GFX_CMD_ID_INIT_TMR;
+    cmd[7] = (ULONG)(g_TmrPhysical.QuadPart & 0xFFFFFFFF);
+    cmd[8] = (ULONG)(g_TmrPhysical.QuadPart >> 32);
+    cmd[9] = g_TmrSize;
+
+    PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
+
+    if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
+        ringWriteOffset = 0;
+    PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
+    RtlZeroMemory(frame, PSP_RING_FRAME_SIZE);
+    frame[0] = (ULONG)(cmdPa.QuadPart & 0xFFFFFFFF);
+    frame[1] = (ULONG)(cmdPa.QuadPart >> 32);
+    frame[2] = PSP_CMD_BUF_SIZE;
+    ringWriteOffset += PSP_RING_FRAME_SIZE;
+
+    KdPrint(("TMR: Submitting INIT_TMR via ring\n"));
+
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+
+    ULONG timeout, resp = 0;
+    for (timeout = 0; timeout < 2000; timeout++) {
+        KeStallExecutionProcessor(1000);
+        resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+        if (resp & 0x80000000) {
+            ULONG st = resp & 0x0000FFFF;
+            ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
+            KdPrint(("TMR: C2PMSG_64=0x%08X cmdResp=0x%08X st=%u\n", resp, cbStatus, st));
+            if (st == 0 && cbStatus == 0) {
+                g_TmrInitialized = TRUE;
+                KdPrint(("TMR: Initialized OK at PA=0x%llX\n", g_TmrPhysical.QuadPart));
+                return STATUS_SUCCESS;
+            }
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+    KdPrint(("TMR: timeout waiting for response\n"));
+    return STATUS_TIMEOUT;
+}
+
+// Free TMR buffer on driver unload
+static VOID PspFreeTmr(VOID)
+{
+    if (g_TmrBuffer) {
+        MmFreeContiguousMemory(g_TmrBuffer);
+        g_TmrBuffer = NULL;
+        g_TmrPhysical.QuadPart = 0;
+        g_TmrSize = 0;
+        g_TmrInitialized = FALSE;
+        KdPrint(("TMR buffer freed\n"));
+    }
+}
+
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
     NTSTATUS status;
@@ -250,6 +342,7 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 
     KdPrint(("=== AMD BC-250 PSP Driver: Unload ===\n"));
 
+    PspFreeTmr();
     PspFreeFirmware(devExt);
 
     if (devExt->PciCfgBase != NULL) {
@@ -600,9 +693,26 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("CREATE_RING: Ring at VA=%p PA=0x%llX size=%u\n",
                 devExt->RingBuffer, devExt->RingPhysical.QuadPart, devExt->RingSize));
 
-            /* On BC-250, TOS_READY (C2PMSG_64 bit 31) never sets because SOS is not
-               loaded. Skip TOS_READY wait -- just program ring registers directly. */
-            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            /* Linux psp_v11_0_8: Wait for MBOX_TOS_READY_FLAG (C2PMSG_64 bit 31)
+               before programming ring registers. SOS must signal readiness first. */
+            ULONG c64_val;
+            ULONG tosTimeout;
+            for (tosTimeout = 0; tosTimeout < PSP_TOS_READY_TIMEOUT; tosTimeout++) {
+                c64_val = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                if (c64_val & 0x80000000) {
+                    KdPrint(("CREATE_RING: TOS ready after %u ms (C2PMSG_64=0x%08X)\n",
+                        tosTimeout, c64_val));
+                    break;
+                }
+                KeStallExecutionProcessor(1000);
+            }
+
+            if (tosTimeout >= PSP_TOS_READY_TIMEOUT) {
+                KdPrint(("CREATE_RING: TOS not ready after %u ms (C2PMSG_64=0x%08X)\n",
+                    PSP_TOS_READY_TIMEOUT, c64_val));
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
 
             /* Write ring address to C2PMSG_69/70 */
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4),
@@ -614,18 +724,30 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             /* Ring type to C2PMSG_64: KM ring = 2 << 16 = 0x00020000 (psp_v11_0_8.c) */
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00020000);
 
-            KeStallExecutionProcessor(50000);
+            /* Wait for response: C2PMSG_64 bit 31 = MBOX_TOS_RESP_FLAG */
+            ULONG ringResp;
+            ULONG respTimeout;
+            for (respTimeout = 0; respTimeout < 3000; respTimeout++) {
+                KeStallExecutionProcessor(1000);
+                ringResp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                if (ringResp & 0x80000000) break;
+            }
 
-            ULONG c64_after = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            if (respTimeout >= 3000) {
+                KdPrint(("CREATE_RING: Ring create timeout (C2PMSG_64=0x%08X)\n", ringResp));
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+
             devExt->RingCreated = TRUE;
 
-            KdPrint(("CREATE_RING: C2PMSG_64 0x%08X -> 0x%08X ringCreated=1\n",
-                c64_before, c64_after));
+            KdPrint(("CREATE_RING: C2PMSG_64=0x%08X tosWait=%ums respWait=%ums ringCreated=1\n",
+                ringResp, tosTimeout, respTimeout));
 
             if (outputLength >= sizeof(ULONG) * 3) {
                 ((PULONG)outputBuffer)[0] = (ULONG)(devExt->RingPhysical.QuadPart & 0xFFFFFFFF);
-                ((PULONG)outputBuffer)[1] = c64_before;
-                ((PULONG)outputBuffer)[2] = c64_after;
+                ((PULONG)outputBuffer)[1] = c64_val;
+                ((PULONG)outputBuffer)[2] = ringResp;
                 bytesReturned = sizeof(ULONG) * 3;
             }
             status = STATUS_SUCCESS;
@@ -1014,14 +1136,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             info->RingBufferPA = (ULONG)(g_RingBufferPhysical.QuadPart & 0xFFFFFFFF);
             info->FwLoaded = devExt->FwBuffer ? 1 : 0;
             info->FwCount = g_RingFwCount;
-            info->TMRBase = 0xF40F800000;
-            info->TMSSize = 0x400000;
+            info->TMRBase = g_TmrInitialized ? g_TmrPhysical.QuadPart : 0xF40F800000;
+            info->TMSSize = g_TmrSize ? g_TmrSize : 0x400000;
             info->GfxVersion = 10;
 
             info->C2pmsg64 = READ_REGISTER_ULONG(
                 (PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
             info->C2pmsg81 = READ_REGISTER_ULONG(
                 (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
+            info->TmrInitialized = g_TmrInitialized ? 1 : 0;
 
             bytesReturned = sizeof(PSP_GPU_INFO);
             status = STATUS_SUCCESS;
@@ -1128,6 +1251,16 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             if (timeout >= 5000) { KdPrint(("AUTOLOAD_RLC: timeout\n")); status = STATUS_TIMEOUT; }
 
             if (outputLength >= sizeof(ULONG)) { ((PULONG)outputBuffer)[0] = resp; bytesReturned = sizeof(ULONG); }
+            break;
+        }
+
+        case IOCTL_PSP_INIT_TMR:
+        {
+            status = PspInitTmr(devExt);
+            if (outputLength >= sizeof(ULONG)) {
+                ((PULONG)outputBuffer)[0] = g_TmrInitialized ? 1 : 0;
+                bytesReturned = sizeof(ULONG);
+            }
             break;
         }
 

@@ -8,6 +8,9 @@
 // Include shared IOCTL definitions
 #include "PspIoctl.h"
 
+// Forward declarations
+BOOL RingAutoloadRlc(HANDLE hDevice);
+
 static FILE *g_log = NULL;
 
 void Log(const char *fmt, ...) {
@@ -503,6 +506,18 @@ BOOL RingAutoloadRlc(HANDLE hDevice)
     return ok;
 }
 
+BOOL InitTmr(HANDLE hDevice)
+{
+    ULONG resp = 0;
+    DWORD returned = 0;
+    Log("INIT_TMR (allocate 4MB TMR, send via ring)...\n");
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_INIT_TMR,
+        NULL, 0, &resp, sizeof(resp), &returned, NULL);
+    if (ok) { Log("  TMR Init: %s\n", resp ? "OK" : "FAIL"); }
+    else { Log("  TMR Init FAILED (err=%lu)\n", GetLastError()); }
+    return ok;
+}
+
 BOOL GetGpuInfo(HANDLE hDevice)
 {
     PSP_GPU_INFO info = {0};
@@ -518,6 +533,7 @@ BOOL GetGpuInfo(HANDLE hDevice)
         Log("  C2PMSG_64     = 0x%08X\n", info.C2pmsg64);
         Log("  C2PMSG_81     = 0x%08X  %s\n", info.C2pmsg81,
             (info.C2pmsg81 == 0xF0000010) ? "(SOS Alive)" : "");
+        Log("  TMR Init      = %s\n", info.TmrInitialized ? "YES" : "NO");
     } else {
         Log("GET_GPU_INFO FAILED (err=%lu)\n", GetLastError());
     }
@@ -561,6 +577,7 @@ void PrintUsage(const char *prog)
     printf("  -T                 Trigger RLC autoload (start GPU FW execution)\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
+    printf("  -M                 Initialize TMR (Trusted Memory Region, 4MB)\n");
     printf("  -T                 Run comprehensive HW probe (mailbox + NBIO + ring)\n");
     printf("  -l <logfile>       Write log to file\n");
     printf("\nExamples:\n");
@@ -738,6 +755,10 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "-T") == 0) {
             ok = ComprehensiveProbe(h);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-M") == 0) {
+            ok = InitTmr(h);
             if (!ok) { ret = 1; }
         }
         else if (strcmp(argv[i], "-t") == 0) {

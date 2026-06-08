@@ -32,6 +32,7 @@ extern "C" {
 #define IOCTL_PSP_REG_PROG            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x816, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_AUTOLOAD_RLC        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x817, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_KIQ_SUBMIT          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x818, METHOD_BUFFERED, FILE_ANY_ACCESS)  // TODO
+#define IOCTL_PSP_INIT_TMR            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x819, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
@@ -66,6 +67,7 @@ extern "C" {
 #define GFX_FW_TYPE_SDMA   GFX_FW_TYPE_SDMA0
 
 // PSP ring frame command IDs (from Linux psp_gfx_if.h)
+#define GFX_CMD_ID_INIT_TMR     0x00000001
 #define GFX_CMD_ID_LOAD_IP_FW   0x00000006
 #define GFX_CMD_ID_LOAD_TOC     0x00000020
 #define GFX_CMD_ID_AUTOLOAD_RLC 0x00000021
@@ -178,6 +180,7 @@ typedef struct _PSP_GPU_INFO {
     ULONG GfxVersion;         // GPU IP version (cyan_skillfish2 = 10)
     ULONG C2pmsg64;           // Current C2PMSG_64 value
     ULONG C2pmsg81;           // Current C2PMSG_81 value (SOS alive = 0xF0000010)
+    ULONG TmrInitialized;     // 1 if TMR has been initialized successfully
 } PSP_GPU_INFO, *PPSP_GPU_INFO;
 
 // Input for IOCTL_PSP_REG_PROG — program a register through PSP
