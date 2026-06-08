@@ -30,6 +30,7 @@ extern "C" {
 #define IOCTL_PSP_RING_LOAD_IP_FW    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x814, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_GET_GPU_INFO        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x815, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_REG_PROG            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x816, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_AUTOLOAD_RLC        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x817, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
@@ -64,7 +65,9 @@ extern "C" {
 #define GFX_FW_TYPE_SDMA   GFX_FW_TYPE_SDMA0
 
 // PSP ring frame command IDs (from Linux psp_gfx_if.h)
-#define GFX_CMD_ID_LOAD_IP_FW  0x00000006
+#define GFX_CMD_ID_LOAD_IP_FW   0x00000006
+#define GFX_CMD_ID_LOAD_TOC     0x00000020
+#define GFX_CMD_ID_AUTOLOAD_RLC 0x00000021
 
 // Ring frame: 64 bytes pointing to a 1024-byte command buffer
 #define PSP_RING_FRAME_SIZE   64

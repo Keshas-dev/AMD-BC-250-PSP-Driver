@@ -480,8 +480,27 @@ BOOL RingLoadAllFw(HANDLE hDevice)
         Log("[%d/%d] %s: ", i+1, count, FwTypeName(fw_list[i].type));
         if (RingLoadIpFw(hDevice, fw_list[i].type, fw_list[i].name)) ok++;
     }
-    Log("=== Done: %d/%d loaded ===\n", ok, count);
-    return ok == count;
+    Log("=== All FW loaded, triggering RLC autoload... ===\n");
+    if (ok == count) {
+        BOOL rlcOk = RingAutoloadRlc(hDevice);
+        Log("=== Done: %d/%d loaded, RLC %s ===\n", ok, count, rlcOk ? "OK" : "FAIL");
+        return rlcOk;
+    } else {
+        Log("=== Done: %d/%d loaded (skipping RLC) ===\n", ok, count);
+        return FALSE;
+    }
+}
+
+BOOL RingAutoloadRlc(HANDLE hDevice)
+{
+    ULONG resp = 0;
+    DWORD returned = 0;
+    Log("AUTOLOAD_RLC (trigger GPU FW execution)...\n");
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_AUTOLOAD_RLC,
+        NULL, 0, &resp, sizeof(resp), &returned, NULL);
+    if (ok) { Log("  OK (C2PMSG_64=0x%08X)\n", resp); }
+    else { Log("  FAILED (err=%lu)\n", GetLastError()); }
+    return ok;
 }
 
 BOOL GetGpuInfo(HANDLE hDevice)
@@ -539,6 +558,7 @@ void PrintUsage(const char *prog)
     printf("  -A                 Load ALL GPU FW via PSP ring (cyan_skillfish2)\n");
     printf("  -G                 Get GPU bridge info (ring PA, TMR, FW status)\n");
     printf("  -P <id> <val>      Program register through PSP ring\n");
+    printf("  -T                 Trigger RLC autoload (start GPU FW execution)\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -T                 Run comprehensive HW probe (mailbox + NBIO + ring)\n");
@@ -700,6 +720,10 @@ int main(int argc, char *argv[])
             ULONG regId = (ULONG)strtoul(argv[++i], NULL, 0);
             ULONG val = (ULONG)strtoul(argv[++i], NULL, 0);
             ok = ProgReg(h, regId, val);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-T") == 0) {
+            ok = RingAutoloadRlc(h);
             if (!ok) { ret = 1; }
         }
         else if (strcmp(argv[i], "-m") == 0) {

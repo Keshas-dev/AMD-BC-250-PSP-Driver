@@ -1086,6 +1086,51 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
 
+        case IOCTL_PSP_AUTOLOAD_RLC:
+        {
+            if (!devExt->RingCreated) { status = STATUS_DEVICE_NOT_READY; break; }
+
+            // Build command buffer with GFX_CMD_ID_AUTOLOAD_RLC (0x21)
+            RtlZeroMemory(g_CmdBuffer, PSP_CMD_BUF_SIZE);
+            PULONG cmd = (PULONG)g_CmdBuffer;
+            cmd[0] = PSP_CMD_BUF_SIZE;
+            cmd[1] = 1;
+            cmd[2] = 0x00000021;  // GFX_CMD_ID_AUTOLOAD_RLC
+            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
+
+            // Build ring frame
+            if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
+                ringWriteOffset = 0;
+            PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
+            RtlZeroMemory(frame, PSP_RING_FRAME_SIZE);
+            frame[0] = (ULONG)(cmdPa.QuadPart & 0xFFFFFFFF);
+            frame[1] = (ULONG)(cmdPa.QuadPart >> 32);
+            frame[2] = PSP_CMD_BUF_SIZE;
+            ringWriteOffset += PSP_RING_FRAME_SIZE;
+
+            KdPrint(("AUTOLOAD_RLC: triggering GPU firmware execution\n"));
+
+            // Set wptr (C2PMSG_67) and wait for response on C2PMSG_64
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+
+            ULONG timeout, resp = 0;
+            for (timeout = 0; timeout < 5000; timeout++) {  // Up to 5s for RLC autoload
+                KeStallExecutionProcessor(1000);
+                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                if (resp & 0x80000000) {
+                    ULONG st = resp & 0x0000FFFF;
+                    ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
+                    status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+                    KdPrint(("AUTOLOAD_RLC: C2PMSG_64=0x%08X cmdResp=0x%08X\n", resp, cbStatus));
+                    break;
+                }
+            }
+            if (timeout >= 5000) { KdPrint(("AUTOLOAD_RLC: timeout\n")); status = STATUS_TIMEOUT; }
+
+            if (outputLength >= sizeof(ULONG)) { ((PULONG)outputBuffer)[0] = resp; bytesReturned = sizeof(ULONG); }
+            break;
+        }
+
         default:
             status = STATUS_INVALID_DEVICE_REQUEST;
             break;
