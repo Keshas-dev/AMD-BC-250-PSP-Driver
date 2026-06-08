@@ -104,17 +104,18 @@ BOOL UnlockNbio(HANDLE hDevice)
 
 BOOL CreateRing(HANDLE hDevice)
 {
-    ULONG resp[2] = {0};
+    ULONG resp[3] = {0};
     DWORD returned = 0;
 
     Log("CREATE_RING...\n");
     BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_CREATE_RING,
         NULL, 0, &resp, sizeof(resp), &returned, NULL);
 
-    if (ok && returned >= sizeof(ULONG) * 2) {
-        Log("Ring created: PA=0x%08X C2PMSG_64=0x%08X%s\n",
-            resp[0], resp[1],
-            (resp[1] & 0x80000000) ? " TOS_RESPONSE" : "");
+    if (ok && returned >= sizeof(ULONG) * 3) {
+        Log("Ring: PA=0x%08X C64pre=0x%08X C64post=0x%08X\n",
+            resp[0], resp[1], resp[2]);
+    } else if (ok && returned >= sizeof(ULONG) * 2) {
+        Log("Ring: PA=0x%08X C2PMSG_64=0x%08X\n", resp[0], resp[1]);
     } else if (ok) {
         Log("Ring created (partial response)\n");
     } else {
@@ -125,17 +126,19 @@ BOOL CreateRing(HANDLE hDevice)
 
 BOOL NbioViaRing(HANDLE hDevice)
 {
-    ULONG resp[3] = {0};
+    ULONG resp[4] = {0};
     DWORD returned = 0;
 
     Log("NBIO_VIA_RING...\n");
     BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_NBIO_VIA_RING,
         NULL, 0, &resp, sizeof(resp), &returned, NULL);
 
-    if (ok && returned >= sizeof(ULONG) * 3) {
-        Log("cmd=0x%08X C2PMSG_64=0x%08X MMHUB=0x%08X%s\n",
-            resp[0], resp[1], resp[2],
-            (resp[2] != 0xFFFFFFFF) ? " *** NBIO UNLOCKED? ***" : "");
+    if (ok && returned >= sizeof(ULONG) * 4) {
+        Log("cmd=0x%08X C64post=0x%08X MMHUB=0x%08X GRBM=0x%08X%s\n",
+            resp[0], resp[1], resp[2], resp[3],
+            (resp[3] != 0xFFFFFFFF) ? " *** GRBM UNLOCKED ***" : " (BLOCKED)");
+    } else if (ok && returned >= sizeof(ULONG) * 3) {
+        Log("cmd=0x%08X C2PMSG_64=0x%08X MMHUB=0x%08X\n", resp[0], resp[1], resp[2]);
     } else if (ok) {
         Log("NBIO via ring (partial response)\n");
     } else {
@@ -154,14 +157,17 @@ BOOL GetPspStatus(HANDLE hDevice)
 
     if (ok && returned >= sizeof(PSP_STATUS_INFO)) {
         Log("=== PSP STATUS ===\n");
-        Log("  C2PMSG_81=0x%08X  C2PMSG_35=0x%08X  C2PMSG_36=0x%08X\n", info.C2PMSG_81, info.C2PMSG_35, info.C2PMSG_36);
+        Log("  C2PMSG_35=0x%08X  C2PMSG_36=0x%08X  C2PMSG_37=0x%08X\n", info.C2PMSG_35, info.C2PMSG_36, info.C2PMSG_37);
+        Log("  C2PMSG_64=0x%08X  C2PMSG_81=0x%08X\n", info.C2PMSG_64, info.C2PMSG_81);
         Log("  PSP Alive: %s\n", info.PspAlive ? "YES" : "NO");
         Log("  FW Loaded: %s (%u bytes, PA>>20=0x%08X)\n", info.FwLoaded ? "YES" : "NO", info.FwSize, info.FwPaShifted);
         Log("  NBIO SIG1=0x%08X SIG2=0x%08X\n", info.NbioSig1, info.NbioSig2);
         Log("  GRBM_STATUS=0x%08X%s\n", info.GrbmStatus,
             (info.GrbmStatus != 0xFFFFFFFF) ? " *** UNLOCKED ***" : " (BLOCKED)");
-        Log("  MMHUB=0x%08X  MMIO VA=0x%08X  Size=%u\n", info.MmhubCheck, info.MmioVA, info.MmioSize);
-        Log("  Ring Created: %s\n", info.RingCreated ? "YES" : "NO");
+        Log("  GC (0x3000)=0x%08X  HDP (0x05A0)=0x%08X  MMHUB (0x50D0)=0x%08X\n",
+            info.GcCheck, info.HdpCheck, info.MmhubCheck);
+        Log("  MMIO VA=0x%08X  Size=%u  Ring Created: %s\n", info.MmioVA, info.MmioSize,
+            info.RingCreated ? "YES" : "NO");
     } else {
         Log("GET_STATUS FAILED (err=%lu)\n", GetLastError());
     }
@@ -234,6 +240,62 @@ BOOL LoadEmbeddedFirmware(HANDLE hDevice)
         Log("LOAD_EMBEDDED_FW FAILED (err=%lu)\n", GetLastError());
     }
     return ok;
+}
+
+BOOL ComprehensiveProbe(HANDLE hDevice)
+{
+    PSP_PROBE_INFO probe = {0};
+    DWORD returned = 0;
+
+    Log("=== COMPREHENSIVE HW PROBE ===\n");
+
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_PROBE,
+        NULL, 0, &probe, sizeof(probe), &returned, NULL);
+
+    if (!ok || returned < sizeof(probe)) {
+        Log("PROBE FAILED (err=%lu)\n", GetLastError());
+        return FALSE;
+    }
+
+    Log("--- Mailbox State ---\n");
+    Log("  C2PMSG_35 (cmd)  = 0x%08X\n", probe.C2PMSG_35);
+    Log("  C2PMSG_36 (data) = 0x%08X\n", probe.C2PMSG_36);
+    Log("  C2PMSG_37 (dataH)= 0x%08X\n", probe.C2PMSG_37);
+    Log("  C2PMSG_64 (ring) = 0x%08X\n", probe.C2PMSG_64);
+    Log("  C2PMSG_81 (stat) = 0x%08X", probe.C2PMSG_81);
+    if (probe.C2PMSG_81 == 0) Log(" (IDLE)");
+    else if (probe.C2PMSG_81 == 0xFFFFFFFF) Log(" (INVALID)");
+    else if (probe.C2PMSG_81 & 0x80000000) Log(" (PSP_RESPONSE)");
+    Log("\n");
+
+    Log("--- NBIO Region Probe ---\n");
+    Log("  SIG1 (0xC100)    = 0x%08X%s\n", probe.NbioSig1,
+        (probe.NbioSig1 == 0xFEDCBAEF) ? " (UNLOCKED)" : "");
+    Log("  SIG2 (0xC180)    = 0x%08X%s\n", probe.NbioSig2,
+        (probe.NbioSig2 == 0xFEDCBADF) ? " (UNLOCKED)" : "");
+    Log("  MMHUB (0x50D0)   = 0x%08X%s\n", probe.MmhubCheck,
+        (probe.MmhubCheck != 0 && probe.MmhubCheck != 0xFFFFFFFF) ? " (ACCESSIBLE)" : "");
+    Log("  GRBM (0x2004)    = 0x%08X%s\n", probe.GrbmStatus,
+        (probe.GrbmStatus != 0xFFFFFFFF) ? " *** ACCESSIBLE ***" : " (BLOCKED)");
+    Log("  GC (0x3000)      = 0x%08X%s\n", probe.GcCheck,
+        (probe.GcCheck != 0 && probe.GcCheck != 0xFFFFFFFF) ? " (ACCESSIBLE)" : "");
+    Log("  HDP (0x05A0)     = 0x%08X%s\n", probe.HdpCheck,
+        (probe.HdpCheck != 0 && probe.HdpCheck != 0xFFFFFFFF) ? " (ACCESSIBLE)" : "");
+
+    Log("--- Operations ---\n");
+    Log("  NBIO sig write   = %s\n", probe.SigWriteOk ? "OK" : "FAIL");
+    Log("  Ring register    = %s", probe.RingProgOk ? "OK" : "FAIL");
+    if (probe.RingCreated) Log(" (was created)");
+    Log("\n");
+    Log("  NBIO via ring    = %s", probe.NbioViaRingOk ? "OK" : "FAIL");
+    if (probe.NbioViaRingOk) Log(" *** GRBM UNLOCKED! ***");
+    Log("\n");
+
+    Log("--- Ring Buffer State ---\n");
+    Log("  AddrLow=0x%08X AddrHigh=0x%08X Size=%u\n",
+        probe.RingAddrLow, probe.RingAddrHigh, probe.RingSize);
+
+    return TRUE;
 }
 
 BOOL SendCommand(HANDLE hDevice, ULONG command)
@@ -348,6 +410,80 @@ BOOL LoadFirmware(HANDLE hDevice, const char* filename)
     return ok;
 }
 
+BOOL RingLoadIpFw(HANDLE hDevice, ULONG fwType, const char* filename)
+{
+    FILE* f = fopen(filename, "rb");
+    if (!f) {
+        Log("Failed to open FW file: %s\n", filename);
+        return FALSE;
+    }
+    fseek(f, 0, SEEK_END);
+    long fwSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fwSize <= 0 || fwSize > 1024*1024) {
+        Log("Invalid FW size: %ld\n", fwSize);
+        fclose(f); return FALSE;
+    }
+
+    ULONG inputSize = sizeof(PSP_RING_FW_REQUEST) + fwSize;
+    BYTE* inputBuf = (BYTE*)malloc(inputSize);
+    if (!inputBuf) { fclose(f); return FALSE; }
+
+    PSP_RING_FW_REQUEST* req = (PSP_RING_FW_REQUEST*)inputBuf;
+    req->FwType = fwType;
+    req->FwSize = fwSize;
+    size_t read = fread(inputBuf + sizeof(PSP_RING_FW_REQUEST), 1, fwSize, f);
+    fclose(f);
+    if ((long)read != fwSize) { free(inputBuf); return FALSE; }
+
+    Log("RING_LOAD_IP_FW(type=%u, %s, %ld bytes)...\n", fwType, filename, fwSize);
+
+    ULONG resp = 0;
+    DWORD returned = 0;
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_RING_LOAD_IP_FW,
+        inputBuf, inputSize, &resp, sizeof(resp), &returned, NULL);
+
+    free(inputBuf);
+
+    if (ok) { Log("  OK (PA>>20=0x%08X)\n", resp); }
+    else { Log("  FAILED (err=%lu)\n", GetLastError()); }
+    return ok;
+}
+
+static const char* FwTypeName(ULONG t) {
+    switch (t) {
+        case 1: return "CE";   case 2: return "PFP";
+        case 3: return "ME";   case 4: return "MEC";
+        case 5: return "MEC2"; case 6: return "RLC";
+        case 7: return "SDMA"; case 8: return "SDMA1";
+        default: return "?";
+    }
+}
+
+BOOL RingLoadAllFw(HANDLE hDevice)
+{
+    // NOTE: Decompressed .bin files must be in the working directory (e.g., `output\`)
+    static const struct { ULONG type; const char* name; } fw_list[] = {
+        {1, "cyan_skillfish2_ce.bin"},
+        {2, "cyan_skillfish2_pfp.bin"},
+        {3, "cyan_skillfish2_me.bin"},
+        {4, "cyan_skillfish2_mec.bin"},
+        {5, "cyan_skillfish2_mec2.bin"},
+        {6, "cyan_skillfish2_rlc.bin"},
+        {7, "cyan_skillfish2_sdma.bin"},
+        {8, "cyan_skillfish2_sdma1.bin"},
+    };
+    int count = sizeof(fw_list)/sizeof(fw_list[0]);
+    int ok = 0;
+    Log("=== Loading ALL GPU FW via PSP ring ===\n");
+    for (int i = 0; i < count; i++) {
+        Log("[%d/%d] %s: ", i+1, count, FwTypeName(fw_list[i].type));
+        if (RingLoadIpFw(hDevice, fw_list[i].type, fw_list[i].name)) ok++;
+    }
+    Log("=== Done: %d/%d loaded ===\n", ok, count);
+    return ok == count;
+}
+
 void PrintUsage(const char *prog)
 {
     printf("Usage: %s [options]\n", prog);
@@ -365,8 +501,11 @@ void PrintUsage(const char *prog)
     printf("  -B                 Full boot sequence (embedded FW + SYSDRV 0x4 + SOS 0x8)\n");
     printf("  -pb <bus> <df> <off>  PCI config read (bus, device<<3|func, offset hex)\n");
     printf("  -pw <bus> <df> <off> <val>  PCI config write\n");
+    printf("  -L <type> <file>   Load GPU FW via PSP ring (type: 1=CE 2=PFP 3=ME 4=MEC 5=MEC2 6=RLC 7=SDMA 8=SDMA1)\n");
+    printf("  -A                 Load ALL GPU FW via PSP ring (cyan_skillfish2)\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
+    printf("  -T                 Run comprehensive HW probe (mailbox + NBIO + ring)\n");
     printf("  -l <logfile>       Write log to file\n");
     printf("\nExamples:\n");
     printf("  %s -i 0xFE800000 0x100000     Init HW with BAR5 at 0xFE800000\n", prog);
@@ -507,6 +646,16 @@ int main(int argc, char *argv[])
                 ret = 1;
             }
         }
+        else if (strcmp(argv[i], "-L") == 0 && i + 2 < argc) {
+            ULONG fwType = (ULONG)strtoul(argv[++i], NULL, 0);
+            const char* filename = argv[++i];
+            ok = RingLoadIpFw(h, fwType, filename);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-A") == 0) {
+            ok = RingLoadAllFw(h);
+            if (!ok) { ret = 1; }
+        }
         else if (strcmp(argv[i], "-m") == 0) {
             Log("MAILBOX STATUS (C2PMSG_81): ");
             ok = ReadRegister(h, PSP_C2PMSG_81_OFFSET, &value);
@@ -516,6 +665,10 @@ int main(int argc, char *argv[])
                 Log("FAILED (err=%lu)\n", GetLastError());
                 ret = 1;
             }
+        }
+        else if (strcmp(argv[i], "-T") == 0) {
+            ok = ComprehensiveProbe(h);
+            if (!ok) { ret = 1; }
         }
         else if (strcmp(argv[i], "-t") == 0) {
             Log("=== Connectivity Test ===\n");

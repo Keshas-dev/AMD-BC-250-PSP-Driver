@@ -26,12 +26,30 @@ extern "C" {
 #define IOCTL_PSP_BOOT_SEQUENCE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_PCI_READ           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_PCI_WRITE          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_PROBE              CTL_CODE(FILE_DEVICE_UNKNOWN, 0x813, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_RING_LOAD_IP_FW    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x814, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
 #define PSP_C2PMSG_35_OFFSET  0x1056C   // Command register
 #define PSP_C2PMSG_36_OFFSET  0x10570   // Data register  
 #define PSP_C2PMSG_81_OFFSET  0x10614   // Status register
+
+// GFX firmware type codes (used with IOCTL_PSP_RING_LOAD_IP_FW)
+#define GFX_FW_TYPE_CE      1
+#define GFX_FW_TYPE_PFP     2
+#define GFX_FW_TYPE_ME      3
+#define GFX_FW_TYPE_MEC     4
+#define GFX_FW_TYPE_MEC2    5
+#define GFX_FW_TYPE_RLC     6
+#define GFX_FW_TYPE_SDMA    7
+#define GFX_FW_TYPE_SDMA1   8
+
+// PSP ring frame command IDs
+#define GFX_CMD_ID_LOAD_IP_FW  0x0000000A
+
+// Ring frame size (5 DWORDs: cmd_id, fw_type, pa_lo, pa_hi, fw_size)
+#define PSP_RING_FRAME_SIZE  20
 
 // IOCTL input/output structures
 #pragma pack(push, 1)
@@ -72,6 +90,10 @@ typedef struct _PSP_STATUS_INFO {
     ULONG MmioVA;              // BAR5 virtual address
     ULONG MmioSize;            // BAR5 mapped size
     ULONG RingCreated;         // 1 if PSP ring is active
+    ULONG C2PMSG_37;           // Raw C2PMSG_37 value
+    ULONG C2PMSG_64;           // Raw C2PMSG_64 value (ring control)
+    ULONG GcCheck;             // GC register (0x3000)
+    ULONG HdpCheck;            // HDP register (0x05A0)
 } PSP_STATUS_INFO, *PPSP_STATUS_INFO;
 
 // For IOCTL_PSP_INIT_HW, input is physical address + size
@@ -89,6 +111,39 @@ typedef struct _PSP_LOAD_FW_RESPONSE {
     ULONG Status;           // NTSTATUS equivalent
     ULONG MailboxStatus;    // C2PMSG_81 value after command
 } PSP_LOAD_FW_RESPONSE, *PPSP_LOAD_FW_RESPONSE;
+
+// Comprehensive HW probe output
+typedef struct _PSP_PROBE_INFO {
+    // Mailbox registers
+    ULONG C2PMSG_35;
+    ULONG C2PMSG_36;
+    ULONG C2PMSG_37;
+    ULONG C2PMSG_64;
+    ULONG C2PMSG_81;
+    // NBIO unlock results
+    ULONG NbioSig1;
+    ULONG NbioSig2;
+    ULONG MmhubCheck;
+    ULONG GrbmStatus;
+    ULONG GcCheck;
+    ULONG HdpCheck;
+    // Ring state
+    ULONG RingCreated;
+    ULONG RingAddrLow;
+    ULONG RingAddrHigh;
+    ULONG RingSize;
+    // Operation results
+    ULONG SigWriteOk;
+    ULONG RingProgOk;
+    ULONG NbioViaRingOk;
+} PSP_PROBE_INFO, *PPSP_PROBE_INFO;
+
+// For IOCTL_PSP_RING_LOAD_IP_FW, input buffer contains this struct + firmware blob
+typedef struct _PSP_RING_FW_REQUEST {
+    ULONG FwType;       // GFX_FW_TYPE code (CE=1, PFP=2, ME=3, MEC=4, MEC2=5, RLC=6, SDMA=7, SDMA1=8)
+    ULONG FwSize;       // Size of firmware blob that follows in the input buffer
+    // Firmware data follows immediately in the input buffer after this struct
+} PSP_RING_FW_REQUEST, *PPSP_RING_FW_REQUEST;
 
 #pragma pack(pop)
 
