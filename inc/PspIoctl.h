@@ -28,6 +28,8 @@ extern "C" {
 #define IOCTL_PSP_PCI_WRITE          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_PROBE              CTL_CODE(FILE_DEVICE_UNKNOWN, 0x813, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_RING_LOAD_IP_FW    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x814, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_GET_GPU_INFO        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x815, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_REG_PROG            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x816, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
@@ -44,6 +46,13 @@ extern "C" {
 #define GFX_FW_TYPE_RLC_G      8
 #define GFX_FW_TYPE_SDMA0      9
 #define GFX_FW_TYPE_SDMA1      10
+
+// PSP register program IDs (from Linux psp_reg_prog_id enum)
+#define PSP_REG_IH_RB_CNTL         0
+#define PSP_REG_IH_RB_CNTL_RING1   1
+#define PSP_REG_IH_RB_CNTL_RING2   2
+#define PSP_REG_MMHUB_L1_TLB_CNTL  25
+#define PSP_REG_LAST               26
 
 // Compat aliases
 #define GFX_FW_TYPE_CE     GFX_FW_TYPE_CP_CE
@@ -154,6 +163,25 @@ typedef struct _PSP_RING_FW_REQUEST {
     ULONG FwSize;       // Size of firmware blob that follows in the input buffer
     // Firmware data follows immediately in the input buffer after this struct
 } PSP_RING_FW_REQUEST, *PPSP_RING_FW_REQUEST;
+
+// Output for IOCTL_PSP_GET_GPU_INFO — info GPU driver needs on init
+typedef struct _PSP_GPU_INFO {
+    ULONG RingBufferPA;       // Physical address of the PSP ring buffer (low 32 bits)
+    ULONG FwLoaded;           // 1 if GPU FW loaded via ring
+    ULONG FwCount;            // Number of GPU FW components loaded (max 8)
+    ULONG TMRBase;            // TMR base address (Linux uses 0xF40F800000)
+    ULONG TMSSize;            // TMR size (4MB)
+    ULONG GfxVersion;         // GPU IP version (cyan_skillfish2 = 10)
+    ULONG C2pmsg64;           // Current C2PMSG_64 value
+    ULONG C2pmsg81;           // Current C2PMSG_81 value (SOS alive = 0xF0000010)
+} PSP_GPU_INFO, *PPSP_GPU_INFO;
+
+// Input for IOCTL_PSP_REG_PROG — program a register through PSP
+// Uses GFX_CMD_ID_PROG_REG (0x0B) via the ring
+typedef struct _PSP_REG_PROG_REQUEST {
+    ULONG RegId;             // Register ID (see psp_reg_prog_id enum)
+    ULONG RegValue;          // Value to program
+} PSP_REG_PROG_REQUEST, *PPSP_REG_PROG_REQUEST;
 
 #pragma pack(pop)
 

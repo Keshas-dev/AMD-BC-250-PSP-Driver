@@ -1001,6 +1001,89 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
 
+        case IOCTL_PSP_GET_GPU_INFO:
+        {
+            if (outputLength < sizeof(PSP_GPU_INFO)) {
+                status = STATUS_BUFFER_TOO_SMALL; break;
+            }
+            PSP_GPU_INFO* info = (PSP_GPU_INFO*)outputBuffer;
+            RtlZeroMemory(info, sizeof(PSP_GPU_INFO));
+
+            info->RingBufferPA = (ULONG)(g_RingBufferPhysical.QuadPart & 0xFFFFFFFF);
+            info->FwLoaded = devExt->FwBuffer ? 1 : 0;
+            info->FwCount = 0;
+            info->TMRBase = 0xF40F800000;
+            info->TMSSize = 0x400000;
+            info->GfxVersion = 10;
+
+            info->C2pmsg64 = READ_REGISTER_ULONG(
+                (PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            info->C2pmsg81 = READ_REGISTER_ULONG(
+                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
+
+            bytesReturned = sizeof(PSP_GPU_INFO);
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        case IOCTL_PSP_REG_PROG:
+        {
+            if (inputLength < sizeof(PSP_REG_PROG_REQUEST)) {
+                status = STATUS_INVALID_PARAMETER; break;
+            }
+            if (!devExt->RingCreated) {
+                status = STATUS_DEVICE_NOT_READY; break;
+            }
+
+            PSP_REG_PROG_REQUEST* req = (PSP_REG_PROG_REQUEST*)inputBuffer;
+            ULONG regId = req->RegId;
+            ULONG regVal = req->RegValue;
+
+            RtlZeroMemory(g_CmdBuffer, PSP_CMD_BUF_SIZE);
+            PULONG cmd = (PULONG)g_CmdBuffer;
+            cmd[0] = PSP_CMD_BUF_SIZE;
+            cmd[1] = 1;
+            cmd[2] = 0x0000000B;
+            cmd[7] = regVal;
+            cmd[8] = regId;
+            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
+
+            if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
+                ringWriteOffset = 0;
+            PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
+            RtlZeroMemory(frame, PSP_RING_FRAME_SIZE);
+            frame[0] = (ULONG)(cmdPa.QuadPart & 0xFFFFFFFF);
+            frame[1] = (ULONG)(cmdPa.QuadPart >> 32);
+            frame[2] = PSP_CMD_BUF_SIZE;
+            ringWriteOffset += PSP_RING_FRAME_SIZE;
+
+            KdPrint(("REG_PROG: id=%u val=0x%08X\n", regId, regVal));
+
+            WRITE_REGISTER_ULONG(
+                (PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+
+            ULONG timeout, resp = 0;
+            for (timeout = 0; timeout < 1000; timeout++) {
+                KeStallExecutionProcessor(1000);
+                resp = READ_REGISTER_ULONG(
+                    (PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                if (resp & 0x80000000) {
+                    ULONG st = resp & 0x0000FFFF;
+                    ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
+                    status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+                    KdPrint(("REG_PROG: C2PMSG_64=0x%08X cmdResp=0x%08X\n", resp, cbStatus));
+                    break;
+                }
+            }
+            if (timeout >= 1000) { status = STATUS_TIMEOUT; }
+
+            if (outputLength >= sizeof(ULONG)) {
+                ((PULONG)outputBuffer)[0] = regVal;
+                bytesReturned = sizeof(ULONG);
+            }
+            break;
+        }
+
         default:
             status = STATUS_INVALID_DEVICE_REQUEST;
             break;

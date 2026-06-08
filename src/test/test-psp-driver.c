@@ -484,6 +484,40 @@ BOOL RingLoadAllFw(HANDLE hDevice)
     return ok == count;
 }
 
+BOOL GetGpuInfo(HANDLE hDevice)
+{
+    PSP_GPU_INFO info = {0};
+    DWORD returned = 0;
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_GET_GPU_INFO,
+        NULL, 0, &info, sizeof(info), &returned, NULL);
+    if (ok && returned >= sizeof(PSP_GPU_INFO)) {
+        Log("=== GPU BRIDGE INFO ===\n");
+        Log("  RingBuffer PA = 0x%08X\n", info.RingBufferPA);
+        Log("  TMR Base      = 0x%08X (size=%u)\n", info.TMRBase, info.TMSSize);
+        Log("  GPU FW Loaded = %s (%u components)\n", info.FwLoaded ? "YES" : "NO", info.FwCount);
+        Log("  GFX Version   = %u (cyan_skillfish2=gfx_v10_0_0)\n", info.GfxVersion);
+        Log("  C2PMSG_64     = 0x%08X\n", info.C2pmsg64);
+        Log("  C2PMSG_81     = 0x%08X  %s\n", info.C2pmsg81,
+            (info.C2pmsg81 == 0xF0000010) ? "(SOS Alive)" : "");
+    } else {
+        Log("GET_GPU_INFO FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
+BOOL ProgReg(HANDLE hDevice, ULONG regId, ULONG value)
+{
+    PSP_REG_PROG_REQUEST req = { regId, value };
+    ULONG resp = 0;
+    DWORD returned = 0;
+    Log("REG_PROG(id=%u, val=0x%08X)...\n", regId, value);
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_REG_PROG,
+        &req, sizeof(req), &resp, sizeof(resp), &returned, NULL);
+    if (ok) { Log("  OK (resp=0x%08X)\n", resp); }
+    else { Log("  FAILED (err=%lu)\n", GetLastError()); }
+    return ok;
+}
+
 void PrintUsage(const char *prog)
 {
     printf("Usage: %s [options]\n", prog);
@@ -503,6 +537,8 @@ void PrintUsage(const char *prog)
     printf("  -pw <bus> <df> <off> <val>  PCI config write\n");
     printf("  -L <type> <file>   Load GPU FW via PSP ring (type: 1=CE 2=PFP 3=ME 4=MEC 5=MEC2 6=RLC 7=SDMA 8=SDMA1)\n");
     printf("  -A                 Load ALL GPU FW via PSP ring (cyan_skillfish2)\n");
+    printf("  -G                 Get GPU bridge info (ring PA, TMR, FW status)\n");
+    printf("  -P <id> <val>      Program register through PSP ring\n");
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -T                 Run comprehensive HW probe (mailbox + NBIO + ring)\n");
@@ -654,6 +690,16 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "-A") == 0) {
             ok = RingLoadAllFw(h);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-G") == 0) {
+            ok = GetGpuInfo(h);
+            if (!ok) { ret = 1; }
+        }
+        else if (strcmp(argv[i], "-P") == 0 && i + 2 < argc) {
+            ULONG regId = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG val = (ULONG)strtoul(argv[++i], NULL, 0);
+            ok = ProgReg(h, regId, val);
             if (!ok) { ret = 1; }
         }
         else if (strcmp(argv[i], "-m") == 0) {
