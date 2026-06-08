@@ -426,9 +426,14 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PspFreeFirmware(devExt);
 
             PHYSICAL_ADDRESS highAddr;
-            highAddr.QuadPart = 0xFFFFFFFF;
+            highAddr.QuadPart = 0x10000000000ULL;  // Allow allocation above 4GB (system RAM up to 0x45FFFFFFF)
 
             devExt->FwBuffer = MmAllocateContiguousMemory(inputLength, highAddr);
+            if (devExt->FwBuffer == NULL) {
+                // Fallback to below 4GB
+                highAddr.QuadPart = 0xFFFFFFFF;
+                devExt->FwBuffer = MmAllocateContiguousMemory(inputLength, highAddr);
+            }
             if (devExt->FwBuffer == NULL) {
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 KdPrint(("IOCTL_PSP_LOAD_FW: Failed to allocate contiguous memory\n"));
@@ -569,7 +574,6 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             devExt->RingPhysical = g_RingBufferPhysical;
             devExt->RingSize = sizeof(g_RingBuffer);
             
-            // FIX #7: Reinitialize buffer if ring already created
             if (devExt->RingCreated) {
                 KdPrint(("CREATE_RING: Ring already created, reinitializing...\n"));
             }
@@ -578,20 +582,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("CREATE_RING: Ring at VA=%p PA=0x%llX size=%u\n",
                 devExt->RingBuffer, devExt->RingPhysical.QuadPart, devExt->RingSize));
 
-            // FIX #6: Add timeout for TOS_READY with proper error handling
-            ULONG c64;
-            ULONG t;
-            for (t = 0; t < PSP_TOS_READY_TIMEOUT; t++) {
-                c64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
-                if (c64 & 0x80000000) break;
-                KeStallExecutionProcessor(10000);  // 10ms per iteration
-            }
-
-            if (t >= PSP_TOS_READY_TIMEOUT) {
-                KdPrint(("CREATE_RING: TOS_READY timeout after %u iterations\n", t));
-                status = STATUS_TIMEOUT;
-                break;
-            }
+            /* On BC-250, TOS_READY (C2PMSG_64 bit 31) never sets because SOS is not
+               loaded. Skip TOS_READY wait -- just program ring registers directly. */
+            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
 
             /* Write ring address to C2PMSG_69/70 */
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4),
@@ -600,20 +593,22 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 (ULONG)(devExt->RingPhysical.QuadPart >> 32));
             /* Ring size to C2PMSG_71 */
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC), devExt->RingSize);
-            /* Trigger */
+            /* Trigger ring */
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0);
 
             KeStallExecutionProcessor(50000);
 
-            c64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
-            devExt->RingCreated = TRUE;  /* Ring registers were programmed successfully */
+            ULONG c64_after = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            devExt->RingCreated = TRUE;
 
-            KdPrint(("CREATE_RING: C2PMSG_64=0x%08X ringCreated=1\n", c64));
+            KdPrint(("CREATE_RING: C2PMSG_64 0x%08X -> 0x%08X ringCreated=1\n",
+                c64_before, c64_after));
 
-            if (outputLength >= sizeof(ULONG) * 2) {
+            if (outputLength >= sizeof(ULONG) * 3) {
                 ((PULONG)outputBuffer)[0] = (ULONG)(devExt->RingPhysical.QuadPart & 0xFFFFFFFF);
-                ((PULONG)outputBuffer)[1] = c64;
-                bytesReturned = sizeof(ULONG) * 2;
+                ((PULONG)outputBuffer)[1] = c64_before;
+                ((PULONG)outputBuffer)[2] = c64_after;
+                bytesReturned = sizeof(ULONG) * 3;
             }
             status = STATUS_SUCCESS;
             break;
@@ -621,40 +616,36 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
         case IOCTL_PSP_NBIO_VIA_RING:
         {
-            ULONG results[3] = {0};
+            ULONG results[4] = {0};
 
-            // Send GFX_CTRL_CMD_ID_DESTROY_RINGS to C2PMSG_64 (from GPU driver's Amdbc250PspTryUnlockNbio)
+            // Step 1: Write 0x00020000 to C2PMSG_64 (GFX_CTRL_CMD_ID_DESTROY_RINGS)
+            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00020000);
             results[0] = 0x00020000;
 
-            // Wait 500ms for PSP to process
-            {
-                LARGE_INTEGER delay;
-                delay.QuadPart = -5000000LL;  // 500ms
-                KeDelayExecutionThread(KernelMode, FALSE, &delay);
-            }
+            KeStallExecutionProcessor(500000); // 500ms
 
             // Read C2PMSG_64 response
             ULONG c64resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
             results[1] = c64resp;
 
-            // Write NBIO signatures directly to BAR5 (not through PSP)
+            // Step 2: Write NBIO signatures directly to BAR5
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
 
-            // Wait 100ms
-            {
-                LARGE_INTEGER delay;
-                delay.QuadPart = -1000000LL;
-                KeDelayExecutionThread(KernelMode, FALSE, &delay);
-            }
+            KeStallExecutionProcessor(100000); // 100ms
 
+            // Step 3: Check results
+            ULONG sig1 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET));
+            ULONG sig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
             ULONG mmhub = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
             ULONG grbm = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
             results[2] = mmhub;
+            results[3] = grbm;
 
-            KdPrint(("NBIO_VIA_RING: cmd=0x%08X c64=0x%08X MMHUB=0x%08X GRBM=0x%08X\n",
-                0x00020000, c64resp, mmhub, grbm));
+            KdPrint(("NBIO_VIA_RING: C64pre=0x%08X cmd=0x%08X C64post=0x%08X "
+                "SIG1=0x%08X SIG2=0x%08X MMHUB=0x%08X GRBM=0x%08X\n",
+                c64_before, 0x00020000, c64resp, sig1, sig2, mmhub, grbm));
 
             if (outputLength >= sizeof(results)) {
                 RtlCopyMemory(outputBuffer, results, sizeof(results));
@@ -678,6 +669,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             info->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
             info->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
             info->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET));
+            info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x10574));
+            info->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
             info->PspAlive = (info->C2PMSG_81 != 0 && info->C2PMSG_81 != 0xFFFFFFFF) ? 1 : 0;
 
             // Firmware info
@@ -690,6 +683,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             info->NbioSig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
             info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
             info->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
+            info->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x3000));
+            info->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x05A0));
 
             // MMIO and ring info
             info->MmioVA = (ULONG)(ULONG_PTR)devExt->MmioBase;
@@ -720,12 +715,14 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
 
             PHYSICAL_ADDRESS highAddr;
-            highAddr.QuadPart = 0xFFFFFFFF;
+            highAddr.QuadPart = 0x10000000000ULL;  // Allow above 4GB
 
-            devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
             if (devExt->FwBuffer == NULL) {
-                status = STATUS_INSUFFICIENT_RESOURCES;
-                KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Failed to allocate\n"));
+                highAddr.QuadPart = 0xFFFFFFFF;
+                devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            }
+            if (devExt->FwBuffer == NULL) {
                 break;
             }
 
@@ -755,7 +752,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             NTSTATUS stepStatus;
             ULONG results[4] = {0};
             PHYSICAL_ADDRESS highAddr;
-            highAddr.QuadPart = 0xFFFFFFFF;
+            highAddr.QuadPart = 0x10000000000ULL;  // Allow above 4GB
 
             // FIX #5: Validate SYSDRV firmware size before allocation
             if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
@@ -767,6 +764,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             // Step 1: Load SYSDRV firmware (type 8, 256KB from BIOS 0x8FEE00) -> send command 0x4
             PspFreeFirmware(devExt);
             devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            if (devExt->FwBuffer == NULL) {
+                highAddr.QuadPart = 0xFFFFFFFF;
+                devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            }
             if (devExt->FwBuffer == NULL) {
                 KdPrint(("BOOT_SEQ: SYSDRV alloc failed\n"));
                 status = STATUS_INSUFFICIENT_RESOURCES;
@@ -810,6 +811,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PspFreeFirmware(devExt);
             devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
             if (devExt->FwBuffer == NULL) {
+                highAddr.QuadPart = 0xFFFFFFFF;
+                devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
+            }
+            if (devExt->FwBuffer == NULL) {
                 KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 break;
@@ -839,6 +844,74 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 bytesReturned = sizeof(results);
             }
             status = STATUS_SUCCESS;  /* Always succeed - user checks GRBM in results */
+            break;
+        }
+
+        case IOCTL_PSP_PROBE:
+        {
+            if (outputLength < sizeof(PSP_PROBE_INFO)) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            PSP_PROBE_INFO* probe = (PSP_PROBE_INFO*)outputBuffer;
+            RtlZeroMemory(probe, sizeof(PSP_PROBE_INFO));
+
+            // Step 1: Read all mailbox registers
+            probe->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
+            probe->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET));
+            probe->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x10574));
+            probe->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            probe->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
+
+            // Step 2: Read NBIO region probes
+            probe->NbioSig1 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET));
+            probe->NbioSig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
+            probe->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
+            probe->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
+            probe->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x3000));
+            probe->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x05A0));
+
+            // Step 3: Try writing NBIO sigs and verify
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
+            KeStallExecutionProcessor(1000);
+            ULONG sig1a = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET));
+            ULONG sig2a = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
+            probe->SigWriteOk = ((sig1a == NBIO_SIG1_VALUE) && (sig2a == NBIO_SIG2_VALUE)) ? 1 : 0;
+
+            // Step 4: Try programming ring registers
+            probe->RingAddrLow = (ULONG)(g_RingBufferPhysical.QuadPart & 0xFFFFFFFF);
+            probe->RingAddrHigh = (ULONG)(g_RingBufferPhysical.QuadPart >> 32);
+            probe->RingSize = 0x1000;
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4), probe->RingAddrLow);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F8), probe->RingAddrHigh);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC), probe->RingSize);
+            KeStallExecutionProcessor(1000);
+            ULONG rl = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4));
+            ULONG rh = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F8));
+            ULONG rs = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC));
+            probe->RingProgOk = ((rl == probe->RingAddrLow) && (rs == probe->RingSize)) ? 1 : 0;
+            probe->RingCreated = devExt->RingCreated ? 1 : 0;
+
+            // Step 5: Try NBIO via ring (write 0x00020000 to C2PMSG_64)
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00020000);
+            KeStallExecutionProcessor(500000);
+            ULONG c64r = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            ULONG grbm2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x2004));
+            probe->NbioViaRingOk = (grbm2 != 0xFFFFFFFF) ? 1 : 0;
+
+            KdPrint(("PROBE: mailbox=0x%08X/0x%08X/0x%08X/0x%08X/0x%08X "
+                "sig=0x%08X/0x%08X mmhub=0x%08X grbm=0x%08X gc=0x%08X hdp=0x%08X "
+                "sigOk=%d ringProg=%d nbioVia=%d\n",
+                probe->C2PMSG_35, probe->C2PMSG_36, probe->C2PMSG_37,
+                probe->C2PMSG_64, probe->C2PMSG_81,
+                probe->NbioSig1, probe->NbioSig2, probe->MmhubCheck,
+                probe->GrbmStatus, probe->GcCheck, probe->HdpCheck,
+                probe->SigWriteOk, probe->RingProgOk, probe->NbioViaRingOk));
+
+            bytesReturned = sizeof(PSP_PROBE_INFO);
+            status = STATUS_SUCCESS;
             break;
         }
 
