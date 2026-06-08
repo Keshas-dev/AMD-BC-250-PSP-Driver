@@ -174,9 +174,9 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
         0
     );
 
-    // Restore original C2PMSG_81 value (SOS alive flag) if it was set,
-    // so GPU driver's Amdbc250PspInit() sees SOS is alive
-    if (originalC2pmsg81 != 0 && NT_SUCCESS(status)) {
+    // Restore SOS alive flag (0xF0000010) if it was present before command
+    // This preserves the indicator that GPU driver Amdbc250PspInit() relies on
+    if (originalC2pmsg81 == 0xF0000010 && NT_SUCCESS(status)) {
         WRITE_REGISTER_ULONG(
             (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET),
             originalC2pmsg81
