@@ -191,7 +191,41 @@ The arrays in `firmware_data.h` are correctly named for this BIOS (5.00) $PSP ta
 
 Verified against the user's BIOS dump. If regenerating `firmware_data.h` from a different BIOS, verify the $PSP table type assignments before generating.
 
-## Known pitfalls
+## GPU Driver Integration API
+
+### Initialization sequence
+```
+1. PSP_INIT_HW     → {0xFE800000, 0x200000}     // Map BAR5
+2. PSP_BOOT_SEQ    → NULL                        // Load FW + CMD 0x4 + CMD 0x8
+3. PSP_NBIO_UNLOCK → NULL                        // Write NBIO sigs
+4. PSP_GET_GPU_INFO → PSP_GPU_INFO               // Check C2PMSG_81, get TMR/ring info
+5. Verify info.C2pmsg81 == 0xF0000010            // SOS alive
+```
+
+### Accessible MMIO ranges
+| Range | Example offset | Status |
+|-------|---------------|--------|
+| GC | 0x3000 | Unlocked (READ_REG/WRITE_REG ok) |
+| MMHUB | 0x5000-0x50D0 | Unlocked |
+| HDP | 0x05A0 | Unlocked |
+| NBIO SIG | 0xC100, 0xC180 | Writable |
+| **GRBM/CP** | **0x2000-0x2FFF** | **HW BLOCKED (0xFFFFFFFF)** |
+
+### Limitations
+- GRBM/CP registers return 0xFFFFFFFF — PS5 Oberon hardware block
+- PSP GPCOM ring not supported by BIOS SOS (C2PMSG_64 always 0)
+- Sos alive indicator: C2PMSG_81 = 0xF0000010
+
+### Useful IOCTLs for GPU driver
+| IOCTL | Code | Use |
+|-------|------|-----|
+| PSP_INIT_HW | 0x803 | One-time MMIO mapping |
+| PSP_BOOT_SEQUENCE | 0x810 | Automated FW boot |
+| PSP_NBIO_UNLOCK | 0x804 | NBIO sig registers |
+| PSP_GET_GPU_INFO | 0x815 | Bridge status snapshot |
+| PSP_READ_REG | 0x800 | Read unlocked registers |
+| PSP_WRITE_REG | 0x801 | Write unlocked registers |
+| PSP_SEND_CMD | 0x805 | Raw mailbox command |
 
 - **Secure Boot must be OFF** in BIOS. Test signing is blocked if Secure Boot is on.
 - **Driver Code 0x7e**: Linking with WDF libraries (KMDF) instead of WDM. Do not add `wdf` libs.
