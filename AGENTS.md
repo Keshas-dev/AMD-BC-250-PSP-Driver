@@ -18,6 +18,7 @@ cl /W3 /Zi /O2 /D_AMD64_ /Iinc src\test\test-psp-driver.c /Fe:output\test-psp-dr
 
 - **WDM** (native NT), NOT KMDF (KMDF caused 0x7e). No WDF libs in link step.
 - Target: PCI `VEN_1022&DEV_143E` (AMD PSP on BC-250 / PS5 Oberon)
+- **BIOS**: Version 5.00 from `BC250_5.00_clv.bin` (all FW extracted from this version)
 - MMIO maps **Graphics BAR5** (`0xFE800000`), not PSP BAR0. C2PMSG mailbox lives in BAR5.
 - IOCTL: `METHOD_BUFFERED`, device `\Device\AmdBcPsp`, symlink `\DosDevices\AmdBcPsp`
 - User-mode: `test-psp-driver.exe` talks via `DeviceIoControl` to `\\.\AmdBcPsp`

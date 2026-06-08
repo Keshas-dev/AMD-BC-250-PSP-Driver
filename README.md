@@ -20,6 +20,7 @@ This driver provides low-level access to the AMD BC-250 PSP hardware via:
 
 - **Device**: PCI\VEN_1022&DEV_143E (AMD PSP)
 - **Platform**: AMD BC-250 (PS5 Oberon variant)
+- **BIOS**: Version 5.00 (`BC250_5.00_clv.bin`)
 - **Architecture**: WDM (native NT)
 
 ## Repository Structure
