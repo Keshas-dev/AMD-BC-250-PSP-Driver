@@ -40,7 +40,9 @@ Critical protocol flow for firmware loading on BC-250 PSP:
 3. WRITE_REGISTER_ULONG(C2PMSG_35, cmd)   # Command (0x4 = SYSDRV, 0x8 = SOS)
 4. Poll C2PMSG_81 until != initial value  # Wait for PSP response
 5. Decode response: bit 31 = done, bits[27:0] = status (0 = success)
-6. WRITE_REGISTER_ULONG(C2PMSG_81, 0)     # Acknowledge
+6. WRITE_REGISTER_ULONG(C2PMSG_35, 0)     # ACK (do NOT clear C2PMSG_81!)
+7. IF original C2PMSG_81 was SOS alive (0xF0000010) AND status === success:
+   RESTORE original value to C2PMSG_81   # Preserve SOS alive flag for GPU driver
 ```
 
 ### PSP error codes
