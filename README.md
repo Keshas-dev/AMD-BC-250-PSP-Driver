@@ -20,7 +20,7 @@ This driver provides low-level access to the AMD BC-250 PSP hardware via:
 
 - **Device**: PCI\VEN_1022&DEV_143E (AMD PSP)
 - **Platform**: AMD BC-250 (PS5 Oberon variant)
-- **Architecture**: KMDF (Kernel-Mode Driver Framework)
+- **Architecture**: WDM (native NT)
 
 ## Repository Structure
 
@@ -125,20 +125,39 @@ output\test-psp-driver.exe -t
 # Load firmware (persistent buffer, not freed after load)
 output\test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin
 
-# Two-stage PSP boot sequence (from sibling project PSP v11 code)
-output\test-psp-driver.exe -C 0x00000004      # SYSDRV command
-output\test-psp-driver.exe -C 0x00000008      # SOS command
+# Two-stage PSP boot (embedded FW + SYSDRV + SOS)
+output\test-psp-driver.exe -B
 
-# Check GRBM_STATUS after firmware load
-output\test-psp-driver.exe -r 0x2004
+# Create PSP GPCOM ring (psp_v11_0_8 protocol)
+output\test-psp-driver.exe -R
+
+# Load GPU firmware via PSP ring (8 files)
+output\test-psp-driver.exe -A
+
+# Or load single GPU firmware
+output\test-psp-driver.exe -L 9 cyan_skillfish2_sdma.bin
+
+# NBIO unlock + signature registers
+output\test-psp-driver.exe -U
+
+# Full status snapshot
+output\test-psp-driver.exe -s
 
 # Read any register
-output\test-psp-driver.exe -r 0xC100           # NBIO signature reg 1
-output\test-psp-driver.exe -r 0x50D0           # MMHUB register
-output\test-psp-driver.exe -w 0x1056C 0x1      # Write to register
+output\test-psp-driver.exe -r 0xC100
 
 # Quick help
 output\test-psp-driver.exe
+```
+
+### Full GPU bring-up sequence
+
+```cmd
+cd output
+test-psp-driver.exe -i 0xFE800000 0x200000   # Init BAR5
+test-psp-driver.exe -B                        # Load SYSDRV + SOS
+test-psp-driver.exe -R                        # Create GPCOM ring
+test-psp-driver.exe -A                        # Load all GPU FW (CE, PFP, ME, MEC, MEC2, RLC, SDMA0, SDMA1)
 ```
 
 ## IOCTL Interface
@@ -153,10 +172,12 @@ See `inc/PspIoctl.h` for full definitions:
 | `PSP_LOAD_FW` | 0x802 | Load firmware blob (persistent buffer) |
 | `PSP_SEND_CMD` | 0x805 | Send mailbox command (0x4=SYSDRV, 0x8=SOS) |
 | `PSP_NBIO_UNLOCK` | 0x804 | Write NBIO signature registers |
-| `PSP_CREATE_RING` | 0x806 | Create PSP ring buffer (C2PMSG_69/70/71/64) |
-| `PSP_NBIO_VIA_RING` | 0x807 | NBIO unlock via ring command (0x00020000) |
-| `PSP_GET_STATUS` | 0x808 | Comprehensive PSP status snapshot |
-| `PSP_LOAD_EMBEDDED_FW` | 0x809 | Load compiled-in firmware (no .bin needed) |
+| `PSP_CREATE_RING` | 0x806 | Create PSP ring buffer (GPCOM/KM, psp_v11_0_8) |
+| `PSP_NBIO_VIA_RING` | 0x807 | NBIO unlock + sigs via C2PMSG_64 |
+| `PSP_GET_STATUS` | 0x808 | Full PSP status snapshot |
+| `PSP_LOAD_EMBEDDED_FW` | 0x809 | Load compiled-in SYSDRV+SOS firmware |
+| `PSP_BOOT_SEQUENCE` | 0x810 | Automated boot: FW alloc + CMD 0x4 + CMD 0x8 + GRBM |
+| `PSP_RING_LOAD_IP_FW` | 0x814 | Load GPU IP firmware via PSP ring buffer |
 
 ## Architecture
 
