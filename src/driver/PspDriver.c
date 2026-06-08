@@ -53,6 +53,8 @@ DRIVER_DISPATCH PspDeviceControl;
 static UCHAR g_RingBuffer[0x1000];
 static BOOLEAN g_RingBufferInitialized = FALSE;
 static PHYSICAL_ADDRESS g_RingBufferPhysical;
+static UCHAR g_CmdBuffer[PSP_CMD_BUF_SIZE];  // 1024-byte command buffer for ring submissions
+static ULONG ringWriteOffset = 0;
 
 static BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
 {
@@ -608,8 +610,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 (ULONG)(devExt->RingPhysical.QuadPart >> 32));
             /* Ring size to C2PMSG_71 */
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC), devExt->RingSize);
-            /* Trigger ring */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0);
+            /* Ring type to C2PMSG_64: KM ring = 2 << 16 = 0x00020000 (psp_v11_0_8.c) */
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00020000);
 
             KeStallExecutionProcessor(50000);
 
@@ -932,77 +934,70 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
         case IOCTL_PSP_RING_LOAD_IP_FW:
         {
-            if (inputLength < sizeof(PSP_RING_FW_REQUEST)) {
-                status = STATUS_INVALID_PARAMETER; break;
-            }
-            if (!devExt->RingCreated) {
-                status = STATUS_DEVICE_NOT_READY; break;
-            }
+            if (inputLength < sizeof(PSP_RING_FW_REQUEST)) { status = STATUS_INVALID_PARAMETER; break; }
+            if (!devExt->RingCreated) { status = STATUS_DEVICE_NOT_READY; break; }
             PSP_RING_FW_REQUEST* req = (PSP_RING_FW_REQUEST*)inputBuffer;
             ULONG fwSize = req->FwSize;
             ULONG fwType = req->FwType;
             ULONG totalInput = sizeof(PSP_RING_FW_REQUEST) + fwSize;
-            if (inputLength < totalInput || fwSize == 0 || fwSize > PSP_MAX_FW_TOTAL) {
-                status = STATUS_INVALID_PARAMETER; break;
-            }
+            if (inputLength < totalInput || fwSize == 0 || fwSize > PSP_MAX_FW_TOTAL) { status = STATUS_INVALID_PARAMETER; break; }
             PUCHAR fwData = (PUCHAR)inputBuffer + sizeof(PSP_RING_FW_REQUEST);
 
             PHYSICAL_ADDRESS highAddr;
             highAddr.QuadPart = 0x10000000000ULL;
             PVOID fwMem = MmAllocateContiguousMemory(fwSize, highAddr);
-            if (fwMem == NULL) {
-                highAddr.QuadPart = 0xFFFFFFFF;
-                fwMem = MmAllocateContiguousMemory(fwSize, highAddr);
-            }
+            if (fwMem == NULL) { highAddr.QuadPart = 0xFFFFFFFF; fwMem = MmAllocateContiguousMemory(fwSize, highAddr); }
             if (fwMem == NULL) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
             RtlCopyMemory(fwMem, fwData, fwSize);
             PHYSICAL_ADDRESS fwPa = MmGetPhysicalAddress(fwMem);
 
-            static ULONG ringWriteOffset = 0;
-            if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
-                ringWriteOffset = 0;
-            PULONG entry = (PULONG)(g_RingBuffer + ringWriteOffset);
-            entry[0] = GFX_CMD_ID_LOAD_IP_FW;
-            entry[1] = fwType;
-            entry[2] = (ULONG)(fwPa.QuadPart & 0xFFFFFFFF);
-            entry[3] = (ULONG)(fwPa.QuadPart >> 32);
-            entry[4] = fwSize;
+            // Build command buffer (psp_gfx_cmd_resp, 1024 bytes)
+            // +0: buf_size, +4: buf_version, +8: cmd_id = GFX_CMD_ID_LOAD_IP_FW (0x06)
+            // +28: cmd_load_ip_fw: fw_addr_lo, fw_addr_hi, fw_size, fw_type
+            RtlZeroMemory(g_CmdBuffer, PSP_CMD_BUF_SIZE);
+            PULONG cmd = (PULONG)g_CmdBuffer;
+            cmd[0] = PSP_CMD_BUF_SIZE;
+            cmd[1] = 1;
+            cmd[2] = GFX_CMD_ID_LOAD_IP_FW;
+            cmd[7] = (ULONG)(fwPa.QuadPart & 0xFFFFFFFF);
+            cmd[8] = (ULONG)(fwPa.QuadPart >> 32);
+            cmd[9] = fwSize;
+            cmd[10] = fwType;
+            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
+
+            // Build ring frame (psp_gfx_rb_frame, 64 bytes) pointing to command buffer
+            if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer)) ringWriteOffset = 0;
+            PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
+            RtlZeroMemory(frame, PSP_RING_FRAME_SIZE);
+            frame[0] = (ULONG)(cmdPa.QuadPart & 0xFFFFFFFF);
+            frame[1] = (ULONG)(cmdPa.QuadPart >> 32);
+            frame[2] = PSP_CMD_BUF_SIZE;
             ringWriteOffset += PSP_RING_FRAME_SIZE;
 
-            KdPrint(("RING: Load IP FW type=%u size=%u PA=0x%llX\n", fwType, fwSize, fwPa.QuadPart));
+            KdPrint(("RING: type=%u size=%u fwPA=0x%llX cmdPA=0x%llX\n", fwType, fwSize, fwPa.QuadPart, cmdPa.QuadPart));
 
-            WRITE_REGISTER_ULONG(
-                (PULONG)((PUCHAR)devExt->MmioBase + 0x105E0),
-                ringWriteOffset
-            );
+            // Set ring wptr (C2PMSG_67 = 0x105EC, gpcom_wptr per psp_v11_0_8.c)
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
 
-            ULONG timeout;
-            ULONG resp = 0;
-            for (timeout = 0; timeout < 500; timeout++) {
+            // Poll C2PMSG_64 (0x105E0) for response (bit 31 = done)
+            ULONG timeout, resp = 0;
+            for (timeout = 0; timeout < 1000; timeout++) {
                 KeStallExecutionProcessor(1000);
-                resp = READ_REGISTER_ULONG(
-                    (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
+                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
                 if (resp & 0x80000000) {
-                    ULONG pspStatus = resp & 0x0FFFFFFF;
-                    status = (pspStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-                    KdPrint(("RING: response 0x%08X status=%u\n", resp, pspStatus));
+                    ULONG st = resp & 0x0000FFFF;
+                    // Also check command buffer response status at +864
+                    ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
+                    status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+                    KdPrint(("RING: C2PMSG_64=0x%08X cmdResp=0x%08X\n", resp, cbStatus));
                     break;
                 }
             }
-            if (timeout >= 500) {
-                KdPrint(("RING: timeout waiting for response\n"));
-                status = STATUS_TIMEOUT;
-            }
-
-            WRITE_REGISTER_ULONG(
-                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET), 0);
+            if (timeout >= 1000) { KdPrint(("RING: timeout\n")); status = STATUS_TIMEOUT; }
 
             MmFreeContiguousMemory(fwMem);
 
-            if (outputLength >= sizeof(ULONG)) {
-                ((PULONG)outputBuffer)[0] = (ULONG)(fwPa.QuadPart >> 20);
-                bytesReturned = sizeof(ULONG);
-            }
+            if (outputLength >= sizeof(ULONG)) { ((PULONG)outputBuffer)[0] = (ULONG)(fwPa.QuadPart >> 20); bytesReturned = sizeof(ULONG); }
             break;
         }
 

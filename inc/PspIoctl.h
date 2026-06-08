@@ -35,21 +35,31 @@ extern "C" {
 #define PSP_C2PMSG_36_OFFSET  0x10570   // Data register  
 #define PSP_C2PMSG_81_OFFSET  0x10614   // Status register
 
-// GFX firmware type codes (used with IOCTL_PSP_RING_LOAD_IP_FW)
-#define GFX_FW_TYPE_CE      1
-#define GFX_FW_TYPE_PFP     2
-#define GFX_FW_TYPE_ME      3
-#define GFX_FW_TYPE_MEC     4
-#define GFX_FW_TYPE_MEC2    5
-#define GFX_FW_TYPE_RLC     6
-#define GFX_FW_TYPE_SDMA    7
-#define GFX_FW_TYPE_SDMA1   8
+// GFX firmware type codes from Linux psp_gfx_if.h (used with IOCTL_PSP_RING_LOAD_IP_FW)
+#define GFX_FW_TYPE_CP_ME      1
+#define GFX_FW_TYPE_CP_PFP     2
+#define GFX_FW_TYPE_CP_CE      3
+#define GFX_FW_TYPE_CP_MEC     4
+#define GFX_FW_TYPE_CP_MEC1    5
+#define GFX_FW_TYPE_RLC_G      8
+#define GFX_FW_TYPE_SDMA0      9
+#define GFX_FW_TYPE_SDMA1      10
 
-// PSP ring frame command IDs
-#define GFX_CMD_ID_LOAD_IP_FW  0x0000000A
+// Compat aliases
+#define GFX_FW_TYPE_CE     GFX_FW_TYPE_CP_CE
+#define GFX_FW_TYPE_PFP    GFX_FW_TYPE_CP_PFP
+#define GFX_FW_TYPE_ME     GFX_FW_TYPE_CP_ME
+#define GFX_FW_TYPE_MEC    GFX_FW_TYPE_CP_MEC
+#define GFX_FW_TYPE_MEC2   GFX_FW_TYPE_CP_MEC1
+#define GFX_FW_TYPE_RLC    GFX_FW_TYPE_RLC_G
+#define GFX_FW_TYPE_SDMA   GFX_FW_TYPE_SDMA0
 
-// Ring frame size (5 DWORDs: cmd_id, fw_type, pa_lo, pa_hi, fw_size)
-#define PSP_RING_FRAME_SIZE  20
+// PSP ring frame command IDs (from Linux psp_gfx_if.h)
+#define GFX_CMD_ID_LOAD_IP_FW  0x00000006
+
+// Ring frame: 64 bytes pointing to a 1024-byte command buffer
+#define PSP_RING_FRAME_SIZE   64
+#define PSP_CMD_BUF_SIZE      1024
 
 // IOCTL input/output structures
 #pragma pack(push, 1)
