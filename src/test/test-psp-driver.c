@@ -578,7 +578,7 @@ void PrintUsage(const char *prog)
     printf("  -m                 Read mailbox status (C2PMSG_81)\n");
     printf("  -t                 Run basic connectivity test\n");
     printf("  -M                 Initialize TMR (Trusted Memory Region, 4MB)\n");
-    printf("  -T                 Run comprehensive HW probe (mailbox + NBIO + ring)\n");
+    printf("  -H                 Run comprehensive HW probe (mailbox + NBIO + ring)\n");
     printf("  -l <logfile>       Write log to file\n");
     printf("\nExamples:\n");
     printf("  %s -i 0xFE800000 0x100000     Init HW with BAR5 at 0xFE800000\n", prog);
@@ -753,7 +753,7 @@ int main(int argc, char *argv[])
                 ret = 1;
             }
         }
-        else if (strcmp(argv[i], "-T") == 0) {
+        else if (strcmp(argv[i], "-H") == 0) {
             ok = ComprehensiveProbe(h);
             if (!ok) { ret = 1; }
         }

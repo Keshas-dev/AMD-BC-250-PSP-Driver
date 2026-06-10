@@ -31,17 +31,17 @@ for %%D in (C D E F G H) do (
     )
     if exist "%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
         set "VSWHERE=%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Community on %%D: drive (x86)
+        echo Found VS2022 Community on %%D: drive ^(x86^)
         goto :SetupEnv
     )
     if exist "%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
         set "VSWHERE=%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Professional on %%D: drive (x86)
+        echo Found VS2022 Professional on %%D: drive ^(x86^)
         goto :SetupEnv
     )
     if exist "%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
         set "VSWHERE=%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Enterprise on %%D: drive (x86)
+        echo Found VS2022 Enterprise on %%D: drive ^(x86^)
         goto :SetupEnv
     )
 )
@@ -52,11 +52,7 @@ exit /b 1
 
 :SetupEnv
 echo Setting up build environment...
-call "%VSWHERE%" >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Failed to setup VS build environment
-    exit /b 1
-)
+call "%VSWHERE%"
 
 :: --- Detect Windows Kit (WDK) ---
 :: Searches multiple drives for Windows Kits
@@ -118,7 +114,7 @@ echo  BUILDING KMDF Driver (PspDriver.sys)
 echo ==========================================
 echo.
 
-cl.exe /c /kernel /W3 /Zi /Od /DAMD64 /D_AMD64_ /DAMD_BC250_PSP_DRIVER ^
+cl.exe /c /kernel /GS- /W3 /Zi /Od /DAMD64 /D_AMD64_ /DAMD_BC250_PSP_DRIVER ^
   /I"%WDK_ROOT%\Include\%WDK_VERSION%\km" ^
   /I"%WDK_ROOT%\Include\%WDK_VERSION%\km\crt" ^
   /I"%WDK_ROOT%\Include\%WDK_VERSION%\shared" ^
@@ -132,7 +128,7 @@ if errorlevel 1 (
 )
 
 echo Linking KMDF driver...
-link.exe /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry ^
+link.exe /DRIVER /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry ^
   /OUT:"%OUTPUT_DIR%\PspDriver.sys" ^
   PspDriver.obj ^
   ntoskrnl.lib wdm.lib hal.lib ^
@@ -165,24 +161,23 @@ echo  SIGNING DRIVER (Test Certificate)
 echo ==========================================
 echo.
 
-set "CERT_PATH=%PROJECT_DIR%\%CERT_NAME%.cer"
-set "PFX_PATH=%PROJECT_DIR%\%CERT_NAME%.pfx"
+pushd "%PROJECT_DIR%"
+
+set "CERT_PATH=%CD%\PspTestCert.cer"
+set "PFX_PATH=%CD%\PspTestCert.pfx"
 
 if not exist "%CERT_PATH%" (
     echo Creating test certificate for driver signing...
-    
-    :: Method 1: New-SelfSignedCertificate (PowerShell - modern Windows)
     echo   Trying PowerShell New-SelfSignedCertificate...
-    powershell -Command "New-SelfSignedCertificate -Type Custom -Subject 'CN=%CERT_NAME%' -KeyUsage DigitalSignature -CertStoreLocation Cert:\\CurrentUser\\My -NotAfter (Get-Date).AddYears(10) -OutFile '%CERT_PATH%'" >nul 2>&1
-    
+    powershell -Command "New-SelfSignedCertificate -Type Custom -Subject 'CN=%CERT_NAME%' -KeyUsage DigitalSignature -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(10) -OutFile '%CERT_PATH%'" >nul 2>&1
     if not exist "%CERT_PATH%" (
-        :: Method 2: makecert (legacy WDK tool)
-        if exist "%SIGNTOOLS%\makecert.exe" (
-            echo   Trying makecert (legacy)...
-            "%SIGNTOOLS%\makecert.exe" /r /pe /ss PrivateCertStore /n "CN=%CERT_NAME%" "%CERT_PATH%" >nul 2>&1
+        if not "%SIGNTOOLS%"=="" (
+            if exist "%SIGNTOOLS%\makecert.exe" (
+                echo   Trying makecert (legacy^)...
+                "%SIGNTOOLS%\makecert.exe" /r /pe /ss PrivateCertStore /n "CN=%CERT_NAME%" "%CERT_PATH%" >nul 2>&1
+            )
         )
     )
-    
     if exist "%CERT_PATH%" (
         echo   Test certificate created: %CERT_NAME%
     ) else (
@@ -194,9 +189,9 @@ if not exist "%CERT_PATH%" (
 )
 
 :: --- Check if testsigning is enabled ---
-for /f "tokens=2* delims=" %%A in ('bcdedit /enum {current} ^| findstr "testsigning"') do (
-    echo   Test Signing: %%A
-)
+bcdedit /enum {current} 2>nul | findstr /i "testsigning" >nul 2>&1 && echo   Test Signing: ON || echo   Test Signing: OFF
+
+popd
 
 :: --- Sign driver ---
 if not "%SIGNTOOLS%"=="" (

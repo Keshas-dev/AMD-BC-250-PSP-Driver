@@ -1,15 +1,15 @@
 #include <ntddk.h>
 #include <wdm.h>
+
+// Must define NT device name BEFORE including PspIoctl.h (which defines the user-mode symlink name)
+#define PSP_NT_DEVICE_NAME     L"\\Device\\AmdBcPsp"
+#define PSP_SYMBOLIC_LINK_NAME L"\\DosDevices\\AmdBcPsp"
+
 #include "PspIoctl.h"
 #include "firmware_data.h"
 
 // BUS_DATA_TYPE for PCI config access via HAL
 #define PCIConfiguration 0
-
-// PSP Mailbox register offsets (BAR5-relative)
-#define PSP_C2PMSG_35_OFFSET  0x1056C
-#define PSP_C2PMSG_36_OFFSET  0x10570
-#define PSP_C2PMSG_81_OFFSET  0x10614
 
 // NBIO signature registers for firewall unlock
 #define NBIO_SIG1_OFFSET       0xC100
@@ -19,7 +19,7 @@
 #define MMHUB_CHECK_OFFSET     0x50D0
 
 #define PSP_FW_WAIT_MS         500
-#define PSP_TOS_READY_TIMEOUT  10000  // 10 second timeout for TOS_READY (matches Linux adev->usec_timeout behavior)
+#define PSP_TOS_READY_TIMEOUT  60000  // 60 second timeout for TOS_READY (Linux shows ~5.5s on BC-250)
 #define PSP_BOOT_CMD_0xC100    0xC100
 #define PSP_BOOT_CMD_0xC180    0xC180
 #define PSP_BAR0_PHYSICAL      0xFD600000ULL
@@ -40,9 +40,6 @@ typedef struct _DEVICE_EXTENSION {
     PVOID       PciCfgBase;          // Mapped PCI ECAM region
     ULONG       PciCfgSize;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
-
-#define PSP_DEVICE_NAME        L"\\Device\\AmdBcPsp"
-#define PSP_SYMBOLIC_LINK_NAME L"\\DosDevices\\AmdBcPsp"
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD DriverUnload;
@@ -238,6 +235,8 @@ static NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)
 
     PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
 
+    KIRQL ringIrql;
+    KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
     if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
         ringWriteOffset = 0;
     PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
@@ -250,6 +249,7 @@ static NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)
     KdPrint(("TMR: Submitting INIT_TMR via ring\n"));
 
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+    KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
     ULONG timeout, resp = 0;
     for (timeout = 0; timeout < 2000; timeout++) {
@@ -300,7 +300,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = PspDeviceControl;
     DriverObject->DriverUnload = DriverUnload;
 
-    RtlInitUnicodeString(&deviceName, PSP_DEVICE_NAME);
+    RtlInitUnicodeString(&deviceName, PSP_NT_DEVICE_NAME);
     status = IoCreateDevice(
         DriverObject,
         sizeof(DEVICE_EXTENSION),
@@ -413,6 +413,12 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PHYSICAL_ADDRESS physAddr;
             physAddr.QuadPart = req->PhysicalAddress;
             ULONG size = req->Size;
+
+            if (physAddr.QuadPart == 0 || size == 0 || size > 0x400000) {
+                status = STATUS_INVALID_PARAMETER;
+                KdPrint(("INIT_HW: invalid PA=0x%llX size=%u\n", physAddr.QuadPart, size));
+                break;
+            }
 
             devExt->MmioBase = MmMapIoSpace(physAddr, size, MmNonCached);
             if (devExt->MmioBase == NULL) {
@@ -693,10 +699,16 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("CREATE_RING: Ring at VA=%p PA=0x%llX size=%u\n",
                 devExt->RingBuffer, devExt->RingPhysical.QuadPart, devExt->RingSize));
 
+            /* Clear any stale error from C2PMSG_81 that might block TOS */
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET), 0);
+
             /* Linux psp_v11_0_8: Wait for MBOX_TOS_READY_FLAG (C2PMSG_64 bit 31)
                before programming ring registers. SOS must signal readiness first. */
             ULONG c64_val;
             ULONG tosTimeout;
+            KdPrint(("CREATE_RING: C2PMSG_64=0x%08X C2PMSG_81=0x%08X waiting for TOS_READY...\n",
+                READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0)),
+                READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET))));
             for (tosTimeout = 0; tosTimeout < PSP_TOS_READY_TIMEOUT; tosTimeout++) {
                 c64_val = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
                 if (c64_val & 0x80000000) {
@@ -1088,7 +1100,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             cmd[10] = fwType;
             PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
 
-            // Build ring frame (psp_gfx_rb_frame, 64 bytes) pointing to command buffer
+            KIRQL ringIrql;
+            KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
             if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer)) ringWriteOffset = 0;
             PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
             RtlZeroMemory(frame, PSP_RING_FRAME_SIZE);
@@ -1101,6 +1114,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             // Set ring wptr (C2PMSG_67 = 0x105EC, gpcom_wptr per psp_v11_0_8.c)
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+            KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
             // Poll C2PMSG_64 (0x105E0) for response (bit 31 = done)
             ULONG timeout, resp = 0;
@@ -1173,6 +1187,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             cmd[8] = regId;
             PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
 
+            KIRQL ringIrql;
+            KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
             if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
                 ringWriteOffset = 0;
             PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
@@ -1186,6 +1202,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             WRITE_REGISTER_ULONG(
                 (PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+            KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
             ULONG timeout, resp = 0;
             for (timeout = 0; timeout < 1000; timeout++) {
@@ -1222,6 +1239,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
 
             // Build ring frame
+            KIRQL ringIrql;
+            KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
             if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
                 ringWriteOffset = 0;
             PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
@@ -1235,6 +1254,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             // Set wptr (C2PMSG_67) and wait for response on C2PMSG_64
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+            KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
             ULONG timeout, resp = 0;
             for (timeout = 0; timeout < 5000; timeout++) {  // Up to 5s for RLC autoload
