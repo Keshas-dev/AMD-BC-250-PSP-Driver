@@ -657,6 +657,13 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         {
             /* Use global ring buffer (always available, no allocation needed) */
             devExt->RingBuffer = g_RingBuffer;
+            /* Initialize physical address if not already done */
+            if (!g_RingBufferInitialized || g_RingBufferPhysical.QuadPart == 0) {
+                g_RingBufferPhysical = MmGetPhysicalAddress(g_RingBuffer);
+                g_RingBufferInitialized = TRUE;
+                KdPrint(("CREATE_RING: Ring buffer PA initialized to 0x%llX\n",
+                    g_RingBufferPhysical.QuadPart));
+            }
             devExt->RingPhysical = g_RingBufferPhysical;
             devExt->RingSize = sizeof(g_RingBuffer);
             
@@ -668,32 +675,13 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("CREATE_RING: Ring at VA=%p PA=0x%llX size=%u\n",
                 devExt->RingBuffer, devExt->RingPhysical.QuadPart, devExt->RingSize));
 
-            /* Clear any stale error from C2PMSG_81 that might block TOS */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET), 0);
-
-            /* Linux psp_v11_0_8: Wait for MBOX_TOS_READY_FLAG (C2PMSG_64 bit 31)
-               before programming ring registers. SOS must signal readiness first. */
-            ULONG c64_val;
-            ULONG tosTimeout;
-            KdPrint(("CREATE_RING: C2PMSG_64=0x%08X C2PMSG_81=0x%08X waiting for TOS_READY...\n",
-                READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0)),
-                READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET))));
-            for (tosTimeout = 0; tosTimeout < PSP_TOS_READY_TIMEOUT; tosTimeout++) {
-                c64_val = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
-                if (c64_val & 0x80000000) {
-                    KdPrint(("CREATE_RING: TOS ready after %u ms (C2PMSG_64=0x%08X)\n",
-                        tosTimeout, c64_val));
-                    break;
-                }
-                KeStallExecutionProcessor(1000);
-            }
-
-            if (tosTimeout >= PSP_TOS_READY_TIMEOUT) {
-                KdPrint(("CREATE_RING: TOS not ready after %u ms (C2PMSG_64=0x%08X)\n",
-                    PSP_TOS_READY_TIMEOUT, c64_val));
-                status = STATUS_DEVICE_NOT_READY;
-                break;
-            }
+            /* Linux psp_v11_0_ring_create protocol:
+               1. Write ring PA to C2PMSG_69/70, size to C2PMSG_71
+               2. Write ring type to C2PMSG_64 → triggers TOS to process creation
+               3. Wait for TOS_RESP_FLAG (C2PMSG_64 bit 31)
+               Do NOT wait for TOS_READY first — bit 31 is the response, not a precondition.
+               Do NOT clear C2PMSG_81 — that is the SOS alive register, not a ring sync. */
+            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
 
             /* Write ring address to C2PMSG_69/70 */
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4),
@@ -702,8 +690,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 (ULONG)(devExt->RingPhysical.QuadPart >> 32));
             /* Ring size to C2PMSG_71 */
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC), devExt->RingSize);
-            /* Ring type to C2PMSG_64: KM ring = 2 << 16 = 0x00020000 (psp_v11_0_8.c) */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00020000);
+            /* Ring type to C2PMSG_64: KM ring = 1 << 16 = 0x00010000 (psp_v11_0_8.c) */
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00010000);
 
             /* Wait for response: C2PMSG_64 bit 31 = MBOX_TOS_RESP_FLAG */
             ULONG ringResp;
@@ -722,12 +710,12 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             devExt->RingCreated = TRUE;
 
-            KdPrint(("CREATE_RING: C2PMSG_64=0x%08X tosWait=%ums respWait=%ums ringCreated=1\n",
-                ringResp, tosTimeout, respTimeout));
+            KdPrint(("CREATE_RING: C2PMSG_64 before=0x%08X after=0x%08X respWait=%ums ringCreated=1\n",
+                c64_before, ringResp, respTimeout));
 
             if (outputLength >= sizeof(ULONG) * 3) {
                 ((PULONG)outputBuffer)[0] = (ULONG)(devExt->RingPhysical.QuadPart & 0xFFFFFFFF);
-                ((PULONG)outputBuffer)[1] = c64_val;
+                ((PULONG)outputBuffer)[1] = c64_before;
                 ((PULONG)outputBuffer)[2] = ringResp;
                 bytesReturned = sizeof(ULONG) * 3;
             }
@@ -1165,7 +1153,34 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
 
             if (!devExt->RingCreated) {
-                status = STATUS_DEVICE_NOT_READY; break;
+                /* Try mailbox-based PROG_REG when ring not available */
+                KdPrint(("REG_PROG: ring not available, trying mailbox PROG_REG (reg=0x%04X val=0x%08X)\n",
+                    regId, regVal));
+                KIRQL mbIrql;
+                KeAcquireSpinLock(&devExt->CommandLock, &mbIrql);
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET), regId);
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x10574), regVal);
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET), 0x0000000B);
+                KeReleaseSpinLock(&devExt->CommandLock, mbIrql);
+                ULONG mbTimeout;
+                for (mbTimeout = 0; mbTimeout < 500; mbTimeout++) {
+                    KeStallExecutionProcessor(1000);
+                    ULONG cmdReg = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
+                    if (cmdReg == 0) {
+                        KdPrint(("REG_PROG: mailbox PROG_REG completed after %u ms\n", mbTimeout));
+                        status = STATUS_SUCCESS;
+                        break;
+                    }
+                }
+                if (mbTimeout >= 500) {
+                    KdPrint(("REG_PROG: mailbox PROG_REG timeout\n"));
+                    status = STATUS_TIMEOUT;
+                }
+                if (outputLength >= sizeof(ULONG)) {
+                    ((PULONG)outputBuffer)[0] = regVal;
+                    bytesReturned = sizeof(ULONG);
+                }
+                break;
             }
 
             /* Write path: GPCOM PROG_REG command via ring (bypasses NBIO) */
