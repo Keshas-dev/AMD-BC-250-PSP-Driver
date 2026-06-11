@@ -375,6 +375,47 @@ Our driver incorrectly:
 3. **Polls C2PMSG_81** (not C2PMSG_35)
 4. Restores C2PMSG_81 → **clobbers PSP response**
 
+## Session results (2026-06-11): NBIO firewall confirmed — no ring, no bypass
+
+### CREATE_RING protocol correction
+- **Removed TOS_READY wait** before writing ring params. Linux psp protocol:
+  1. Write ring PA to C2PMSG_69/70, size to C2PMSG_71
+  2. Write ring type to C2PMSG_64 (triggers ring creation)
+  3. Wait for TOS_RESP_FLAG (C2PMSG_64 bit 31)
+- C2PMSG_81 should NOT be cleared before ring creation — it's SOS alive register, not ring sync
+- Fixed `g_RingBufferPhysical` initialization: was 0 (never initialized) causing ring at PA=0
+
+### Ring type: KM=1, not KM=2
+- Linux enum: `PSP_RING_TYPE_KM = 1` (KM ring = 0x00010000, not 0x00020000)
+- Changed from 0x00020000 to 0x00010000 — still no response from TOS
+
+### Mailbox-based PROG_REG fallback
+- When GPCOM ring not available, REG_PROG now tries to send PROG_REG (0x0B) via C2PMSG_35/36/37 mailbox
+- PSP accepts the command (C2PMSG_35 clears), but **register write is silently ignored**
+- Verified by attempting to write 0x12345678 to 0xC100 — readback still returns 0xFEDCBAEF
+- SOS firmware does NOT support mailbox-based register programming
+
+### SOS pre-loaded by BIOS
+- C2PMSG_81 = 0xF0000010 is readable immediately after INIT_HW, without BOOT_SEQUENCE
+- SOS is pre-loaded by BIOS/UEFI during POST
+- Our BOOT_SEQUENCE (CMD 0x4/0x8) is redundant — SOS already running
+- BOOT_SEQUENCE is harmless but unnecessary
+
+### NBIO firewall confirmed: cannot bypass from Windows
+- Even with SOS loaded and alive (C2PMSG_81 = 0xF0000010):
+  - GPCOM ring: ❌ (TOS protocol not implemented in firmware)
+  - Mailbox PROG_REG: ❌ (accepted but write ignored)
+  - Direct BAR5 MMIO: ❌ (NBIO blocks 0x2000-0x2FFF)
+- Linux `psp_v11_0_8` skips ALL PSP firmware loading and ALL ring commands
+- NBIO unlock must happen before Windows boot process activates firewall
+- **Only solution**: boot from environment where NBIO stays unlocked (Linux), then warm reboot into Windows
+
+### GPU Driver Proxy fixes (this session)
+- Fixed GET_CAPS early-return: field layout now matches main handler (d[4]=CUs=24, not temperature)
+- Fixed GET_VRAM_INFO early-return: uses ULONG64 byte layout (not ULONG MB — caused "16777216 MB" display bug)
+- Fixed PspProxyInit(): only sets g_PspProxyAvailable=TRUE when PSP_GET_GPU_INFO succeeds
+- Fixed NBIO_MAP INIT_HARDWARE path: sets GpuClockMhz=2000, MemoryClockMhz=1500 defaults
+
 ## Session results (2026-06-10): Fundamental HW blockers
 
 ### Confirmed: GPCOM ring protocol NOT supported by this SOS
