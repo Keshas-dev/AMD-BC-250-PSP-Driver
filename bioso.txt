@@ -1,0 +1,2 @@
+WinNtDriverIo su d6 4a eb 96 2a a3 d4 11 bc fd 00 80 c7 3c 88 81
+WinNtThunk B1 1B C5 58 F3 76 D4 11 BC EA 00 80 C7 3C 88 81

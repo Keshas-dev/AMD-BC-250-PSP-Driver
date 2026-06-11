@@ -50,7 +50,6 @@ DRIVER_DISPATCH PspDeviceControl;
 static UCHAR g_RingBuffer[0x1000];
 static BOOLEAN g_RingBufferInitialized = FALSE;
 static PHYSICAL_ADDRESS g_RingBufferPhysical;
-static UCHAR g_CmdBuffer[PSP_CMD_BUF_SIZE];  // 1024-byte command buffer for ring submissions
 static ULONG ringWriteOffset = 0;
 static ULONG g_RingFwCount = 0;              // Number of GPU FW loaded via ring
 static PVOID g_TmrBuffer = NULL;             // TMR (Trusted Memory Region) buffer
@@ -95,100 +94,61 @@ static VOID PspFreeFirmware(PDEVICE_EXTENSION devExt)
 static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
 {
     ULONG timeout;
-    ULONG statusReg;
-    ULONG initialStatus;
-    KIRQL irql;  // FIX #9: Add IRQL for spinlock
+    ULONG cmdReg;
+    KIRQL irql;
 
     if (devExt->FwBuffer == NULL) {
         KdPrint(("No firmware loaded\n"));
         return STATUS_NO_MEMORY;
     }
 
-    // FIX #9: Acquire spinlock to prevent race conditions
+    // Per Linux psp_v11_0_mbox_send protocol:
+    // 1. Under spinlock: write data to C2PMSG_36/37 + cmd to C2PMSG_35
+    // 2. Release spinlock (do NOT block other threads during polling)
+    // 3. Poll C2PMSG_35 until PSP clears it to 0 (completion signal)
+    // 4. Do NOT save/restore C2PMSG_81 (PSP manages it)
     KeAcquireSpinLock(&devExt->CommandLock, &irql);
 
-    // FIX #12: Write physical address (low 32 bits, assumes <4GB) to C2PMSG_36,
-    // then write command to C2PMSG_35.
-    // CRITICAL: Must clear C2PMSG_81 first by writing 0, or PSP ignores command.
-    ULONG paLo = (ULONG)(devExt->FwPhysical.QuadPart & 0xFFFFFFFF);
-
-    // Save original C2PMSG_81 (SOS alive flag for GPU driver)
-    ULONG originalC2pmsg81 = READ_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
-    );
-
-    // Clear previous response in C2PMSG_81 so PSP accepts new command
-    WRITE_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET),
-        0
-    );
-
-    // Save cleared C2PMSG_81 as initial for polling
-    initialStatus = READ_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
-    );
-
-    // Write PA (low 32 bits, PSP sees <4GB physical) to C2PMSG_36
+    // Write physical address: low 32 bits to C2PMSG_36, high 32 bits to C2PMSG_37
     WRITE_REGISTER_ULONG(
         (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET),
-        paLo
+        (ULONG)(devExt->FwPhysical.QuadPart & 0xFFFFFFFF)
     );
-    KdPrint(("Mailbox: Wrote PA=0x%08X to C2PMSG_36\n", paLo));
+    WRITE_REGISTER_ULONG(
+        (PULONG)((PUCHAR)devExt->MmioBase + 0x10574),  // C2PMSG_37
+        (ULONG)(devExt->FwPhysical.QuadPart >> 32)
+    );
 
     // Write command to C2PMSG_35 (triggers PSP execution)
     WRITE_REGISTER_ULONG(
         (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET),
         command
     );
-    KdPrint(("Mailbox: Wrote command 0x%08X to C2PMSG_35\n", command));
+    KdPrint(("Mailbox: PA=0x%llX cmd=0x%08X written to C2PMSG_36/37/35\n",
+        devExt->FwPhysical.QuadPart, command));
 
-        // FIX #4: Use non-blocking delay instead of busy-wait
+    // Release spinlock before polling — do NOT block other threads
+    KeReleaseSpinLock(&devExt->CommandLock, irql);
+
+    // Poll C2PMSG_35 until PSP clears it to 0 (command complete)
     NTSTATUS status = STATUS_SUCCESS;
     for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
-        KeStallExecutionProcessor(1000);  // 1ms stall
-        statusReg = READ_REGISTER_ULONG(
-            (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET)
+        KeStallExecutionProcessor(1000);
+        cmdReg = READ_REGISTER_ULONG(
+            (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET)
         );
-        if (statusReg != initialStatus) {
-            KdPrint(("Mailbox: C2PMSG_81 changed: 0x%08X -> 0x%08X after %u ms\n",
-                initialStatus, statusReg, timeout));
-            // FIX #11: Decode C2PMSG_81 response: bit 31 set = response valid,
-            // bits [27:0] = status code. 0x00 = success, anything else = error.
-            if (statusReg & 0x80000000) {
-                ULONG pspStatus = statusReg & 0x0FFFFFFF;
-                if (pspStatus != 0) {
-                    KdPrint(("Mailbox: PSP returned error 0x%03X for command 0x%08X\n",
-                        pspStatus, command));
-                    status = STATUS_UNSUCCESSFUL;
-                }
-            }
+        if (cmdReg == 0) {
+            KdPrint(("Mailbox: C2PMSG_35 cleared after %u ms (cmd 0x%08X)\n",
+                timeout, command));
             break;
         }
     }
 
     if (timeout >= PSP_FW_WAIT_MS) {
-        KdPrint(("Mailbox: TIMEOUT waiting for C2PMSG_81 change (command 0x%08X)\n", command));
+        KdPrint(("Mailbox: TIMEOUT C2PMSG_35 stuck at 0x%08X (cmd 0x%08X)\n",
+            cmdReg, command));
         status = STATUS_TIMEOUT;
     }
-
-    // FIX #12: Acknowledge command completion by writing 0 to C2PMSG_35
-    // (NOT C2PMSG_81 — that register holds SOS alive status and must be preserved)
-    WRITE_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET),
-        0
-    );
-
-    // Restore SOS alive flag (0xF0000010) if it was present before command
-    // This preserves the indicator that GPU driver Amdbc250PspInit() relies on
-    if (originalC2pmsg81 == 0xF0000010 && NT_SUCCESS(status)) {
-        WRITE_REGISTER_ULONG(
-            (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET),
-            originalC2pmsg81
-        );
-    }
-
-    // FIX #9: Release spinlock
-    KeReleaseSpinLock(&devExt->CommandLock, irql);
 
     return status;
 }
@@ -223,9 +183,11 @@ static NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)
         KdPrint(("TMR: Allocated 4MB at PA=0x%llX\n", g_TmrPhysical.QuadPart));
     }
 
-    // Send INIT_TMR (0x01) via ring
-    RtlZeroMemory(g_CmdBuffer, PSP_CMD_BUF_SIZE);
-    PULONG cmd = (PULONG)g_CmdBuffer;
+    // Send INIT_TMR (0x01) via ring — use per-call buffer (no race)
+    PVOID cmdBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, PSP_CMD_BUF_SIZE, 'mCSP');
+    if (!cmdBuffer) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(cmdBuffer, PSP_CMD_BUF_SIZE);
+    PULONG cmd = (PULONG)cmdBuffer;
     cmd[0] = PSP_CMD_BUF_SIZE;
     cmd[1] = 1;
     cmd[2] = GFX_CMD_ID_INIT_TMR;
@@ -233,7 +195,7 @@ static NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)
     cmd[8] = (ULONG)(g_TmrPhysical.QuadPart >> 32);
     cmd[9] = g_TmrSize;
 
-    PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
+    PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(cmdBuffer);
 
     KIRQL ringIrql;
     KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
@@ -252,23 +214,30 @@ static NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)
     KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
     ULONG timeout, resp = 0;
+    NTSTATUS tmrStatus = STATUS_TIMEOUT;
     for (timeout = 0; timeout < 2000; timeout++) {
         KeStallExecutionProcessor(1000);
         resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
         if (resp & 0x80000000) {
             ULONG st = resp & 0x0000FFFF;
-            ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
+            ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
             KdPrint(("TMR: C2PMSG_64=0x%08X cmdResp=0x%08X st=%u\n", resp, cbStatus, st));
             if (st == 0 && cbStatus == 0) {
                 g_TmrInitialized = TRUE;
-                KdPrint(("TMR: Initialized OK at PA=0x%llX\n", g_TmrPhysical.QuadPart));
-                return STATUS_SUCCESS;
+                tmrStatus = STATUS_SUCCESS;
+            } else {
+                tmrStatus = STATUS_UNSUCCESSFUL;
             }
-            return STATUS_UNSUCCESSFUL;
+            break;
         }
     }
-    KdPrint(("TMR: timeout waiting for response\n"));
-    return STATUS_TIMEOUT;
+    ExFreePool(cmdBuffer);
+    if (NT_SUCCESS(tmrStatus)) {
+        KdPrint(("TMR: Initialized OK at PA=0x%llX\n", g_TmrPhysical.QuadPart));
+    } else if (timeout >= 2000) {
+        KdPrint(("TMR: timeout waiting for response\n"));
+    }
+    return tmrStatus;
 }
 
 // Free TMR buffer on driver unload
@@ -857,8 +826,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
             PspFreeFirmware(devExt);
 
-            // FIX #5: Validate embedded firmware size before allocation
-            // NOTE: g_SosFirmwareData contains Type 1 (SOS) content, suitable for CMD 0x8
+            // Validate embedded firmware size before allocation
             if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
                 KdPrint(("IOCTL_PSP_LOAD_EMBEDDED_FW: Embedded FW too large (%u > %u)\n", 
                     g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
@@ -869,10 +837,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             PHYSICAL_ADDRESS highAddr;
             highAddr.QuadPart = 0x10000000000ULL;  // Allow above 4GB
 
-            devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
             if (devExt->FwBuffer == NULL) {
                 highAddr.QuadPart = 0xFFFFFFFF;
-                devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+                devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
             }
             if (devExt->FwBuffer == NULL) {
                 break;
@@ -995,7 +963,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 RtlCopyMemory(outputBuffer, results, sizeof(results));
                 bytesReturned = sizeof(results);
             }
-            status = STATUS_SUCCESS;  /* Always succeed - user checks GRBM in results */
+            // Return real status from failing step (if any)
+            status = stepStatus;
             break;
         }
 
@@ -1086,11 +1055,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             RtlCopyMemory(fwMem, fwData, fwSize);
             PHYSICAL_ADDRESS fwPa = MmGetPhysicalAddress(fwMem);
 
-            // Build command buffer (psp_gfx_cmd_resp, 1024 bytes)
-            // +0: buf_size, +4: buf_version, +8: cmd_id = GFX_CMD_ID_LOAD_IP_FW (0x06)
-            // +28: cmd_load_ip_fw: fw_addr_lo, fw_addr_hi, fw_size, fw_type
-            RtlZeroMemory(g_CmdBuffer, PSP_CMD_BUF_SIZE);
-            PULONG cmd = (PULONG)g_CmdBuffer;
+            // Build command buffer (per-call alloc — no race with other ring ops)
+            PVOID cmdBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, PSP_CMD_BUF_SIZE, 'mCSP');
+            if (!cmdBuffer) { MmFreeContiguousMemory(fwMem); status = STATUS_INSUFFICIENT_RESOURCES; break; }
+            RtlZeroMemory(cmdBuffer, PSP_CMD_BUF_SIZE);
+            PULONG cmd = (PULONG)cmdBuffer;
             cmd[0] = PSP_CMD_BUF_SIZE;
             cmd[1] = 1;
             cmd[2] = GFX_CMD_ID_LOAD_IP_FW;
@@ -1098,7 +1067,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             cmd[8] = (ULONG)(fwPa.QuadPart >> 32);
             cmd[9] = fwSize;
             cmd[10] = fwType;
-            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
+            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(cmdBuffer);
 
             KIRQL ringIrql;
             KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
@@ -1124,7 +1093,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
                     // Also check command buffer response status at +864
-                    ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
+                    ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
                     status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
                     if (NT_SUCCESS(status)) g_RingFwCount++;
                     KdPrint(("RING: C2PMSG_64=0x%08X cmdResp=0x%08X\n", resp, cbStatus));
@@ -1133,6 +1102,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
             if (timeout >= 1000) { KdPrint(("RING: timeout\n")); status = STATUS_TIMEOUT; }
 
+            ExFreePool(cmdBuffer);
             MmFreeContiguousMemory(fwMem);
 
             if (outputLength >= sizeof(ULONG)) { ((PULONG)outputBuffer)[0] = (ULONG)(fwPa.QuadPart >> 20); bytesReturned = sizeof(ULONG); }
@@ -1170,22 +1140,45 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             if (inputLength < sizeof(PSP_REG_PROG_REQUEST)) {
                 status = STATUS_INVALID_PARAMETER; break;
             }
-            if (!devExt->RingCreated) {
-                status = STATUS_DEVICE_NOT_READY; break;
-            }
 
             PSP_REG_PROG_REQUEST* req = (PSP_REG_PROG_REQUEST*)inputBuffer;
             ULONG regId = req->RegId;
             ULONG regVal = req->RegValue;
 
-            RtlZeroMemory(g_CmdBuffer, PSP_CMD_BUF_SIZE);
-            PULONG cmd = (PULONG)g_CmdBuffer;
+            /* Check for IsRead flag: when inputLength >= 12 and 3rd ULONG == 1 */
+            BOOLEAN isRead = (inputLength >= 3 * sizeof(ULONG) &&
+                             ((PULONG)inputBuffer)[2] == 1);
+
+            if (isRead) {
+                /* Read path: direct PSP MMIO read (works for mailbox/csr registers) */
+                if (regId >= devExt->MmioSize || (regId + sizeof(ULONG) > devExt->MmioSize) || (regId & 0x3)) {
+                    status = STATUS_ARRAY_BOUNDS_EXCEEDED; break;
+                }
+                ULONG value = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + regId));
+                if (outputLength >= sizeof(ULONG)) {
+                    ((PULONG)outputBuffer)[0] = value;
+                    bytesReturned = sizeof(ULONG);
+                }
+                KdPrint(("REG_PROG: read reg 0x%04X = 0x%08X\n", regId, value));
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            if (!devExt->RingCreated) {
+                status = STATUS_DEVICE_NOT_READY; break;
+            }
+
+            /* Write path: GPCOM PROG_REG command via ring (bypasses NBIO) */
+            PVOID cmdBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, PSP_CMD_BUF_SIZE, 'mCSP');
+            if (!cmdBuffer) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
+            RtlZeroMemory(cmdBuffer, PSP_CMD_BUF_SIZE);
+            PULONG cmd = (PULONG)cmdBuffer;
             cmd[0] = PSP_CMD_BUF_SIZE;
             cmd[1] = 1;
             cmd[2] = 0x0000000B;
             cmd[7] = regVal;
             cmd[8] = regId;
-            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
+            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(cmdBuffer);
 
             KIRQL ringIrql;
             KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
@@ -1198,7 +1191,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             frame[2] = PSP_CMD_BUF_SIZE;
             ringWriteOffset += PSP_RING_FRAME_SIZE;
 
-            KdPrint(("REG_PROG: id=%u val=0x%08X\n", regId, regVal));
+            KdPrint(("REG_PROG: write id=%u val=0x%08X\n", regId, regVal));
 
             WRITE_REGISTER_ULONG(
                 (PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
@@ -1211,7 +1204,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                     (PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
-                    ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
+                    ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
                     status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
                     KdPrint(("REG_PROG: C2PMSG_64=0x%08X cmdResp=0x%08X\n", resp, cbStatus));
                     break;
@@ -1219,6 +1212,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
             if (timeout >= 1000) { status = STATUS_TIMEOUT; }
 
+            ExFreePool(cmdBuffer);
             if (outputLength >= sizeof(ULONG)) {
                 ((PULONG)outputBuffer)[0] = regVal;
                 bytesReturned = sizeof(ULONG);
@@ -1230,13 +1224,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         {
             if (!devExt->RingCreated) { status = STATUS_DEVICE_NOT_READY; break; }
 
-            // Build command buffer with GFX_CMD_ID_AUTOLOAD_RLC (0x21)
-            RtlZeroMemory(g_CmdBuffer, PSP_CMD_BUF_SIZE);
-            PULONG cmd = (PULONG)g_CmdBuffer;
+            // Build command buffer (per-call alloc — no race)
+            PVOID cmdBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, PSP_CMD_BUF_SIZE, 'mCSP');
+            if (!cmdBuffer) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
+            RtlZeroMemory(cmdBuffer, PSP_CMD_BUF_SIZE);
+            PULONG cmd = (PULONG)cmdBuffer;
             cmd[0] = PSP_CMD_BUF_SIZE;
             cmd[1] = 1;
             cmd[2] = 0x00000021;  // GFX_CMD_ID_AUTOLOAD_RLC
-            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(g_CmdBuffer);
+            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(cmdBuffer);
 
             // Build ring frame
             KIRQL ringIrql;
@@ -1262,7 +1258,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
-                    ULONG cbStatus = ((PULONG)g_CmdBuffer)[864/sizeof(ULONG)];
+                    ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
                     status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
                     KdPrint(("AUTOLOAD_RLC: C2PMSG_64=0x%08X cmdResp=0x%08X\n", resp, cbStatus));
                     break;
@@ -1270,6 +1266,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
             if (timeout >= 5000) { KdPrint(("AUTOLOAD_RLC: timeout\n")); status = STATUS_TIMEOUT; }
 
+            ExFreePool(cmdBuffer);
             if (outputLength >= sizeof(ULONG)) { ((PULONG)outputBuffer)[0] = resp; bytesReturned = sizeof(ULONG); }
             break;
         }

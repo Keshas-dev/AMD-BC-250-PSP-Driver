@@ -389,7 +389,7 @@ BOOL LoadFirmware(HANDLE hDevice, const char* filename)
     
     Log("Loading firmware: %s (%ld bytes)...\n", filename, fwSize);
     
-    PSP_LOAD_FW_RESPONSE resp = {0};
+    ULONG resp = 0;  // Driver returns single ULONG: PA>>20
     DWORD returned = 0;
     
     BOOL ok = DeviceIoControl(
@@ -404,8 +404,7 @@ BOOL LoadFirmware(HANDLE hDevice, const char* filename)
     free(fwBuffer);
     
     if (ok) {
-        Log("Firmware load: SUCCESS (status=0x%08X, mailbox=0x%08X)\n", 
-            resp.Status, resp.MailboxStatus);
+        Log("Firmware load: SUCCESS (PA>>20=0x%08X)\n", resp);
     } else {
         Log("Firmware load: FAILED (err=%lu)\n", GetLastError());
     }
