@@ -375,6 +375,46 @@ Our driver incorrectly:
 3. **Polls C2PMSG_81** (not C2PMSG_35)
 4. Restores C2PMSG_81 → **clobbers PSP response**
 
+## Session results (2026-06-11): BC-250 register map is NOT standard Navi10
+
+### Critical Discovery: GC_BASE offset
+
+Found the root cause of all 0xFFFFFFFF register reads at offsets 0x2000-0x2FFF:
+
+**BC-250 (Cyan Skillfish) uses different BAR5 register offsets than standard Navi10.**
+
+From `linux/drivers/gpu/drm/amd/include/cyan_skillfish_ip_offset.h`:
+```
+GC_BASE__INST0_SEG0 = 0x00001260  ← GC registers shifted by 0x1260 bytes
+GC_BASE__INST0_SEG1 = 0x0000A000  ← second segment
+```
+
+This means register `mmCC_GC_SHADER_ARRAY_CONFIG` (at byte offset 0x2004 on Navi10) is at **BAR5 + 0x1260 + 0x2004 = BAR5 + 0x3264** on BC-250.
+
+**Impact on previous testing:** ALL 0x2000-0x2FFF reads returned 0xFFFFFFFF because they hit unmapped address space, NOT because of NBIO firewall. The NBIO firewall status for GC registers is actually **unknown** — we were testing the wrong addresses.
+
+**Linux amdgpu** works because RREG32_SOC15/WREG32_SOC15 macros automatically add GC_BASE to register offsets via `cyan_skillfish_reg_init.c`.
+
+**40 CU unlock patch** (duggasco/bc250-40cu-unlock) writes to registers through the proper amdgpu MMIO path which handles the offset shift.
+
+### Corrected Register Offsets for BC-250
+
+| Register | Navi10 Offset | BC-250 BAR5 Offset |
+|----------|--------------|-------------------|
+| CC_GC_SHADER_ARRAY_CONFIG | 0x2004 | **0x3264** |
+| GRBM_STATUS | 0x2000 | **0x3260** |
+| SPI_PG_ENABLE_STATIC_WGP_MASK | 0x229C | **0x34FC** |
+| RLC_PG_ALWAYS_ON_WGP_MASK | 0x2B04 | **0x3D64** |
+| CP scratch registers | 0x2074+ | **0x32D4+** |
+| SDMA registers | 0x2600+ | **0x3860+** |
+
+### Next Steps
+1. Re-test register reads with CORRECTED offsets (0x3264 instead of 0x2004)
+2. Re-verify NBIO firewall status — may not be blocking GC registers at all
+3. Update Windows driver to use BC-250-specific register offsets
+4. Try 40 CU unlock via direct MMIO at correct offsets
+5. Test warm reboot from Linux (with amdgpu loaded) into Windows
+
 ## Session results (2026-06-11): NBIO firewall confirmed — no ring, no bypass
 
 ### CREATE_RING protocol correction
