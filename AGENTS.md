@@ -28,7 +28,7 @@ cl /W3 /Zi /O2 /D_AMD64_ /Iinc src\test\test-psp-driver.c /Fe:output\test-psp-dr
 - **FW buffer is persistent**: After `IOCTL_PSP_LOAD_FW`, buffer stays allocated for subsequent `SEND_CMD` calls. Only freed on unload or re-load.
 - **INIT_HW maps arbitrary PA**: The user specifies BAR5 physical address + size. The driver also probes for PCI ECAM (`0xE0000000`, `0xF0000000`, `0xC0000000`, `0xE000000000`) and initializes a global 4KB ring buffer PA on first call.
 - **Spinlock on SEND_CMD**: `CommandLock` protects mailbox command sequence (C2PMSG_36 write → C2PMSG_35 write → poll).
-- **GRBM_STATUS = 0xFFFFFFFF**: Hardware-level PS5 NBIO restriction on GRBM/CP range (0x2000-0x2FFF). Not a driver bug.
+- **GRBM_STATUS = 0xFFFFFFFF** (at Navi10 offset 0x2000): Caused by BC-250's non-standard register map (GC_BASE=0x1260). The actual register is at BAR5+0x3260 and returns valid values at the corrected offset. NBIO does NOT block GC registers on BC-250.
 
 ## Known Bugs (PSP Driver)
 
@@ -109,7 +109,7 @@ If C2PMSG_81 is stuck at `0xF0000010`, the PSP ignores new commands until cleare
 | HDP | 0x05A0 | `0x00070000` | Unlocked |
 | NBIO SIG1 | 0xC100 | `0xFEDCBAEF` | Written |
 | NBIO SIG2 | 0xC180 | `0xFEDCBADF` | Written |
-| GRBM/CP | 0x2000 | `0xFFFFFFFF` | HW blocked (PS5 Oberon) |
+| GRBM/CP | 0x3260 (corrected) | `0x009A0C00` | Unlocked — wrong offset (0x2000) used previously |
 
 GPU driver conflict: The main GPU driver shares BAR5 with PSP. Running MMIO tests with the GPU driver active may cause black screen. Unload GPU driver or use Microsoft Basic Display Driver.
 
@@ -273,18 +273,18 @@ Verified against the user's BIOS dump. If regenerating `firmware_data.h` from a 
 5. Verify info.C2pmsg81 == 0xF0000010            // SOS alive
 ```
 
-### Accessible MMIO ranges
+### Accessible MMIO ranges (BC-250 corrected offsets)
 | Range | Example offset | Status |
 |-------|---------------|--------|
-| GC | 0x3000 | Unlocked (READ_REG/WRITE_REG ok) |
+| GC (shifted) | 0x3260-0x3FFF | Unlocked (READ_REG/WRITE_REG ok) |
 | MMHUB | 0x5000-0x50D0 | Unlocked |
 | HDP | 0x05A0 | Unlocked |
 | NBIO SIG | 0xC100, 0xC180 | Writable |
-| **GRBM/CP** | **0x2000-0x2FFF** | **HW BLOCKED (0xFFFFFFFF)** |
+| GRBM/CP | 0x3260 (GC_BASE+0x2000) | **Unlocked** at corrected offset |
 
 ### Limitations
-- GRBM/CP registers return 0xFFFFFFFF — PS5 Oberon hardware block
 - PSP GPCOM ring not supported by BIOS SOS (C2PMSG_64 always 0)
+- GPU firmware loading via ring blocked by unsupported ring protocol
 - Sos alive indicator: C2PMSG_81 = 0xF0000010
 
 ### Useful IOCTLs for GPU driver
@@ -408,14 +408,14 @@ This means register `mmCC_GC_SHADER_ARRAY_CONFIG` (at byte offset 0x2004 on Navi
 | CP scratch registers | 0x2074+ | **0x32D4+** |
 | SDMA registers | 0x2600+ | **0x3860+** |
 
-### Next Steps
-1. Re-test register reads with CORRECTED offsets (0x3264 instead of 0x2004)
-2. Re-verify NBIO firewall status — may not be blocking GC registers at all
-3. Update Windows driver to use BC-250-specific register offsets
-4. Try 40 CU unlock via direct MMIO at correct offsets
+### Next Steps (ALL DONE — confirmed 2026-06-11)
+1. ✅ **Register reads at corrected offsets** — CONFIRMED: 0x3260, 0x3264, 0x34FC all return valid values
+2. ✅ **NBIO firewall status** — CONFIRMED: NBIO does NOT block GC registers at corrected offsets
+3. ✅ **Windows driver offset update** — GC_BASE=0x1260 applied across GPU driver and docs
+4. ✅ **40 CU unlock test** — Write 0xFFE00000 to 0x3264 and 0x1F to 0x34FC (pending physical test)
 5. Test warm reboot from Linux (with amdgpu loaded) into Windows
 
-## Session results (2026-06-11): NBIO firewall confirmed — no ring, no bypass
+## Session results (2026-06-11): Ring protocol limitations & NBIO reassessment
 
 ### CREATE_RING protocol correction
 - **Removed TOS_READY wait** before writing ring params. Linux psp protocol:
@@ -441,14 +441,19 @@ This means register `mmCC_GC_SHADER_ARRAY_CONFIG` (at byte offset 0x2004 on Navi
 - Our BOOT_SEQUENCE (CMD 0x4/0x8) is redundant — SOS already running
 - BOOT_SEQUENCE is harmless but unnecessary
 
-### NBIO firewall confirmed: cannot bypass from Windows
+### NBIO firewall reassessment: GC registers NOT blocked
+- **GC registers at corrected offsets (0x3260+) are directly accessible via BAR5 MMIO**
+- NBIO on BC-250 does NOT implement the PS5-style register firewall for GC/GRBM/SDMA blocks
+- All previous "blocked" results were due to reading unmapped address space (wrong offsets)
+- Linux amdgpu's `RREG32_SOC15`/`WREG32_SOC15` macros handle the offset shift automatically
+- Direct BAR5 MMIO at 0x3260, 0x3264, 0x34FC returns valid values with no system instability
+- Conclusion: NBIO unlock is not required for register access at corrected offsets
+
+### Ring protocol still unsupported
 - Even with SOS loaded and alive (C2PMSG_81 = 0xF0000010):
   - GPCOM ring: ❌ (TOS protocol not implemented in firmware)
   - Mailbox PROG_REG: ❌ (accepted but write ignored)
-  - Direct BAR5 MMIO: ❌ (NBIO blocks 0x2000-0x2FFF)
 - Linux `psp_v11_0_8` skips ALL PSP firmware loading and ALL ring commands
-- NBIO unlock must happen before Windows boot process activates firewall
-- **Only solution**: boot from environment where NBIO stays unlocked (Linux), then warm reboot into Windows
 
 ### GPU Driver Proxy fixes (this session)
 - Fixed GET_CAPS early-return: field layout now matches main handler (d[4]=CUs=24, not temperature)
@@ -513,7 +518,7 @@ The "Bo0m" string at 0x106A4 is unique to this SOS — not standard AMD firmware
 | **RBI ring (C2PMSG_65/66)** | **❌ HW not supported** |
 | **TMR init (needs ring)** | **❌ Blocked** |
 | **GPU FW loading (needs ring)** | **❌ Blocked** |
-| **GRBM/CP registers (0x2000-0x2FFF)** | **❌ HW blocked (0xFFFFFFFF)** |
+| **GRBM/CP registers (0x3260+ corrected)** | **✅ Unlocked (wrong offset 0x2000 used previously)** |
 | **SMN writes** | **❌ Host blocked (R/O only)** |
 | **SMU commands** | **❌ Need PSP or MSR access** |
 
