@@ -40,6 +40,11 @@ extern "C" {
 #define PSP_C2PMSG_36_OFFSET  0x10570   // Data register  
 #define PSP_C2PMSG_81_OFFSET  0x10614   // Status register
 
+// GC register base offset on BC-250 (Cyan Skillfish)
+// Navi10 has GC registers at BAR5+0x0000; BC-250 shifts them by 0x1260
+// See: cyan_skillfish_ip_offset.h (GC_BASE__INST0_SEG0 = 0x00001260)
+#define AMDBC250_GC_BASE                        0x1260
+
 // GFX firmware type codes from Linux psp_gfx_if.h (used with IOCTL_PSP_RING_LOAD_IP_FW)
 #define GFX_FW_TYPE_CP_ME      1
 #define GFX_FW_TYPE_CP_PFP     2
@@ -110,7 +115,7 @@ typedef struct _PSP_STATUS_INFO {
     ULONG FwPaShifted;         // PA>>20 of firmware buffer
     ULONG NbioSig1;            // NBIO signature register 0xC100
     ULONG NbioSig2;            // NBIO signature register 0xC180
-    ULONG GrbmStatus;          // GRBM_STATUS (0x2004)
+    ULONG GrbmStatus;          // GRBM_STATUS (GC_BASE + 0x2004 = 0x3264)
     ULONG MmhubCheck;          // MMHUB check register (0x50D0)
     ULONG MmioVA;              // BAR5 virtual address
     ULONG MmioSize;            // BAR5 mapped size
@@ -149,7 +154,7 @@ typedef struct _PSP_PROBE_INFO {
     ULONG NbioSig1;
     ULONG NbioSig2;
     ULONG MmhubCheck;
-    ULONG GrbmStatus;
+    ULONG GrbmStatus;          // GRBM_STATUS (GC_BASE + 0x2004 = 0x3264)
     ULONG GcCheck;
     ULONG HdpCheck;
     // Ring state

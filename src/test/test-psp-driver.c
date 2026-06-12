@@ -167,7 +167,7 @@ BOOL GetPspStatus(HANDLE hDevice)
         Log("  NBIO SIG1=0x%08X SIG2=0x%08X\n", info.NbioSig1, info.NbioSig2);
         Log("  GRBM_STATUS=0x%08X%s\n", info.GrbmStatus,
             (info.GrbmStatus != 0xFFFFFFFF) ? " *** UNLOCKED ***" : " (BLOCKED)");
-        Log("  GC (0x3000)=0x%08X  HDP (0x05A0)=0x%08X  MMHUB (0x50D0)=0x%08X\n",
+        Log("  GC (0x4260)=0x%08X  HDP (0x05A0)=0x%08X  MMHUB (0x50D0)=0x%08X\n",
             info.GcCheck, info.HdpCheck, info.MmhubCheck);
         Log("  MMIO VA=0x%08X  Size=%u  Ring Created: %s\n", info.MmioVA, info.MmioSize,
             info.RingCreated ? "YES" : "NO");
@@ -278,9 +278,9 @@ BOOL ComprehensiveProbe(HANDLE hDevice)
         (probe.NbioSig2 == 0xFEDCBADF) ? " (UNLOCKED)" : "");
     Log("  MMHUB (0x50D0)   = 0x%08X%s\n", probe.MmhubCheck,
         (probe.MmhubCheck != 0 && probe.MmhubCheck != 0xFFFFFFFF) ? " (ACCESSIBLE)" : "");
-    Log("  GRBM (0x2004)    = 0x%08X%s\n", probe.GrbmStatus,
+    Log("  GRBM (0x3264)    = 0x%08X%s\n", probe.GrbmStatus,
         (probe.GrbmStatus != 0xFFFFFFFF) ? " *** ACCESSIBLE ***" : " (BLOCKED)");
-    Log("  GC (0x3000)      = 0x%08X%s\n", probe.GcCheck,
+    Log("  GC (0x4260)      = 0x%08X%s\n", probe.GcCheck,
         (probe.GcCheck != 0 && probe.GcCheck != 0xFFFFFFFF) ? " (ACCESSIBLE)" : "");
     Log("  HDP (0x05A0)     = 0x%08X%s\n", probe.HdpCheck,
         (probe.HdpCheck != 0 && probe.HdpCheck != 0xFFFFFFFF) ? " (ACCESSIBLE)" : "");
