@@ -9,6 +9,14 @@ This driver provides low-level PSP access for register diagnostics, firmware ana
 and hardware exploration on the AMD BC-250 (Cyan Skillfish) platform. Designed to coexist
 alongside the GPU driver — both use the same certificate and signing infrastructure.
 
+## GitHub Repository
+
+This project is part of the [AMD BC-250 Windows Driver collection](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver) — GPU driver and PSP driver repositories work together.
+
+The PSP driver repository is located at:
+- **GPU Driver**: https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver
+- **PSP Driver**: https://github.com/Keshas-dev/AMD-BC-250-PSP-Windows-Driver
+
 ## Overview
 
 This driver provides low-level access to the AMD BC-250 PSP hardware via:
@@ -36,6 +44,8 @@ The GPU driver repo contains the full SMU v11.8 analysis. Key findings:
 - **Use RequestActiveWgp (0x18)** to power up WGPs, SetCoreEnableMask (0x2C) for CU enable
 
 See [GPU driver README](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver) for details.
+
+The PSP driver repository can also be found at: https://github.com/Keshas-dev/AMD-BC-250-PSP-Windows-Driver
 
 ## Critical Discovery: BC-250 Register Map
 
@@ -306,6 +316,7 @@ GPU Driver (atikmdag.sys)
 ## Related Projects
 
 - [AMD BC-250 Windows GPU Driver](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver) — Main GPU driver project
+- [AMD BC-250 PSP Windows Driver](https://github.com/Keshas-dev/AMD-BC-250-PSP-Windows-Driver) — Companion PSP driver repository
 
 ## License
 

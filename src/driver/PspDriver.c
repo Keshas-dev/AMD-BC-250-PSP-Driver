@@ -60,6 +60,128 @@ static PHYSICAL_ADDRESS g_TmrPhysical;        // Physical address of TMR buffer
 static ULONG g_TmrSize = 0;                  // TMR size in bytes
 static BOOLEAN g_TmrInitialized = FALSE;     // Whether TMR has been initialized
 
+// KIQ ring for GPU command submission
+static PVOID g_KiqRingVa = NULL;
+static PHYSICAL_ADDRESS g_KiqRingPa = {0};
+static ULONG g_KiqRingSize = 0;
+static ULONG g_KiqRingWptr = 0;
+static BOOLEAN g_KiqRingInitialized = FALSE;
+static KSPIN_LOCK g_KiqRingLock;
+
+// KIQ register offsets (BAR5-relative, BC-250)
+#define KIQ_BASE_LO       0xE060
+#define KIQ_BASE_HI       0xE064
+#define KIQ_CNTL          0xE068
+#define KIQ_RPTR          0xE06C
+#define KIQ_WPTR          0xE078
+#define GRBM_GFX_INDEX    0x34D0
+#define KIQ_GRBM_VAL      0x00010000  // ME=1, PIPE=0, QUEUE=0
+
+#define KIQ_RING_SIZE     0x2000      // 8KB ring buffer
+
+static NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt)
+{
+    PHYSICAL_ADDRESS highAddr;
+    
+    if (g_KiqRingInitialized) {
+        return STATUS_SUCCESS;
+    }
+
+    // Allocate physically contiguous, page-aligned ring buffer
+    highAddr.QuadPart = 0x100000000ULL;  // Prefer below 4GB
+    g_KiqRingVa = MmAllocateContiguousMemory(KIQ_RING_SIZE, highAddr);
+    if (g_KiqRingVa == NULL) {
+        highAddr.QuadPart = 0xFFFFFFFF;
+        g_KiqRingVa = MmAllocateContiguousMemory(KIQ_RING_SIZE, highAddr);
+    }
+    if (g_KiqRingVa == NULL) {
+        KdPrint(("KIQ: Failed to allocate ring buffer\n"));
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    RtlZeroMemory(g_KiqRingVa, KIQ_RING_SIZE);
+    g_KiqRingPa = MmGetPhysicalAddress(g_KiqRingVa);
+    g_KiqRingSize = KIQ_RING_SIZE;
+    g_KiqRingWptr = 0;
+    KeInitializeSpinLock(&g_KiqRingLock);
+
+    if (devExt->MmioBase == NULL) {
+        MmFreeContiguousMemory(g_KiqRingVa);
+        g_KiqRingVa = NULL;
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    // Set GRBM to select KIQ (ME=1)
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + GRBM_GFX_INDEX), KIQ_GRBM_VAL);
+    KeStallExecutionProcessor(1);
+
+    // Write KIQ_BASE_LO/HI with ring buffer physical address
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + KIQ_BASE_LO), g_KiqRingPa.LowPart);
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + KIQ_BASE_HI), g_KiqRingPa.HighPart);
+
+    // Initialize KIQ_WPTR to 0
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + KIQ_WPTR), 0);
+
+    // Restore GRBM to broadcast
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + GRBM_GFX_INDEX), 0);
+    
+    g_KiqRingInitialized = TRUE;
+
+    KdPrint(("KIQ: Ring initialized PA=0x%llX VA=%p size=%u\n",
+        g_KiqRingPa.QuadPart, g_KiqRingVa, g_KiqRingSize));
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PULONG Pm4Commands, ULONG DwordCount)
+{
+    KIRQL irql;
+    ULONG wptr;
+    ULONG i;
+
+    if (!g_KiqRingInitialized) {
+        KdPrint(("KIQ: Ring not initialized\n"));
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (Pm4Commands == NULL || DwordCount == 0 || DwordCount > 64) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&g_KiqRingLock, &irql);
+
+    // Write PM4 commands to ring buffer with wrap-around
+    wptr = g_KiqRingWptr;
+    for (i = 0; i < DwordCount; i++) {
+        if (wptr >= g_KiqRingSize / sizeof(ULONG)) {
+            wptr = 0;
+        }
+        ((volatile PULONG)g_KiqRingVa)[wptr] = Pm4Commands[i];
+        wptr++;
+    }
+    g_KiqRingWptr = wptr;
+
+    // Ring doorbell: write KIQ_WPTR to trigger GPU execution
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + KIQ_WPTR), g_KiqRingWptr);
+
+    KeReleaseSpinLock(&g_KiqRingLock, irql);
+
+    KdPrint(("KIQ: Submitted %u DWORDs, WPTR=%u\n", DwordCount, g_KiqRingWptr));
+    return STATUS_SUCCESS;
+}
+
+static VOID PspKiqCleanup(VOID)
+{
+    g_KiqRingInitialized = FALSE;
+    g_KiqRingWptr = 0;
+    g_KiqRingSize = 0;
+    if (g_KiqRingVa) {
+        MmFreeContiguousMemory(g_KiqRingVa);
+        g_KiqRingVa = NULL;
+    }
+    g_KiqRingPa.QuadPart = 0;
+    KdPrint(("KIQ: Ring cleaned up\n"));
+}
+
 static BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
 {
     if (FirmwareData == NULL || FirmwareSize < 256)
@@ -315,6 +437,7 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     KdPrint(("=== AMD BC-250 PSP Driver: Unload ===\n"));
 
     PspFreeTmr();
+    PspKiqCleanup();
     PspFreeFirmware(devExt);
 
     if (devExt->PciCfgBase != NULL) {
@@ -1294,6 +1417,37 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             status = PspInitTmr(devExt);
             if (outputLength >= sizeof(ULONG)) {
                 ((PULONG)outputBuffer)[0] = g_TmrInitialized ? 1 : 0;
+                bytesReturned = sizeof(ULONG);
+            }
+            break;
+        }
+
+        case IOCTL_PSP_KIQ_SUBMIT:
+        {
+            // Initialize KIQ ring on first use
+            if (!g_KiqRingInitialized) {
+                status = PspKiqInit(devExt);
+                if (!NT_SUCCESS(status)) {
+                    KdPrint(("KIQ: Init failed: 0x%08X\n", status));
+                    break;
+                }
+            }
+
+            // Parse input: first ULONG = command count, rest = PM4 DWORDs
+            if (inputLength < sizeof(ULONG)) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            PULONG inputDwords = (PULONG)inputBuffer;
+            ULONG cmdCount = inputDwords[0];
+            if (cmdCount == 0 || cmdCount > 64 || inputLength < sizeof(ULONG) * (1 + cmdCount)) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            status = PspKiqSubmit(devExt, &inputDwords[1], cmdCount);
+            if (NT_SUCCESS(status) && outputLength >= sizeof(ULONG)) {
+                ((PULONG)outputBuffer)[0] = g_KiqRingWptr;
                 bytesReturned = sizeof(ULONG);
             }
             break;

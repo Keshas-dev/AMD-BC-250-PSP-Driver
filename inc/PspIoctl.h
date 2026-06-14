@@ -31,13 +31,14 @@ extern "C" {
 #define IOCTL_PSP_GET_GPU_INFO        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x815, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_REG_PROG            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x816, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_AUTOLOAD_RLC        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x817, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_PSP_KIQ_SUBMIT          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x818, METHOD_BUFFERED, FILE_ANY_ACCESS)  // TODO
+#define IOCTL_PSP_KIQ_SUBMIT          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x818, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_INIT_TMR            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x819, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
 #define PSP_C2PMSG_35_OFFSET  0x1056C   // Command register
-#define PSP_C2PMSG_36_OFFSET  0x10570   // Data register  
+#define PSP_C2PMSG_36_OFFSET  0x10570   // Data register (PA low 32b)
+#define PSP_C2PMSG_37_OFFSET  0x10574   // Data register (PA high 32b)
 #define PSP_C2PMSG_81_OFFSET  0x10614   // Status register
 
 // GC register base offset on BC-250 (Cyan Skillfish)
@@ -194,6 +195,13 @@ typedef struct _PSP_REG_PROG_REQUEST {
     ULONG RegId;             // Register ID (see psp_reg_prog_id enum)
     ULONG RegValue;          // Value to program
 } PSP_REG_PROG_REQUEST, *PPSP_REG_PROG_REQUEST;
+
+// Input/output for IOCTL_PSP_KIQ_SUBMIT — submit PM4 commands to KIQ ring
+typedef struct _PSP_KIQ_SUBMIT_REQUEST {
+    ULONG CommandCount;      // Number of PM4 DWORDs (max 64)
+    ULONG Reserved[3];       // Alignment padding
+    ULONG Commands[64];      // PM4 commands
+} PSP_KIQ_SUBMIT_REQUEST, *PPSP_KIQ_SUBMIT_REQUEST;
 
 #pragma pack(pop)
 

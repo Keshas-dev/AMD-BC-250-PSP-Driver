@@ -306,7 +306,7 @@ Verified against the user's BIOS dump. If regenerating `firmware_data.h` from a 
 
 ## SomnacinDumper-CPUCoreMod findings (bc250-collective)
 
-Repo: https://github.com/bc250-collective/SomnacinDumper-CPUCoreMod
+Repo: https://github.com/bc250-collective/SomnacinDumper-CPUCoreMod — Additional research from the bc250-collective GitHub organization
 - **BC-250 codename: "ROBIN"** (`#ifdef ROBIN` in all firmware)
 - **SMU firmware SPI address**: `0x8FEE00` (matches our BIOS SYSDRV type 8!)
   - Loader: offset `0x1B340` → absolute `0x8FF240`
@@ -531,3 +531,47 @@ User requested setting up multiple agents to work in parallel:
 
 Use `task` tool with `general` subagent type for these roles.
 Reminder: check `E:\` drive is connected before build commands (user sometimes forgets).
+
+## Linux psp_v11_0_8 vs psp_v11_0 comparison (confirmed 2026-06-13)
+
+### BC-250 (`IP_VERSION(11, 0, 8)`) is NOT in any `init_microcode` switch
+- `psp_v11_0_init_microcode()` in `psp_v11_0.c` has cases for: 11.0.0, 11.0.2, 11.0.4, 11.0.5, 11.0.7, 11.0.9, 11.0.11, 11.0.12, 11.0.13, 11.5.0, 11.5.2
+- **11.0.8 is absent** — Linux never loads SOS/ASD/TA firmware files for BC-250
+- Linux relies entirely on BIOS pre-loaded SOS for this device
+
+### Key differences: 11.0.0 (Navi10 dGPU) vs 11.0.8 (BC-250)
+| Feature | 11.0.0 (Navi10) | 11.0.8 (BC-250) |
+|---------|-----------------|-----------------|
+| `init_microcode` | Loads SOS + ASD + TA | **Not called** (no entry) |
+| SOS source | Filesystem (`psp_init_sos_microcode`) | **BIOS pre-loaded** |
+| Ring protocol | Full support | **TOS never sets MBOX_TOS_READY** |
+| Mailbox CMD 0x4/0x8 | Used in `psp_v11_0.c` | **Not used in `psp_v11_0_8.c`** |
+
+### 11.5.0 (Steam Deck APU) closest analog
+- Also skips SOS firmware loading
+- Loads only ASD + TOC microcode
+- Confirms APU-like devices (BC-250, Steam Deck) have minimal PSP that relies on BIOS
+
+### Linux doesn't use mailbox for register programming
+- `psp_v11_0_8` has no `cmd_submit` — no GPCOM mailbox commands
+- All register access goes through direct BAR5 MMIO (RREG32/WREG32 with GC_BASE offset)
+- This matches our finding that mailbox PROG_REG is accepted but silently ignored
+
+### Conclusion
+- Our Windows driver behavior (mailbox CMD 0x4/0x8 works, ring protocol doesn't) is **consistent with Linux**
+- Ring protocol failure is a SOS firmware limitation, not a driver bug
+- Direct MMIO at corrected offsets (GC_BASE=0x1260) is the intended access method
+
+## Fixes Applied (2026-06-13)
+
+### Driver fixes
+1. **C2PMSG_37 constant** - Added `PSP_C2PMSG_37_OFFSET` to PspIoctl.h, updated PspDriver.c to use it
+2. **GC_BASE offset** - Already correctly applied (0x1260 shift for BAR5 registers)
+3. **Mailbox protocol** - Already fixed: polls C2PMSG_35, not C2PMSG_81
+4. **Spinlock handling** - Already fixed: releases before polling
+5. **Per-call buffers** - Already fixed: uses ExAllocatePool2 for ring operations
+6. **BOOT_SEQUENCE** - Already fixed: returns real NTSTATUS
+
+### Test tool fixes
+1. **64-bit address parsing** - Changed `-i` option to use `strtoull()` for physical addresses
+2. **FW type mapping** - Corrected enum: CE=3, PFP=2, ME=1, SDMA=9, SDMA1=8

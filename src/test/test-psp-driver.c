@@ -454,25 +454,24 @@ BOOL RingLoadIpFw(HANDLE hDevice, ULONG fwType, const char* filename)
 
 static const char* FwTypeName(ULONG t) {
     switch (t) {
-        case 1: return "CE";   case 2: return "PFP";
-        case 3: return "ME";   case 4: return "MEC";
+        case 1: return "ME";    case 2: return "PFP";
+        case 3: return "CE";   case 4: return "MEC";
         case 5: return "MEC2"; case 6: return "RLC";
-        case 7: return "SDMA"; case 8: return "SDMA1";
+        case 8: return "SDMA1"; case 9: return "SDMA";
         default: return "?";
     }
 }
 
 BOOL RingLoadAllFw(HANDLE hDevice)
 {
-    // NOTE: Decompressed .bin files must be in the working directory (e.g., `output\`)
     static const struct { ULONG type; const char* name; } fw_list[] = {
-        {1, "cyan_skillfish2_ce.bin"},
+        {3, "cyan_skillfish2_ce.bin"},
         {2, "cyan_skillfish2_pfp.bin"},
-        {3, "cyan_skillfish2_me.bin"},
+        {1, "cyan_skillfish2_me.bin"},
         {4, "cyan_skillfish2_mec.bin"},
         {5, "cyan_skillfish2_mec2.bin"},
         {6, "cyan_skillfish2_rlc.bin"},
-        {7, "cyan_skillfish2_sdma.bin"},
+        {9, "cyan_skillfish2_sdma.bin"},
         {8, "cyan_skillfish2_sdma1.bin"},
     };
     int count = sizeof(fw_list)/sizeof(fw_list[0]);
@@ -552,6 +551,23 @@ BOOL ProgReg(HANDLE hDevice, ULONG regId, ULONG value)
     return ok;
 }
 
+BOOL KiqSubmit(HANDLE hDevice, PULONG commands, ULONG count)
+{
+    PSP_KIQ_SUBMIT_REQUEST req;
+    req.CommandCount = count;
+    memset(req.Reserved, 0, sizeof(req.Reserved));
+    memset(req.Commands, 0, sizeof(req.Commands));
+    memcpy(req.Commands, commands, count * sizeof(ULONG));
+    ULONG wptr = 0;
+    DWORD returned = 0;
+    Log("KIQ_SUBMIT(%u dwords)...\n", count);
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_KIQ_SUBMIT,
+        &req, sizeof(req), &wptr, sizeof(wptr), &returned, NULL);
+    if (ok) { Log("  OK (wptr=0x%08X)\n", wptr); }
+    else { Log("  FAILED (err=%lu)\n", GetLastError()); }
+    return ok;
+}
+
 void PrintUsage(const char *prog)
 {
     printf("Usage: %s [options]\n", prog);
@@ -569,7 +585,7 @@ void PrintUsage(const char *prog)
     printf("  -B                 Full boot sequence (embedded FW + SYSDRV 0x4 + SOS 0x8)\n");
     printf("  -pb <bus> <df> <off>  PCI config read (bus, device<<3|func, offset hex)\n");
     printf("  -pw <bus> <df> <off> <val>  PCI config write\n");
-    printf("  -L <type> <file>   Load GPU FW via PSP ring (type: 1=CE 2=PFP 3=ME 4=MEC 5=MEC2 6=RLC 7=SDMA 8=SDMA1)\n");
+    printf("  -L <type> <file>   Load GPU FW via PSP ring (type: 1=ME 2=PFP 3=CE 4=MEC 5=MEC2 6=RLC 8=SDMA1 9=SDMA)\n");
     printf("  -A                 Load ALL GPU FW via PSP ring (cyan_skillfish2)\n");
     printf("  -G                 Get GPU bridge info (ring PA, TMR, FW status)\n");
     printf("  -P <id> <val>      Program register through PSP ring\n");
@@ -578,6 +594,7 @@ void PrintUsage(const char *prog)
     printf("  -t                 Run basic connectivity test\n");
     printf("  -M                 Initialize TMR (Trusted Memory Region, 4MB)\n");
     printf("  -H                 Run comprehensive HW probe (mailbox + NBIO + ring)\n");
+    printf("  -k <dwords...>     Submit PM4 commands via KIQ ring (hex dwords, up to 64)\n");
     printf("  -l <logfile>       Write log to file\n");
     printf("\nExamples:\n");
     printf("  %s -i 0xFE800000 0x100000     Init HW with BAR5 at 0xFE800000\n", prog);
@@ -657,7 +674,7 @@ int main(int argc, char *argv[])
             }
         }
         else if (strcmp(argv[i], "-i") == 0 && i + 2 < argc) {
-            ULONG physAddr = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG64 physAddr = strtoull(argv[++i], NULL, 0);
             ULONG size = (ULONG)strtoul(argv[++i], NULL, 0);
             ok = InitHardware(h, physAddr, size);
             if (!ok) {
@@ -794,6 +811,27 @@ int main(int argc, char *argv[])
             }
 
             Log("\n=== Test Complete ===\n");
+        }
+        else if (strcmp(argv[i], "-k") == 0) {
+            // Collect variable number of PM4 DWORDs after -k
+            ULONG cmds[64];
+            ULONG count = 0;
+            int j = i + 1;
+            while (j < argc && argv[j][0] != '-' && count < 64) {
+                cmds[count++] = (ULONG)strtoul(argv[j], NULL, 0);
+                j++;
+            }
+            if (count > 0) {
+                Log("KIQ_SUBMIT(%u dwords): ", count);
+                for (ULONG d = 0; d < count; d++) Log("0x%08X ", cmds[d]);
+                Log("\n");
+                ok = KiqSubmit(h, cmds, count);
+                if (!ok) { ret = 1; }
+            } else {
+                Log("ERROR: -k requires at least one PM4 DWORD\n");
+                ret = 1;
+            }
+            i = j - 1; // Skip consumed args
         }
         else if (strcmp(argv[i], "-l") == 0) {
             i++; // Skip logfile argument (already handled)
