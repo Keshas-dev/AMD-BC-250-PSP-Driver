@@ -110,7 +110,7 @@ if exist "%PROJECT_DIR%*.obj" del /q "%PROJECT_DIR%*.obj" 2>nul
 
 echo.
 echo ==========================================
-echo  BUILDING KMDF Driver (PspDriver.sys)
+echo  BUILDING WDM Driver (PspDriver.sys)
 echo ==========================================
 echo.
 
@@ -122,12 +122,12 @@ cl.exe /c /kernel /GS- /W3 /Zi /Od /DAMD64 /D_AMD64_ /DAMD_BC250_PSP_DRIVER ^
   "%PROJECT_DIR%\src\driver\PspDriver.c"
 
 if errorlevel 1 (
-    echo KMDF compilation FAILED!
+    echo WDM compilation FAILED!
     pause
     exit /b 1
 )
 
-echo Linking KMDF driver...
+echo Linking WDM driver...
 link.exe /DRIVER /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry ^
   /OUT:"%OUTPUT_DIR%\PspDriver.sys" ^
   PspDriver.obj ^
@@ -135,7 +135,7 @@ link.exe /DRIVER /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry ^
   /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VERSION%\km\x64"
 
 if errorlevel 1 (
-    echo KMDF linking FAILED!
+    echo WDM linking FAILED!
     pause
     exit /b 1
 )

@@ -574,4 +574,4 @@ Reminder: check `E:\` drive is connected before build commands (user sometimes f
 
 ### Test tool fixes
 1. **64-bit address parsing** - Changed `-i` option to use `strtoull()` for physical addresses
-2. **FW type mapping** - Corrected enum: CE=3, PFP=2, ME=1, SDMA=9, SDMA1=8
+2. **FW type mapping** - Corrected enum: CE=3, PFP=2, ME=1, SDMA=9, SDMA1=10, RLC=8 (was incorrect 6/8/9)

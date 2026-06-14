@@ -33,12 +33,21 @@ extern "C" {
 #define IOCTL_PSP_AUTOLOAD_RLC        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x817, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_KIQ_SUBMIT          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x818, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_INIT_TMR            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x819, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_LOAD_TOC            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x820, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
 #define PSP_C2PMSG_35_OFFSET  0x1056C   // Command register
 #define PSP_C2PMSG_36_OFFSET  0x10570   // Data register (PA low 32b)
 #define PSP_C2PMSG_37_OFFSET  0x10574   // Data register (PA high 32b)
+#define PSP_C2PMSG_64_OFFSET  0x105E0   // Ring control register
+#define PSP_C2PMSG_65_OFFSET  0x105E4   // RBI wptr
+#define PSP_C2PMSG_66_OFFSET  0x105E8   // RBI rptr
+#define PSP_C2PMSG_67_OFFSET  0x105EC   // GPCOM wptr
+#define PSP_C2PMSG_68_OFFSET  0x105F0   // GPCOM rptr
+#define PSP_C2PMSG_69_OFFSET  0x105F4   // Ring buffer addr lo
+#define PSP_C2PMSG_70_OFFSET  0x105F8   // Ring buffer addr hi
+#define PSP_C2PMSG_71_OFFSET  0x105FC   // Ring buffer size
 #define PSP_C2PMSG_81_OFFSET  0x10614   // Status register
 
 // GC register base offset on BC-250 (Cyan Skillfish)
@@ -75,6 +84,7 @@ extern "C" {
 // PSP ring frame command IDs (from Linux psp_gfx_if.h)
 #define GFX_CMD_ID_INIT_TMR     0x00000001
 #define GFX_CMD_ID_LOAD_IP_FW   0x00000006
+#define GFX_CMD_ID_PROG_REG     0x0000000B
 #define GFX_CMD_ID_LOAD_TOC     0x00000020
 #define GFX_CMD_ID_AUTOLOAD_RLC 0x00000021
 

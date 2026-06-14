@@ -456,8 +456,8 @@ static const char* FwTypeName(ULONG t) {
     switch (t) {
         case 1: return "ME";    case 2: return "PFP";
         case 3: return "CE";   case 4: return "MEC";
-        case 5: return "MEC2"; case 6: return "RLC";
-        case 8: return "SDMA1"; case 9: return "SDMA";
+        case 5: return "MEC2"; case 8: return "RLC";
+        case 9: return "SDMA"; case 10: return "SDMA1";
         default: return "?";
     }
 }
@@ -470,9 +470,9 @@ BOOL RingLoadAllFw(HANDLE hDevice)
         {1, "cyan_skillfish2_me.bin"},
         {4, "cyan_skillfish2_mec.bin"},
         {5, "cyan_skillfish2_mec2.bin"},
-        {6, "cyan_skillfish2_rlc.bin"},
+        {8, "cyan_skillfish2_rlc.bin"},
         {9, "cyan_skillfish2_sdma.bin"},
-        {8, "cyan_skillfish2_sdma1.bin"},
+        {10, "cyan_skillfish2_sdma1.bin"},
     };
     int count = sizeof(fw_list)/sizeof(fw_list[0]);
     int ok = 0;
@@ -585,7 +585,7 @@ void PrintUsage(const char *prog)
     printf("  -B                 Full boot sequence (embedded FW + SYSDRV 0x4 + SOS 0x8)\n");
     printf("  -pb <bus> <df> <off>  PCI config read (bus, device<<3|func, offset hex)\n");
     printf("  -pw <bus> <df> <off> <val>  PCI config write\n");
-    printf("  -L <type> <file>   Load GPU FW via PSP ring (type: 1=ME 2=PFP 3=CE 4=MEC 5=MEC2 6=RLC 8=SDMA1 9=SDMA)\n");
+    printf("  -L <type> <file>   Load GPU FW via PSP ring (type: 1=ME 2=PFP 3=CE 4=MEC 5=MEC2 8=RLC 9=SDMA 10=SDMA1)\n");
     printf("  -A                 Load ALL GPU FW via PSP ring (cyan_skillfish2)\n");
     printf("  -G                 Get GPU bridge info (ring PA, TMR, FW status)\n");
     printf("  -P <id> <val>      Program register through PSP ring\n");

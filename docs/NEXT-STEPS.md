@@ -1,26 +1,25 @@
 # Sekantys Žingsniai — Prioritizuoti
 
-## 1. 🔴 AUKŠTAS — Patvirtinti GC_BASE offset'us
+## 1. 🔴 AUKŠTAS — GC_BASE offset'ai JAU PATAISYTI ✅
 
-**Kritiškiausias** — atnaujinti kodo prielaidas.
+**Atlikta** — `inc/PspIoctl.h` turi `#define AMDBC250_GC_BASE 0x1260` ir `PspDriver.c` naudoja šį offset'ą visur.
 
 ```cmd
 test-psp-driver.exe -i 0xFE800000 0x200000
-test-psp-driver.exe -r 0x3260      # Tikėtina: ne 0xFFFFFFFF
-test-psp-driver.exe -r 0x3264      # Tikėtina: validi reikšmė
-test-psp-driver.exe -r 0x34FC      # Tikėtina: validi reikšmė
+test-psp-driver.exe -r 0x3260      # GRBM_STATUS - validi reikšmė
+test-psp-driver.exe -r 0x3264      # CC_GC_SHADER_ARRAY_CONFIG - validi reikšmė  
+test-psp-driver.exe -r 0x34FC      # SPI_PG_ENABLE_STATIC_WGP_MASK - validi reikšmė
 ```
 
-Jei patvirtinta:
-- Pridėti `#define PSP_GC_BASE 0x1260` į `inc/PspIoctl.h`
-- Atnaujinti visus `0x2004` → `GC_BASE + 0x2004`
-- Atnaujinti test tool, kad palaikytų simbolinius offset'us
+## 2. 🔴 AUKŠTAS — Ring protokolas neveikia (HW apribojimas)
 
-## 2. 🔴 AUKŠTAS — Pakeisti GRBM offset driver'yje
+C2PMSG_64 bit 31 (TOS_READY/TOS_RESP) niekad nesetina. SOS firmware šioje BIOS versijoje nepalaiko GPCOM ring.
 
-Šiuo metu `PspDriver.c` naudoja `0x2004` GRBM_STATUS ir kitiems registrams. Reikia pakeisti į `0x3260+`.
+## 3. 🟡 VIDUTINIS — SDMA FW type pataisyta ✅
 
-## 3. 🟡 VIDUTINIS — UEFI BIOS konfigūracija per RU.efi
+test-psp-driver.c `FwTypeName()` dabar teisingai atpažįsta: CE=3, PFP=2, ME=1, SDMA=9, SDMA1=10, RLC=8.
+
+## 4. 🟡 VIDUTINIS — UEFI BIOS konfigūracija per RU.efi
 
 **Tikslas**: Išjungti IOMMU ir pamatyti ar tai įtakoja NBIO elgesį.
 
@@ -28,9 +27,10 @@ Jei patvirtinta:
 - Taip pat bandyti: SVM Mode (0xB0→00), Above 4G (0xDA→01)
 - Po pakeitimų: reboot → test GRBM offset'us
 
-## 4. 🟡 VIDUTINIS — 40 CU Unlock bandymas
+## 4. 🟢 GRĮŽTAS — 40 CU Unlock bandymas
 
-Jei GC_BASE patvirtinta ir GRBM/SHADER_CONFIG pasiekiami:
+GC_BASE patvirtintas. Bandyti GRBM/SHADER_CONFIG:
+
 ```cmd
 test-psp-driver.exe -w 0x3264 0xFFE00000   # CC_GC_SHADER_ARRAY_CONFIG
 test-psp-driver.exe -w 0x34FC 0x0000001F   # SPI_PG_ENABLE

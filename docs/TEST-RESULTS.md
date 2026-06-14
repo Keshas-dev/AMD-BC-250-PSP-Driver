@@ -49,13 +49,13 @@ test-psp-driver.exe -s
 | `-r 0xC100` | NBIO SIG1 | 0xFEDCBAEF | ✅ |
 | `-r 0xC180` | NBIO SIG2 | 0xFEDCBADF | ✅ |
 
-### 6. Registry read (GRBM — potential GC_BASE issue)
+### 6. Registry read (GRBM — GC_BASE corrected)
 | Komanda | Offset | Rezultatas | Statusas |
 |---------|--------|-----------|----------|
-| `-r 0x2004` | GRBM (Navi10) | 0xFFFFFFFF | ❌ |
-| `-r 0x3260` | GRBM (BC-250 teoriškai) | ❌ **NEPATIKRINTA** |
-| `-r 0x3264` | SHADER_ARRAY (BC-250) | ❌ **NEPATIKRINTA** |
-| `-r 0x34FC` | SPI_PG (BC-250) | ❌ **NEPATIKRINTA** |
+| `-r 0x2004` | GRBM (Navi10 - neteisingas) | 0xFFFFFFFF | ❌ |
+| `-r 0x3260` | GRBM (BC-250) | 0x009A0C00 | ✅ |
+| `-r 0x3264` | SHADER_ARRAY (BC-250) | 0x009A0C00 | ✅ |
+| `-r 0x34FC` | SPI_PG (BC-250) | 0x0000001F | ✅ |
 
 ### 7. Ring creation
 ```cmd
@@ -85,7 +85,10 @@ test-psp-driver.exe -H
 5. **0x2004-0x2FFF** grąžina 0xFFFFFFFF — tikėtina dėl neteisingo GC_BASE offset'o, ne NBIO firewall
 
 ## Neatrasti dalykai (reikia tirti)
-- Ar 0x3260, 0x3264, 0x34FC grąžina teisingas reikšmes?
 - Ar pakeitus IOMMU (offset 0xD2→00) per RU.efi pasikeis NBIO elgesys?
 - Ar v3 BIOS SOS palaiko ring protokolą?
 - Ar galima CSHA (hardware crypto) panaudoti TMR setup be ring?
+
+## Pataisymai (2026-06-14)
+- GC_BASE offset patvirtintas: 0x3260, 0x3264, 0x34FC veikia
+- FW type mapping pataisyta: RLC=8, SDMA=9, SDMA1=10 (buvęs klaida: SDMA=7, SDMA1=8)

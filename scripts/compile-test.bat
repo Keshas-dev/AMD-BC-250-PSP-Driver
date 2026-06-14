@@ -44,6 +44,7 @@ echo Please install VS2022 with "Desktop development with C++" workload
 exit /b 1
 
 :SetupEnv
+echo Setting up build environment...
 call "%VSWHERE%" >nul 2>&1
 if errorlevel 1 (
     echo ERROR: Failed to setup VS build environment

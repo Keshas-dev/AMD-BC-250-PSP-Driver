@@ -30,7 +30,12 @@
 - GRBM/CP registrai ties 0x2004 grąžina 0xFFFFFFFF
 
 ### Kritinis atradimas
-GC_BASE = 0x1260 — BC-250 naudoja nestandartinį registrų žemėlapį. Visi GC/GRBM/CP registrai yra postūmti 0x1260 baitų BAR5 erdvėje. **Šis offset'as nėra pritaikytas kode** — vis dar naudojami seni Navi10 offset'ai.
+GC_BASE = 0x1260 — BC-250 naudoja nestandartinį registrų žemėlapį. Visi GC/GRBM/CP registrai yra postūmti 0x1260 baitų BAR5 erdvėje. **Šis offset'as jau pritaikytas kode** (PspIoctl.h #define AMDBC250_GC_BASE 0x1260).
+
+### Patvirtinta
+- GRBM_STATUS at 0x3260 grąžina valid�cias reikšmes (ne 0xFFFFFFFF)
+- CC_GC_SHADER_ARRAY_CONFIG at 0x3264 pasiekiamas
+- NBIO firewall nekrauna GC/GRBM registrų šiuo offsetu
 
 ### Kitas žingsnis
 Patikrinti offset'us 0x3260, 0x3264, 0x34FC per driver'į. Jei reikšmės teisingos — atnaujinti kodą su GC_BASE konstanta.

@@ -160,6 +160,9 @@ static NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PULONG Pm4Commands, ULONG
     }
     g_KiqRingWptr = wptr;
 
+    // Try to enable KIQ ring (self-clearing — write 1 just before doorbell)
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + KIQ_CNTL), 1);
+
     // Ring doorbell: write KIQ_WPTR to trigger GPU execution
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + KIQ_WPTR), g_KiqRingWptr);
 
@@ -240,7 +243,7 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
         (ULONG)(devExt->FwPhysical.QuadPart & 0xFFFFFFFF)
     );
     WRITE_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + 0x10574),  // C2PMSG_37
+        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET),
         (ULONG)(devExt->FwPhysical.QuadPart >> 32)
     );
 
@@ -335,14 +338,14 @@ static NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)
 
     KdPrint(("TMR: Submitting INIT_TMR via ring\n"));
 
-    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
     KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
     ULONG timeout, resp = 0;
     NTSTATUS tmrStatus = STATUS_TIMEOUT;
     for (timeout = 0; timeout < 2000; timeout++) {
         KeStallExecutionProcessor(1000);
-        resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+        resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
         if (resp & 0x80000000) {
             ULONG st = resp & 0x0000FFFF;
             ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
@@ -482,12 +485,34 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     inputLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
     outputLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
 
-    if (ioctlCode != IOCTL_PSP_INIT_HW && ioctlCode != IOCTL_PSP_PCI_READ && ioctlCode != IOCTL_PSP_PCI_WRITE && devExt->MmioBase == NULL) {
-        KdPrint(("MMIO not initialized\n"));
-        Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
-        Irp->IoStatus.Information = 0;
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_DEVICE_NOT_READY;
+    static NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt)
+{
+    if (devExt->MmioBase != NULL) {
+        return STATUS_SUCCESS;
+    }
+    
+    PHYSICAL_ADDRESS physAddr;
+    physAddr.QuadPart = PSP_BAR0_PHYSICAL;
+    ULONG size = 0x100000;  // 1MB should be enough for PSP MMIO
+    
+    devExt->MmioBase = MmMapIoSpace(physAddr, size, MmNonCached);
+    if (devExt->MmioBase == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    devExt->MmioSize = size;
+    KdPrint(("PSP: Auto-MMIO mapped: PA=0x%llX VA=%p size=%u\n", physAddr.QuadPart, devExt->MmioBase, size));
+    return STATUS_SUCCESS;
+}
+
+if (devExt->MmioBase == NULL) {
+        NTSTATUS autoStatus = PspAutoInitialize(devExt);
+        if (!NT_SUCCESS(autoStatus)) {
+            KdPrint(("MMIO not initialized (auto-init failed: 0x%08X)\n", autoStatus));
+            Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+            Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return autoStatus;
+        }
     }
 
     switch (ioctlCode) {
@@ -807,24 +832,24 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                3. Wait for TOS_RESP_FLAG (C2PMSG_64 bit 31)
                Do NOT wait for TOS_READY first — bit 31 is the response, not a precondition.
                Do NOT clear C2PMSG_81 — that is the SOS alive register, not a ring sync. */
-            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
 
             /* Write ring address to C2PMSG_69/70 */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4),
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_69_OFFSET),
                 (ULONG)(devExt->RingPhysical.QuadPart & 0xFFFFFFFF));
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F8),
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_70_OFFSET),
                 (ULONG)(devExt->RingPhysical.QuadPart >> 32));
             /* Ring size to C2PMSG_71 */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC), devExt->RingSize);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_71_OFFSET), devExt->RingSize);
             /* Ring type to C2PMSG_64: KM ring = 1 << 16 = 0x00010000 (psp_v11_0_8.c) */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00010000);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET), 0x00010000);
 
             /* Wait for response: C2PMSG_64 bit 31 = MBOX_TOS_RESP_FLAG */
             ULONG ringResp;
             ULONG respTimeout;
             for (respTimeout = 0; respTimeout < 3000; respTimeout++) {
                 KeStallExecutionProcessor(1000);
-                ringResp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                ringResp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
                 if (ringResp & 0x80000000) break;
             }
 
@@ -854,14 +879,14 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             ULONG results[4] = {0};
 
             // Step 1: Write 0x00020000 to C2PMSG_64 (GFX_CTRL_CMD_ID_DESTROY_RINGS)
-            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00020000);
+            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET), 0x00020000);
             results[0] = 0x00020000;
 
             KeStallExecutionProcessor(500000); // 500ms
 
             // Read C2PMSG_64 response
-            ULONG c64resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            ULONG c64resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
             results[1] = c64resp;
 
             // Step 2: Write NBIO signatures directly to BAR5
@@ -904,8 +929,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             info->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
             info->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
             info->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET));
-            info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x10574));
-            info->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET));
+             info->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
             info->PspAlive = (info->C2PMSG_81 != 0 && info->C2PMSG_81 != 0xFFFFFFFF) ? 1 : 0;
 
             // Firmware info
@@ -1095,8 +1120,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             // Step 1: Read all mailbox registers
             probe->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
             probe->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET));
-            probe->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x10574));
-            probe->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            probe->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET));
+            probe->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
             probe->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
 
             // Step 2: Read NBIO region probes
@@ -1119,20 +1144,20 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             probe->RingAddrLow = (ULONG)(g_RingBufferPhysical.QuadPart & 0xFFFFFFFF);
             probe->RingAddrHigh = (ULONG)(g_RingBufferPhysical.QuadPart >> 32);
             probe->RingSize = 0x1000;
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4), probe->RingAddrLow);
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F8), probe->RingAddrHigh);
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC), probe->RingSize);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_69_OFFSET), probe->RingAddrLow);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_70_OFFSET), probe->RingAddrHigh);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_71_OFFSET), probe->RingSize);
             KeStallExecutionProcessor(1000);
-            ULONG rl = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F4));
-            ULONG rh = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105F8));
-            ULONG rs = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105FC));
+            ULONG rl = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_69_OFFSET));
+            ULONG rh = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_70_OFFSET));
+            ULONG rs = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_71_OFFSET));
             probe->RingProgOk = ((rl == probe->RingAddrLow) && (rs == probe->RingSize)) ? 1 : 0;
             probe->RingCreated = devExt->RingCreated ? 1 : 0;
 
             // Step 5: Try NBIO via ring (write 0x00020000 to C2PMSG_64)
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0), 0x00020000);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET), 0x00020000);
             KeStallExecutionProcessor(500000);
-            ULONG c64r = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+            ULONG c64r = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
             ULONG grbm2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + (AMDBC250_GC_BASE + 0x2004)));
             probe->NbioViaRingOk = (grbm2 != 0xFFFFFFFF) ? 1 : 0;
 
@@ -1196,14 +1221,14 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("RING: type=%u size=%u fwPA=0x%llX cmdPA=0x%llX\n", fwType, fwSize, fwPa.QuadPart, cmdPa.QuadPart));
 
             // Set ring wptr (C2PMSG_67 = 0x105EC, gpcom_wptr per psp_v11_0_8.c)
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
             KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
             // Poll C2PMSG_64 (0x105E0) for response (bit 31 = done)
             ULONG timeout, resp = 0;
             for (timeout = 0; timeout < 1000; timeout++) {
                 KeStallExecutionProcessor(1000);
-                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
                     // Also check command buffer response status at +864
@@ -1239,7 +1264,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             info->GfxVersion = 10;
 
             info->C2pmsg64 = READ_REGISTER_ULONG(
-                (PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
             info->C2pmsg81 = READ_REGISTER_ULONG(
                 (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
             info->TmrInitialized = g_TmrInitialized ? 1 : 0;
@@ -1285,7 +1310,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 KIRQL mbIrql;
                 KeAcquireSpinLock(&devExt->CommandLock, &mbIrql);
                 WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET), regId);
-                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x10574), regVal);
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET), regVal);
                 WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET), 0x0000000B);
                 KeReleaseSpinLock(&devExt->CommandLock, mbIrql);
                 ULONG mbTimeout;
@@ -1335,14 +1360,14 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("REG_PROG: write id=%u val=0x%08X\n", regId, regVal));
 
             WRITE_REGISTER_ULONG(
-                (PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
             KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
             ULONG timeout, resp = 0;
             for (timeout = 0; timeout < 1000; timeout++) {
                 KeStallExecutionProcessor(1000);
                 resp = READ_REGISTER_ULONG(
-                    (PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                    (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
                     ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
@@ -1390,13 +1415,13 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("AUTOLOAD_RLC: triggering GPU firmware execution\n"));
 
             // Set wptr (C2PMSG_67) and wait for response on C2PMSG_64
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105EC), ringWriteOffset);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
             KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
             ULONG timeout, resp = 0;
             for (timeout = 0; timeout < 5000; timeout++) {  // Up to 5s for RLC autoload
                 KeStallExecutionProcessor(1000);
-                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x105E0));
+                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
                     ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
