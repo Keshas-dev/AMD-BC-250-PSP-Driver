@@ -27,20 +27,30 @@
 #define PSP_BOOT_CMD_0xC180    0xC180
 #define PSP_BAR0_PHYSICAL      0xFD600000ULL
 
-// Device context stored in device extension
+#define PSP_BAR0_PHYSICAL      0xFD600000ULL
+#define PSP_BAR0_SIZE          0x40000
+
+#define PSP_MAILBOX_BASE(devExt) (devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase)
+#define PSP_READ_MAILBOX(devExt, offset) \
+    READ_REGISTER_ULONG((PULONG)((PUCHAR)PSP_MAILBOX_BASE(devExt) + (offset)))
+#define PSP_WRITE_MAILBOX(devExt, offset, value) \
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)PSP_MAILBOX_BASE(devExt) + (offset)), (value))
+
 typedef struct _DEVICE_EXTENSION {
     PVOID       MmioBase;
     ULONG       MmioSize;
-    PVOID       FwBuffer;           // Persistent firmware buffer (allocated, not freed after LOAD_FW)
-    PHYSICAL_ADDRESS FwPhysical;    // Physical address of firmware buffer
-    ULONG       FwSize;             // Firmware size in bytes
-    ULONG       FwPaShifted;        // PA >> 20 (1MB-aligned format for PSP)
-    PVOID       RingBuffer;         // PSP ring buffer
+    PVOID       Bar0Base;
+    ULONG       Bar0Size;
+    PVOID       FwBuffer;
+    PHYSICAL_ADDRESS FwPhysical;
+    ULONG       FwSize;
+    ULONG       FwPaShifted;
+    PVOID       RingBuffer;
     PHYSICAL_ADDRESS RingPhysical;
     ULONG       RingSize;
     BOOLEAN     RingCreated;
-    KSPIN_LOCK  CommandLock;        // FIX #9: Protect SEND_CMD from race conditions
-    PVOID       PciCfgBase;          // Mapped PCI ECAM region
+    KSPIN_LOCK  CommandLock;
+    PVOID       PciCfgBase;
     ULONG       PciCfgSize;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
@@ -211,10 +221,8 @@ static NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PULONG Pm4Commands, ULONG
     }
     g_KiqRingWptr = wptr;
 
-    // Try to enable KIQ ring (self-clearing — write 1 just before doorbell)
-    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + KIQ_CNTL), 1);
-
     // Ring doorbell: write KIQ_WPTR to trigger GPU execution
+    // KIQ_WPTR (0xE078) is accessible via BAR5 MMIO
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + KIQ_WPTR), g_KiqRingWptr);
 
     KeReleaseSpinLock(&g_KiqRingLock, irql);
@@ -275,46 +283,38 @@ static NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     ULONG timeout;
     ULONG cmdReg;
     KIRQL irql;
+    PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
 
     if (devExt->FwBuffer == NULL) {
         KdPrint(("No firmware loaded\n"));
         return STATUS_NO_MEMORY;
     }
 
-    // Per Linux psp_v11_0_mbox_send protocol:
-    // 1. Under spinlock: write data to C2PMSG_36/37 + cmd to C2PMSG_35
-    // 2. Release spinlock (do NOT block other threads during polling)
-    // 3. Poll C2PMSG_35 until PSP clears it to 0 (completion signal)
-    // 4. Do NOT save/restore C2PMSG_81 (PSP manages it)
     KeAcquireSpinLock(&devExt->CommandLock, &irql);
 
-    // Write physical address: low 32 bits to C2PMSG_36, high 32 bits to C2PMSG_37
     WRITE_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET),
+        (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_36_OFFSET),
         (ULONG)(devExt->FwPhysical.QuadPart & 0xFFFFFFFF)
     );
     WRITE_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET),
+        (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_37_OFFSET),
         (ULONG)(devExt->FwPhysical.QuadPart >> 32)
     );
 
-    // Write command to C2PMSG_35 (triggers PSP execution)
     WRITE_REGISTER_ULONG(
-        (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET),
+        (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET),
         command
     );
     KdPrint(("Mailbox: PA=0x%llX cmd=0x%08X written to C2PMSG_36/37/35\n",
         devExt->FwPhysical.QuadPart, command));
 
-    // Release spinlock before polling — do NOT block other threads
     KeReleaseSpinLock(&devExt->CommandLock, irql);
 
-    // Poll C2PMSG_35 until PSP clears it to 0 (command complete)
     NTSTATUS status = STATUS_SUCCESS;
     for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
         KeStallExecutionProcessor(1000);
         cmdReg = READ_REGISTER_ULONG(
-            (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET)
+            (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET)
         );
         if (cmdReg == 0) {
             KdPrint(("Mailbox: C2PMSG_35 cleared after %u ms (cmd 0x%08X)\n",
@@ -389,14 +389,15 @@ static NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)
 
     KdPrint(("TMR: Submitting INIT_TMR via ring\n"));
 
-    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
+    PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
     KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
     ULONG timeout, resp = 0;
     NTSTATUS tmrStatus = STATUS_TIMEOUT;
     for (timeout = 0; timeout < 2000; timeout++) {
         KeStallExecutionProcessor(1000);
-        resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+        resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
         if (resp & 0x80000000) {
             ULONG st = resp & 0x0000FFFF;
             ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
@@ -499,11 +500,16 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
         devExt->PciCfgBase = NULL;
     }
 
-    if (devExt->MmioBase != NULL) {
+    if (devExt->Bar0Base != NULL) {
+        MmUnmapIoSpace(devExt->Bar0Base, devExt->Bar0Size);
+        devExt->Bar0Base = NULL;
+    }
+
+    if (devExt->MmioBase != NULL && devExt->MmioBase != devExt->Bar0Base) {
         MmUnmapIoSpace(devExt->MmioBase, devExt->MmioSize);
         devExt->MmioBase = NULL;
-        KdPrint(("BAR5 resources released\n"));
     }
+    KdPrint(("BAR5 resources released\n"));
 
     RtlInitUnicodeString(&symLinkName, PSP_SYMBOLIC_LINK_NAME);
     IoDeleteSymbolicLink(&symLinkName);
@@ -513,20 +519,24 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 /* Static helper function for auto-initialization */
 static NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt)
 {
-    if (devExt->MmioBase != NULL) {
-        return STATUS_SUCCESS;
+    if (devExt->Bar0Base == NULL) {
+        PHYSICAL_ADDRESS physAddr;
+        physAddr.QuadPart = PSP_BAR0_PHYSICAL;
+        
+        devExt->Bar0Base = MmMapIoSpace(physAddr, PSP_BAR0_SIZE, MmNonCached);
+        if (devExt->Bar0Base == NULL) {
+            KdPrint(("PSP: BAR0 map failed at 0x%llX, using BAR5 for mailbox\n", physAddr.QuadPart));
+        } else {
+            devExt->Bar0Size = PSP_BAR0_SIZE;
+            KdPrint(("PSP: BAR0 mapped: PA=0x%llX VA=%p size=%u\n", physAddr.QuadPart, devExt->Bar0Base, devExt->Bar0Size));
+        }
     }
     
-    PHYSICAL_ADDRESS physAddr;
-    physAddr.QuadPart = PSP_BAR0_PHYSICAL;
-    ULONG size = 0x100000;
-    
-    devExt->MmioBase = MmMapIoSpace(physAddr, size, MmNonCached);
     if (devExt->MmioBase == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+        devExt->MmioBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
+        devExt->MmioSize = devExt->Bar0Size;
     }
-    devExt->MmioSize = size;
-    KdPrint(("PSP: Auto-MMIO mapped: PA=0x%llX VA=%p size=%u\n", physAddr.QuadPart, devExt->MmioBase, size));
+    
     return STATUS_SUCCESS;
 }
 
@@ -568,17 +578,27 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     }
 
     switch (ioctlCode) {
-        case IOCTL_PSP_INIT_HW:
+case IOCTL_PSP_INIT_HW:
         {
             if (inputLength < sizeof(PSP_INIT_HW_REQUEST)) {
                 status = STATUS_INVALID_PARAMETER;
                 break;
             }
 
-            if (devExt->MmioBase != NULL) {
-                MmUnmapIoSpace(devExt->MmioBase, devExt->MmioSize);
-                devExt->MmioBase = NULL;
-                devExt->MmioSize = 0;
+            NTSTATUS bar0Status = PspAutoInitialize(devExt);
+            if (bar0Status < 0) {
+                KdPrint(("BAR0 init note: 0x%08X\n", bar0Status));
+            }
+
+            if (devExt->Bar0Base == NULL) {
+                NTSTATUS autoStatus = PspAutoInitialize(devExt);
+                if (autoStatus < 0) {
+                    KdPrint(("BAR0 not initialized (auto-init failed: 0x%08X)\n", autoStatus));
+                    Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+                    Irp->IoStatus.Information = 0;
+                    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+                    return autoStatus;
+                }
             }
 
             PSP_INIT_HW_REQUEST* req = (PSP_INIT_HW_REQUEST*)inputBuffer;
@@ -590,6 +610,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 status = STATUS_INVALID_PARAMETER;
                 KdPrint(("INIT_HW: invalid PA=0x%llX size=%u\n", physAddr.QuadPart, size));
                 break;
+            }
+
+            if (devExt->MmioBase != devExt->Bar0Base && devExt->MmioBase != NULL) {
+                MmUnmapIoSpace(devExt->MmioBase, devExt->MmioSize);
             }
 
             devExt->MmioBase = MmMapIoSpace(physAddr, size, MmNonCached);
@@ -878,30 +902,21 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("CREATE_RING: Ring at VA=%p PA=0x%llX size=%u\n",
                 devExt->RingBuffer, devExt->RingPhysical.QuadPart, devExt->RingSize));
 
-            /* Linux psp_v11_0_ring_create protocol:
-               1. Write ring PA to C2PMSG_69/70, size to C2PMSG_71
-               2. Write ring type to C2PMSG_64 → triggers TOS to process creation
-               3. Wait for TOS_RESP_FLAG (C2PMSG_64 bit 31)
-               Do NOT wait for TOS_READY first — bit 31 is the response, not a precondition.
-               Do NOT clear C2PMSG_81 — that is the SOS alive register, not a ring sync. */
-            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
+            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
 
-            /* Write ring address to C2PMSG_69/70 */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_69_OFFSET),
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_69_OFFSET),
                 (ULONG)(devExt->RingPhysical.QuadPart & 0xFFFFFFFF));
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_70_OFFSET),
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_70_OFFSET),
                 (ULONG)(devExt->RingPhysical.QuadPart >> 32));
-            /* Ring size to C2PMSG_71 */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_71_OFFSET), devExt->RingSize);
-            /* Ring type to C2PMSG_64: KM ring = 1 << 16 = 0x00010000 (psp_v11_0_8.c) */
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET), 0x00010000);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_71_OFFSET), devExt->RingSize);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET), 0x00010000);
 
-            /* Wait for response: C2PMSG_64 bit 31 = MBOX_TOS_RESP_FLAG */
             ULONG ringResp;
             ULONG respTimeout;
             for (respTimeout = 0; respTimeout < 3000; respTimeout++) {
                 KeStallExecutionProcessor(1000);
-                ringResp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+                ringResp = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
                 if (ringResp & 0x80000000) break;
             }
 
@@ -929,25 +944,22 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         case IOCTL_PSP_NBIO_VIA_RING:
         {
             ULONG results[4] = {0};
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
 
-            // Step 1: Write 0x00020000 to C2PMSG_64 (GFX_CTRL_CMD_ID_DESTROY_RINGS)
-            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET), 0x00020000);
+            ULONG c64_before = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET), 0x00020000);
             results[0] = 0x00020000;
 
-            KeStallExecutionProcessor(500000); // 500ms
+            KeStallExecutionProcessor(500000);
 
-            // Read C2PMSG_64 response
-            ULONG c64resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+            ULONG c64resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
             results[1] = c64resp;
 
-            // Step 2: Write NBIO signatures directly to BAR5
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
 
-            KeStallExecutionProcessor(100000); // 100ms
+            KeStallExecutionProcessor(100000);
 
-            // Step 3: Check results
             ULONG sig1 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET));
             ULONG sig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
             ULONG mmhub = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
@@ -974,15 +986,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 break;
             }
 
-            PSP_STATUS_INFO* info = (PSP_STATUS_INFO*)outputBuffer;
+PSP_STATUS_INFO* info = (PSP_STATUS_INFO*)outputBuffer;
             RtlZeroMemory(info, sizeof(PSP_STATUS_INFO));
 
-            // Mailbox status
-            info->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
-            info->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
-            info->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET));
-info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET));
-             info->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
+            info->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_81_OFFSET));
+            info->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET));
+            info->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_36_OFFSET));
+            info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_37_OFFSET));
+            info->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
             info->PspAlive = (info->C2PMSG_81 != 0 && info->C2PMSG_81 != 0xFFFFFFFF) ? 1 : 0;
 
             // Firmware info
@@ -1169,14 +1181,13 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
             PSP_PROBE_INFO* probe = (PSP_PROBE_INFO*)outputBuffer;
             RtlZeroMemory(probe, sizeof(PSP_PROBE_INFO));
 
-            // Step 1: Read all mailbox registers
-            probe->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
-            probe->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET));
-            probe->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET));
-            probe->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
-            probe->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
+            probe->C2PMSG_35 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET));
+            probe->C2PMSG_36 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_36_OFFSET));
+            probe->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_37_OFFSET));
+            probe->C2PMSG_64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
+            probe->C2PMSG_81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_81_OFFSET));
 
-            // Step 2: Read NBIO region probes
             probe->NbioSig1 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET));
             probe->NbioSig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
             probe->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
@@ -1184,7 +1195,6 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
             probe->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + (AMDBC250_GC_BASE + 0x3000)));
             probe->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x05A0));
 
-            // Step 3: Try writing NBIO sigs and verify
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
             KeStallExecutionProcessor(1000);
@@ -1192,24 +1202,22 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
             ULONG sig2a = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
             probe->SigWriteOk = ((sig1a == NBIO_SIG1_VALUE) && (sig2a == NBIO_SIG2_VALUE)) ? 1 : 0;
 
-            // Step 4: Try programming ring registers
             probe->RingAddrLow = (ULONG)(g_RingBufferPhysical.QuadPart & 0xFFFFFFFF);
             probe->RingAddrHigh = (ULONG)(g_RingBufferPhysical.QuadPart >> 32);
             probe->RingSize = 0x1000;
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_69_OFFSET), probe->RingAddrLow);
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_70_OFFSET), probe->RingAddrHigh);
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_71_OFFSET), probe->RingSize);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_69_OFFSET), probe->RingAddrLow);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_70_OFFSET), probe->RingAddrHigh);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_71_OFFSET), probe->RingSize);
             KeStallExecutionProcessor(1000);
-            ULONG rl = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_69_OFFSET));
-            ULONG rh = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_70_OFFSET));
-            ULONG rs = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_71_OFFSET));
+            ULONG rl = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_69_OFFSET));
+            ULONG rh = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_70_OFFSET));
+            ULONG rs = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_71_OFFSET));
             probe->RingProgOk = ((rl == probe->RingAddrLow) && (rs == probe->RingSize)) ? 1 : 0;
             probe->RingCreated = devExt->RingCreated ? 1 : 0;
 
-            // Step 5: Try NBIO via ring (write 0x00020000 to C2PMSG_64)
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET), 0x00020000);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET), 0x00020000);
             KeStallExecutionProcessor(500000);
-            ULONG c64r = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+            ULONG c64r = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
             ULONG grbm2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + (AMDBC250_GC_BASE + 0x2004)));
             probe->NbioViaRingOk = (grbm2 != 0xFFFFFFFF) ? 1 : 0;
 
@@ -1272,18 +1280,16 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
 
             KdPrint(("RING: type=%u size=%u fwPA=0x%llX cmdPA=0x%llX\n", fwType, fwSize, fwPa.QuadPart, cmdPa.QuadPart));
 
-            // Set ring wptr (C2PMSG_67 = 0x105EC, gpcom_wptr per psp_v11_0_8.c)
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
             KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
-            // Poll C2PMSG_64 (0x105E0) for response (bit 31 = done)
             ULONG timeout, resp = 0;
             for (timeout = 0; timeout < 1000; timeout++) {
                 KeStallExecutionProcessor(1000);
-                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
-                    // Also check command buffer response status at +864
                     ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
                     status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
                     if (NT_SUCCESS(status)) g_RingFwCount++;
@@ -1308,6 +1314,7 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
             PSP_GPU_INFO* info = (PSP_GPU_INFO*)outputBuffer;
             RtlZeroMemory(info, sizeof(PSP_GPU_INFO));
 
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
             info->RingBufferPA = (ULONG)(g_RingBufferPhysical.QuadPart & 0xFFFFFFFF);
             info->FwLoaded = devExt->FwBuffer ? 1 : 0;
             info->FwCount = g_RingFwCount;
@@ -1316,9 +1323,9 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
             info->GfxVersion = 10;
 
             info->C2pmsg64 = READ_REGISTER_ULONG(
-                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+                (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
             info->C2pmsg81 = READ_REGISTER_ULONG(
-                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_81_OFFSET));
+                (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_81_OFFSET));
             info->TmrInitialized = g_TmrInitialized ? 1 : 0;
 
             bytesReturned = sizeof(PSP_GPU_INFO);
@@ -1341,9 +1348,19 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
                              ((PULONG)inputBuffer)[2] == 1);
 
             if (isRead) {
-                /* Read path: direct PSP MMIO read (works for mailbox/csr registers) */
+                PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
                 if (regId >= devExt->MmioSize || (regId + sizeof(ULONG) > devExt->MmioSize) || (regId & 0x3)) {
-                    status = STATUS_ARRAY_BOUNDS_EXCEEDED; break;
+                    if (regId >= devExt->Bar0Size || (regId + sizeof(ULONG) > devExt->Bar0Size) || (regId & 0x3)) {
+                        status = STATUS_ARRAY_BOUNDS_EXCEEDED; break;
+                    }
+                    ULONG value = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + regId));
+                    if (outputLength >= sizeof(ULONG)) {
+                        ((PULONG)outputBuffer)[0] = value;
+                        bytesReturned = sizeof(ULONG);
+                    }
+                    KdPrint(("REG_PROG: read reg 0x%04X = 0x%08X\n", regId, value));
+                    status = STATUS_SUCCESS;
+                    break;
                 }
                 ULONG value = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + regId));
                 if (outputLength >= sizeof(ULONG)) {
@@ -1356,19 +1373,19 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
             }
 
             if (!devExt->RingCreated) {
-                /* Try mailbox-based PROG_REG when ring not available */
+                PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
                 KdPrint(("REG_PROG: ring not available, trying mailbox PROG_REG (reg=0x%04X val=0x%08X)\n",
                     regId, regVal));
                 KIRQL mbIrql;
                 KeAcquireSpinLock(&devExt->CommandLock, &mbIrql);
-                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET), regId);
-                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET), regVal);
-                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET), 0x0000000B);
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_36_OFFSET), regId);
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_37_OFFSET), regVal);
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET), 0x0000000B);
                 KeReleaseSpinLock(&devExt->CommandLock, mbIrql);
                 ULONG mbTimeout;
                 for (mbTimeout = 0; mbTimeout < 500; mbTimeout++) {
                     KeStallExecutionProcessor(1000);
-                    ULONG cmdReg = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
+                    ULONG cmdReg = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET));
                     if (cmdReg == 0) {
                         KdPrint(("REG_PROG: mailbox PROG_REG completed after %u ms\n", mbTimeout));
                         status = STATUS_SUCCESS;
@@ -1411,15 +1428,16 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
 
             KdPrint(("REG_PROG: write id=%u val=0x%08X\n", regId, regVal));
 
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
             WRITE_REGISTER_ULONG(
-                (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
+                (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
             KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
             ULONG timeout, resp = 0;
             for (timeout = 0; timeout < 1000; timeout++) {
                 KeStallExecutionProcessor(1000);
                 resp = READ_REGISTER_ULONG(
-                    (PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+                    (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
                     ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
@@ -1449,10 +1467,9 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
             PULONG cmd = (PULONG)cmdBuffer;
             cmd[0] = PSP_CMD_BUF_SIZE;
             cmd[1] = 1;
-            cmd[2] = 0x00000021;  // GFX_CMD_ID_AUTOLOAD_RLC
+            cmd[2] = 0x00000021;
             PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(cmdBuffer);
 
-            // Build ring frame
             KIRQL ringIrql;
             KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
             if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
@@ -1466,14 +1483,14 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
 
             KdPrint(("AUTOLOAD_RLC: triggering GPU firmware execution\n"));
 
-            // Set wptr (C2PMSG_67) and wait for response on C2PMSG_64
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
             KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
 
             ULONG timeout, resp = 0;
-            for (timeout = 0; timeout < 5000; timeout++) {  // Up to 5s for RLC autoload
+            for (timeout = 0; timeout < 5000; timeout++) {
                 KeStallExecutionProcessor(1000);
-                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_64_OFFSET));
+                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
                 if (resp & 0x80000000) {
                     ULONG st = resp & 0x0000FFFF;
                     ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
@@ -1557,6 +1574,80 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
                 ((PULONG)outputBuffer)[0] = g_KiqRingWptr;
                 bytesReturned = sizeof(ULONG);
             }
+            break;
+        }
+
+        case IOCTL_PSP_KIQ_LOAD_FW:
+        {
+            if (!g_KiqRingInitialized) {
+                status = PspKiqInit(devExt);
+                if (!NT_SUCCESS(status)) {
+                    KdPrint(("KIQ_LOAD_FW: KIQ init failed: 0x%08X\n", status));
+                    break;
+                }
+            }
+
+            if (inputLength < sizeof(ULONG) * 4) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            ULONG fwType = ((PULONG)inputBuffer)[0];
+            ULONG fwSize = ((PULONG)inputBuffer)[1];
+            ULONG fwPaLow = ((PULONG)inputBuffer)[2];
+            ULONG fwPaHigh = ((PULONG)inputBuffer)[3];
+
+            if (fwSize == 0 || fwSize > 0x100000) {
+                KdPrint(("KIQ_LOAD_FW: Invalid FW size %u\n", fwSize));
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            PVOID cmdBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, PSP_CMD_BUF_SIZE, 'mCSP');
+            if (!cmdBuffer) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
+            RtlZeroMemory(cmdBuffer, PSP_CMD_BUF_SIZE);
+            PULONG cmd = (PULONG)cmdBuffer;
+            cmd[0] = PSP_CMD_BUF_SIZE;
+            cmd[1] = 1;
+            cmd[2] = GFX_CMD_ID_LOAD_IP_FW;
+            cmd[7] = fwPaLow;
+            cmd[8] = fwPaHigh;
+            cmd[9] = fwSize;
+            cmd[10] = fwType;
+            PHYSICAL_ADDRESS cmdPa = MmGetPhysicalAddress(cmdBuffer);
+
+            KIRQL ringIrql;
+            KeAcquireSpinLock(&devExt->CommandLock, &ringIrql);
+            if (ringWriteOffset + PSP_RING_FRAME_SIZE > sizeof(g_RingBuffer))
+                ringWriteOffset = 0;
+            PULONG frame = (PULONG)(g_RingBuffer + ringWriteOffset);
+            RtlZeroMemory(frame, PSP_RING_FRAME_SIZE);
+            frame[0] = (ULONG)(cmdPa.QuadPart & 0xFFFFFFFF);
+            frame[1] = (ULONG)(cmdPa.QuadPart >> 32);
+            frame[2] = PSP_CMD_BUF_SIZE;
+            ringWriteOffset += PSP_RING_FRAME_SIZE;
+            KdPrint(("KIQ_LOAD_FW: type=%u size=%u PA=%08X:%08X\n", fwType, fwSize, fwPaHigh, fwPaLow));
+
+            PVOID mboxBase = devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase;
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_67_OFFSET), ringWriteOffset);
+            KeReleaseSpinLock(&devExt->CommandLock, ringIrql);
+
+            ULONG timeout, resp = 0;
+            for (timeout = 0; timeout < 5000; timeout++) {
+                KeStallExecutionProcessor(1000);
+                resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_64_OFFSET));
+                if (resp & 0x80000000) {
+                    ULONG st = resp & 0x0000FFFF;
+                    ULONG cbStatus = ((PULONG)cmdBuffer)[864/sizeof(ULONG)];
+                    status = (st == 0 && cbStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+                    KdPrint(("KIQ_LOAD_FW: C2PMSG_64=0x%08X cmdResp=0x%08X\n", resp, cbStatus));
+                    break;
+                }
+            }
+            if (timeout >= 5000) { KdPrint(("KIQ_LOAD_FW: timeout\n")); status = STATUS_TIMEOUT; }
+
+            ExFreePool(cmdBuffer);
+            if (outputLength >= sizeof(ULONG)) { ((PULONG)outputBuffer)[0] = resp; bytesReturned = sizeof(ULONG); }
             break;
         }
 
