@@ -4,6 +4,8 @@
 #include <wdm.h>
 #include "PspIoctl.h"
 
+// DEVICE_EXTENSION is defined in PspIoctl.h (shared with all driver files)
+
 NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command);
 NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt);
 VOID PspFreeTmr(VOID);

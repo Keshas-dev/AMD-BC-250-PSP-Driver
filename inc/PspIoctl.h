@@ -36,6 +36,29 @@ extern "C" {
 #define IOCTL_PSP_LOAD_TOC            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x820, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_SMU_WAKE            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_KIQ_LOAD_FW         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_KIQ_GET_STATUS      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x823, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// DEVICE_EXTENSION — shared between driver files
+typedef struct _DEVICE_EXTENSION {
+    PVOID       MmioBase;
+    ULONG       MmioSize;
+    PVOID       Bar0Base;
+    ULONG       Bar0Size;
+    PVOID       FwBuffer;
+    PHYSICAL_ADDRESS FwPhysical;
+    ULONG       FwSize;
+    ULONG       FwPaShifted;
+    PVOID       RingBuffer;
+    PHYSICAL_ADDRESS RingPhysical;
+    ULONG       RingSize;
+    BOOLEAN     RingCreated;
+    KSPIN_LOCK  CommandLock;
+    PVOID       PciCfgBase;
+    ULONG       PciCfgSize;
+} DEVICE_EXTENSION, *PDEVICE_EXTENSION;
+
+// Timeout for PSP firmware commands (ms)
+#define PSP_FW_WAIT_MS               5000
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
@@ -59,6 +82,10 @@ extern "C" {
 #define SMU_C2PMSG_82_OFFSET 0x00A48    // Argument register (write param, read result)
 #define SMU_C2PMSG_83_OFFSET 0x00A4C    // Extended data
 #define SMU_C2PMSG_90_OFFSET 0x00A68    // Response register (0=busy, 1=OK, FF=err)
+
+// PSP BAR0 physical address and size (for auto-init fallback)
+#define PSP_BAR0_PHYSICAL      0xFD600000ULL
+#define PSP_BAR0_SIZE          0x40000
 
 // GC register base offset on BC-250 (Cyan Skillfish)
 // Navi10 has GC registers at BAR5+0x0000; BC-250 shifts them by 0x1260
@@ -202,6 +229,14 @@ typedef struct _PSP_KIQ_LOAD_FW_REQUEST {
     ULONG FwSize;       // Size of firmware blob that follows in the input buffer
     // Firmware data follows immediately in the input buffer after this struct
 } PSP_KIQ_LOAD_FW_REQUEST, *PPSP_KIQ_LOAD_FW_REQUEST;
+
+// Output for IOCTL_PSP_KIQ_GET_STATUS
+typedef struct _PSP_KIQ_STATUS {
+    ULONG RingInitialized;    // 1 if KIQ ring is active
+    ULONG RingWptr;           // Current write pointer
+    ULONG RingSize;           // Ring buffer size in bytes
+    ULONG RingPA;             // Physical address (low 32 bits)
+} PSP_KIQ_STATUS, *PPSP_KIQ_STATUS;
 
 // Output for IOCTL_PSP_GET_GPU_INFO — info GPU driver needs on init
 typedef struct _PSP_GPU_INFO {

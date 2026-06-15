@@ -1,11 +1,13 @@
 // PspDriver.c - AMD BC-250 PSP Kernel-Mode Driver (WDM)
-// Single-file dispatcher; core/KIQ/SMU logic lives in separate modules
+// Pure dispatcher; core/KIQ/SMU logic lives in separate modules
 #include <ntddk.h>
 #include <wdm.h>
 
 #include "PspIoctl.h"
 #include "firmware_data.h"
 #include "PspCore.h"
+#include "PspKiq.h"
+#include "PspSmu.h"
 
 // BUS_DATA_TYPE for PCI config access via HAL
 #define PCIConfiguration 0
@@ -25,36 +27,21 @@
 
 // Mailbox base macro (fallback BAR5 when BAR0 unavailable)
 #define PSP_MAILBOX_BASE(devExt) (devExt->Bar0Base ? devExt->Bar0Base : devExt->MmioBase)
-#define PSP_READ_MAILBOX(devExt, offset) \
+#define PSP_READ_MAILBOX(offset) \
     READ_REGISTER_ULONG((PULONG)((PUCHAR)PSP_MAILBOX_BASE(devExt) + (offset)))
-#define PSP_WRITE_MAILBOX(devExt, offset, value) \
+#define PSP_WRITE_MAILBOX(offset, value) \
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)PSP_MAILBOX_BASE(devExt) + (offset)), (value))
 
-// Device context
-typedef struct _DEVICE_EXTENSION {
-    PVOID       MmioBase;
-    ULONG       MmioSize;
-    PVOID       Bar0Base;
-    ULONG       Bar0Size;
-    PVOID       FwBuffer;
-    PHYSICAL_ADDRESS FwPhysical;
-    ULONG       FwSize;
-    ULONG       FwPaShifted;
-    PVOID       RingBuffer;
-    PHYSICAL_ADDRESS RingPhysical;
-    ULONG       RingSize;
-    BOOLEAN     RingCreated;
-    KSPIN_LOCK  CommandLock;
-    PVOID       PciCfgBase;
-    ULONG       PciCfgSize;
-} DEVICE_EXTENSION, *PDEVICE_EXTENSION;
+// Device context (defined in PspIoctl.h, shared with all driver files)
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD DriverUnload;
 DRIVER_DISPATCH PspCreateClose;
 DRIVER_DISPATCH PspDeviceControl;
 
-
+// Device names (also defined in PspIoctl.h as wide strings)
+#define PSP_NT_DEVICE_NAME    L"\\Device\\AmdBcPsp"
+#define PSP_SYMBOLIC_LINK_NAME L"\\DosDevices\\AmdBcPsp"
 
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
@@ -428,12 +415,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         }
         PSP_STATUS_INFO* info = (PSP_STATUS_INFO*)outputBuffer;
         RtlZeroMemory(info, sizeof(PSP_STATUS_INFO));
-        PVOID mboxBase = PSP_MAILBOX_BASE(devExt);
-        info->C2PMSG_81 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_81_OFFSET);
-        info->C2PMSG_35 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_35_OFFSET);
-        info->C2PMSG_36 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_36_OFFSET);
-        info->C2PMSG_37 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_37_OFFSET);
-        info->C2PMSG_64 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_64_OFFSET);
+        info->C2PMSG_81 = PSP_READ_MAILBOX(PSP_C2PMSG_81_OFFSET);
+        info->C2PMSG_35 = PSP_READ_MAILBOX(PSP_C2PMSG_35_OFFSET);
+        info->C2PMSG_36 = PSP_READ_MAILBOX(PSP_C2PMSG_36_OFFSET);
+        info->C2PMSG_37 = PSP_READ_MAILBOX(PSP_C2PMSG_37_OFFSET);
+        info->C2PMSG_64 = PSP_READ_MAILBOX(PSP_C2PMSG_64_OFFSET);
         info->PspAlive = (info->C2PMSG_81 != 0 && info->C2PMSG_81 != 0xFFFFFFFF) ? 1 : 0;
         info->FwLoaded = (devExt->FwBuffer != NULL) ? 1 : 0;
         info->FwSize = devExt->FwSize;
@@ -586,12 +572,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         }
         PSP_PROBE_INFO* probe = (PSP_PROBE_INFO*)outputBuffer;
         RtlZeroMemory(probe, sizeof(PSP_PROBE_INFO));
-        PVOID mboxBase = PSP_MAILBOX_BASE(devExt);
-        probe->C2PMSG_35 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_35_OFFSET);
-        probe->C2PMSG_36 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_36_OFFSET);
-        probe->C2PMSG_37 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_37_OFFSET);
-        probe->C2PMSG_64 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_64_OFFSET);
-        probe->C2PMSG_81 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_81_OFFSET);
+        probe->C2PMSG_35 = PSP_READ_MAILBOX(PSP_C2PMSG_35_OFFSET);
+        probe->C2PMSG_36 = PSP_READ_MAILBOX(PSP_C2PMSG_36_OFFSET);
+        probe->C2PMSG_37 = PSP_READ_MAILBOX(PSP_C2PMSG_37_OFFSET);
+        probe->C2PMSG_64 = PSP_READ_MAILBOX(PSP_C2PMSG_64_OFFSET);
+        probe->C2PMSG_81 = PSP_READ_MAILBOX(PSP_C2PMSG_81_OFFSET);
         probe->NbioSig1 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET));
         probe->NbioSig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
         probe->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
@@ -632,8 +617,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         info->TMRBase = g_TmrInitialized ? g_TmrPhysical.QuadPart : 0;
         info->TMSSize = g_TmrSize;
         info->GfxVersion = 10;
-        info->C2pmsg64 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_64_OFFSET);
-        info->C2pmsg81 = PSP_READ_MAILBOX(devExt, PSP_C2PMSG_81_OFFSET);
+        info->C2pmsg64 = PSP_READ_MAILBOX(PSP_C2PMSG_64_OFFSET);
+        info->C2pmsg81 = PSP_READ_MAILBOX(PSP_C2PMSG_81_OFFSET);
         info->TmrInitialized = g_TmrInitialized ? 1 : 0;
         bytesReturned = sizeof(PSP_GPU_INFO);
         status = STATUS_SUCCESS;

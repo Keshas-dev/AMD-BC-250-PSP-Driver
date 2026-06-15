@@ -19,7 +19,7 @@ ULONG g_KiqRingSize = 0;
 ULONG g_KiqRingWptr = 0;
 BOOLEAN g_KiqRingInitialized = FALSE;
 
-static BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
+BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize)
 {
     if (FirmwareData == NULL || FirmwareSize < 256)
         return FALSE;
