@@ -1,4 +1,23 @@
-# AMD BC-250 PSP Windows Driver — Agent Guide
+## Driver Fixes Applied
+
+### KIQ_SUBMIT Struct Layout Fix (2026-06-15)
+**Bug:** IOCTL_PSP_KIQ_SUBMIT had mismatched struct layout between caller and handler.
+
+- GPU driver sent `{count, cmd0, cmd1, ...}` (flat array)
+- PSP driver expected `PSP_KIQ_SUBMIT_REQUEST` struct with `Reserved[3]` padding
+- Handler read commands from wrong offset (inputDwords[1] instead of &req->Commands[0])
+
+**Fix:** Both sides now use consistent struct layout:
+```c
+typedef struct _PSP_KIQ_SUBMIT_REQUEST {
+    ULONG CommandCount;
+    ULONG Reserved[3];      // padding
+    ULONG Commands[64];     // PM4 commands
+} PSP_KIQ_SUBMIT_REQUEST;
+```
+
+- PSP driver (`PspDriver.c`): Uses `req->CommandCount` and `&req->Commands[0]`
+- GPU driver (`amdbc250_psp.c`): Uses `PSP_KIQ_SUBMIT_REQUEST` struct with proper padding
 
 ## Build commands (from repo root, in VS2022 x64 Native Tools prompt)
 

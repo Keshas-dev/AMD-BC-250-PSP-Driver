@@ -1530,6 +1530,8 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
 
         case IOCTL_PSP_KIQ_SUBMIT:
         {
+            PSP_KIQ_SUBMIT_REQUEST* req = (PSP_KIQ_SUBMIT_REQUEST*)inputBuffer;
+            
             // Initialize KIQ ring on first use
             if (!g_KiqRingInitialized) {
                 status = PspKiqInit(devExt);
@@ -1539,19 +1541,18 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
                 }
             }
 
-            // Parse input: first ULONG = command count, rest = PM4 DWORDs
-            if (inputLength < sizeof(ULONG)) {
-                status = STATUS_INVALID_PARAMETER;
+            // Parse input: use struct layout with CommandCount and Commands[]
+            if (inputLength < sizeof(PSP_KIQ_SUBMIT_REQUEST)) {
+                status = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
-            PULONG inputDwords = (PULONG)inputBuffer;
-            ULONG cmdCount = inputDwords[0];
-            if (cmdCount == 0 || cmdCount > 64 || inputLength < sizeof(ULONG) * (1 + cmdCount)) {
+            ULONG cmdCount = req->CommandCount;
+            if (cmdCount == 0 || cmdCount > 64) {
                 status = STATUS_INVALID_PARAMETER;
                 break;
             }
 
-            status = PspKiqSubmit(devExt, &inputDwords[1], cmdCount);
+            status = PspKiqSubmit(devExt, &req->Commands[0], cmdCount);
             if (NT_SUCCESS(status) && outputLength >= sizeof(ULONG)) {
                 ((PULONG)outputBuffer)[0] = g_KiqRingWptr;
                 bytesReturned = sizeof(ULONG);
