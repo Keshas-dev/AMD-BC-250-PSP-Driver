@@ -76,8 +76,59 @@ static KSPIN_LOCK g_KiqRingLock;
 #define KIQ_WPTR          0xE078
 #define GRBM_GFX_INDEX    0x34D0
 #define KIQ_GRBM_VAL      0x00010000  // ME=1, PIPE=0, QUEUE=0
-
 #define KIQ_RING_SIZE     0x2000      // 8KB ring buffer
+
+// SMU v11.8 protocol: send message via C2PMSG_66, read response from C2PMSG_82
+// Response valid when C2PMSG_90 != 0 (0=busy, 1=OK, 0xFF=error)
+static NTSTATUS PspSmuWake(PDEVICE_EXTENSION devExt, ULONG message, ULONG argument, PULONG pResponse)
+{
+    ULONG timeout;
+    ULONG resp = 0;
+
+    // Check if already initialized
+    if (devExt->MmioBase == NULL) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    // Write 0 to C2PMSG_90 to clear any previous response
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MP1_BASE + SMU_C2PMSG_90_OFFSET), 0);
+
+    // Write argument to C2PMSG_82
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MP1_BASE + SMU_C2PMSG_82_OFFSET), argument);
+
+    // Write message to C2PMSG_66 (triggers SMU)
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MP1_BASE + SMU_C2PMSG_66_OFFSET), message);
+
+    KdPrint(("SMU_WAKE: msg=0x%08X arg=0x%08X sent\n", message, argument));
+
+    // Poll C2PMSG_90 until response ready (up to ~1s)
+    for (timeout = 0; timeout < 1000; timeout++) {
+        KeStallExecutionProcessor(1000);
+        resp = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MP1_BASE + SMU_C2PMSG_90_OFFSET));
+        if (resp != 0) {
+            break;
+        }
+    }
+
+    // Read response from C2PMSG_82
+    ULONG response = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MP1_BASE + SMU_C2PMSG_82_OFFSET));
+
+    KdPrint(("SMU_WAKE: C2PMSG_90=0x%08X response from C2PMSG_82=0x%08X timeout=%ums\n",
+        resp, response, timeout));
+
+    if (timeout >= 1000) {
+        KdPrint(("SMU_WAKE: TIMEOUT - SMU not responding (power-gated or no firmware)\n"));
+        return STATUS_TIMEOUT;
+    }
+
+    if (resp == 0xFFFFFFFF) {
+        KdPrint(("SMU_WAKE: ERROR - invalid register reads\n"));
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    *pResponse = response;
+    return (resp == 1) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
 
 static NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt)
 {
@@ -459,6 +510,26 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     IoDeleteDevice(deviceObject);
 }
 
+/* Static helper function for auto-initialization */
+static NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt)
+{
+    if (devExt->MmioBase != NULL) {
+        return STATUS_SUCCESS;
+    }
+    
+    PHYSICAL_ADDRESS physAddr;
+    physAddr.QuadPart = PSP_BAR0_PHYSICAL;
+    ULONG size = 0x100000;
+    
+    devExt->MmioBase = MmMapIoSpace(physAddr, size, MmNonCached);
+    if (devExt->MmioBase == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    devExt->MmioSize = size;
+    KdPrint(("PSP: Auto-MMIO mapped: PA=0x%llX VA=%p size=%u\n", physAddr.QuadPart, devExt->MmioBase, size));
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS PspCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -485,26 +556,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     inputLength = irpStack->Parameters.DeviceIoControl.InputBufferLength;
     outputLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
 
-    static NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt)
-{
-    if (devExt->MmioBase != NULL) {
-        return STATUS_SUCCESS;
-    }
-    
-    PHYSICAL_ADDRESS physAddr;
-    physAddr.QuadPart = PSP_BAR0_PHYSICAL;
-    ULONG size = 0x100000;  // 1MB should be enough for PSP MMIO
-    
-    devExt->MmioBase = MmMapIoSpace(physAddr, size, MmNonCached);
     if (devExt->MmioBase == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    devExt->MmioSize = size;
-    KdPrint(("PSP: Auto-MMIO mapped: PA=0x%llX VA=%p size=%u\n", physAddr.QuadPart, devExt->MmioBase, size));
-    return STATUS_SUCCESS;
-}
-
-if (devExt->MmioBase == NULL) {
         NTSTATUS autoStatus = PspAutoInitialize(devExt);
         if (!NT_SUCCESS(autoStatus)) {
             KdPrint(("MMIO not initialized (auto-init failed: 0x%08X)\n", autoStatus));
@@ -1444,6 +1496,35 @@ info->C2PMSG_37 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2
                 ((PULONG)outputBuffer)[0] = g_TmrInitialized ? 1 : 0;
                 bytesReturned = sizeof(ULONG);
             }
+            break;
+        }
+
+        case IOCTL_PSP_SMU_WAKE:
+        {
+            if (inputLength < sizeof(PSP_SMU_WAKE_REQUEST)) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            PSP_SMU_WAKE_REQUEST* req = (PSP_SMU_WAKE_REQUEST*)inputBuffer;
+            ULONG response = 0;
+
+            status = PspSmuWake(devExt, req->Message, req->Argument, &response);
+
+            if (outputLength >= sizeof(PSP_SMU_WAKE_RESPONSE)) {
+                PSP_SMU_WAKE_RESPONSE* resp = (PSP_SMU_WAKE_RESPONSE*)outputBuffer;
+                resp->Message = req->Message;
+                resp->Argument = req->Argument;
+                resp->Response = response;
+                resp->Status = (status == STATUS_SUCCESS) ? 1 : (status == STATUS_TIMEOUT ? 0 : 0xFF);
+                bytesReturned = sizeof(PSP_SMU_WAKE_RESPONSE);
+            }
+            break;
+        }
+
+        case IOCTL_PSP_LOAD_TOC:
+        {
+            status = STATUS_NOT_IMPLEMENTED;
             break;
         }
 

@@ -575,3 +575,60 @@ Reminder: check `E:\` drive is connected before build commands (user sometimes f
 ### Test tool fixes
 1. **64-bit address parsing** - Changed `-i` option to use `strtoull()` for physical addresses
 2. **FW type mapping** - Corrected enum: CE=3, PFP=2, ME=1, SDMA=9, SDMA1=10, RLC=8 (was incorrect 6/8/9)
+
+## Test Results (2026-06-15)
+
+### Pasileidimo eiga (driveris įdiegtas, Test Signing įjungtas)
+```
+test-psp-driver.exe -i 0xFE800000 0x200000   # INIT_HW - SUCCESS (VA=0xD1800000)
+test-psp-driver.exe -t                       # Connectivity test - PASS
+test-psp-driver.exe -B                       # BOOT_SEQUENCE - SUCCESS (SYSDRV/SOS sent)
+test-psp-driver.exe -s                       # PSP status - FW Loaded: YES (262144 bytes)
+test-psp-driver.exe -H                       # Comprehensive probe - NBIO sig write OK, Ring prog FAIL, NBIO via ring OK
+test-psp-driver.exe -m                       # C2PMSG_81 - 0xF0000010 (SOS alive)
+test-psp-driver.exe -U                       # NBIO via ring - GRBM UNLOCKED (0x3260 accessible)
+test-psp-driver.exe -R                       # CREATE_RING - ERROR_NOT_READY (TOS ring protocol not supported)
+test-psp-driver.exe -M                       # INIT_TMR - ERROR_NOT_READY (needs ring)
+```
+
+### Patvirtinta
+- BAR5 MMIO mapping (0xFE800000, 2MB) - veikia
+- Mailbox COMMAND 0x4/0x8 (SYSDRV/SOS) - veikia
+- NBIO unlock (NBIO_SIG1=0xFEDCBAEF, SIG2=0xFEDCBADF) - veikia
+- GC registrai 0x3260+ (GRBM, SPI_PG, RLC_PG) - unlocked
+- C2PMSG_81 = 0xF0000010 - SOS statusas (po BOOT_SEQUENCE)
+
+### Užblokuota (SOS firmware ribos)
+- GPCOM ring (C2PMSG_64 bit 31 never sets) - TOS protokolas neimplementuotas
+- TMR init - reikia ring
+- GPU firmware loading via ring - reikia ring
+- Mailbox PROG_REG - priimta bet ignoruota
+
+## Kitos testavimo kryptys (atenkantys į ring ribas)
+
+### Kryptis 1: Išsamus MMIO tyrimas
+- Testuoti visus unsigned registrus ties 0x3260+ (GC_BASE + offset)
+- Bandyti spinorius: SPI_PG_ENABLE_STATIC_WGP_MASK (0x34FC), RLC_PG_ALWAYS_ON_WGP_MASK (0x3D64)
+- Patikrinti 40 CU unlock: WRITE 0xFFE00000 to 0x3264, WRITE 0x1F to 0x34FC
+
+### Kryptis 2: C2PMSG_64 TOS_READY stebėjimas
+- Ilgai stebėti C2PMSG_64 bit 31 (bet jis nėra palaikomas šio SOS)
+- Patikrinti ar BIOS v3 SOS gali būti pakraunama ir ar ji palaiko ring
+
+### Kryptis 3: SMU komandų testas
+- `PspSmuWake()` per IOCTL_PSP_SMU_WAKE - SMU nėra aktivus
+- SMN R/O access per PCI config (veikia, bet neįmanoma rašyti)
+- SMU NBIF/IOMMU registrai (0x0154xxxx) prieinami tik skaityti
+
+### Kryptis 4: Firmware keitimas
+- Bandyti v3 BIOS SOS (gali turėti GPCOM ring palaikymą)
+- Generuoti naują `firmware_data.h` su `scripts/gen-firmware-h-v3.ps1`
+- Testuoti ar `IOCTL_PSP_BOOT_SEQUENCE` veikia su v3 firmware
+
+### Kryptis 5: Driverio tobulinimas
+- Perkelti į KMDF/WDF (su saugumu) - šiuo metu WDM native
+- Pridėti KIQ ring debug output
+- Ištaisyti g_RingBufferPhysical inicializaciją (kad nepadėtų PA=0)
+- **Svarbiausias bug'as**: `g_RingBuffer[0x1000]` statinis masyvas (C53) turi neteisingą fizinį adresą
+  - Reikia `MmAllocateContiguousMemory(0x1000)` vietoje statinio masyvo
+  - Tačiau TOS ring protokolas neleidžiamas šio SOS → nėra prioritetas

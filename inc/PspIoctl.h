@@ -34,6 +34,7 @@ extern "C" {
 #define IOCTL_PSP_KIQ_SUBMIT          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x818, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_INIT_TMR            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x819, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_LOAD_TOC            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x820, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_SMU_WAKE            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // PSP Mailbox register offsets (relative to BAR0 base)
 // These match the hardware addresses documented in the spec
@@ -49,6 +50,14 @@ extern "C" {
 #define PSP_C2PMSG_70_OFFSET  0x105F8   // Ring buffer addr hi
 #define PSP_C2PMSG_71_OFFSET  0x105FC   // Ring buffer size
 #define PSP_C2PMSG_81_OFFSET  0x10614   // Status register
+
+// SMU v11.8 Mailbox offsets (MP1_BASE = 0x16000 on BC-250)
+// Used for SMU communication: C2PMSG_66->90 at MP1_BASE offset
+#define MP1_BASE             0x16000    // MP1 (SMU) base in BAR5 (same as MP0 on BC-250)
+#define SMU_C2PMSG_66_OFFSET 0x00A08    // Message register (write msg → triggers SMU)
+#define SMU_C2PMSG_82_OFFSET 0x00A48    // Argument register (write param, read result)
+#define SMU_C2PMSG_83_OFFSET 0x00A4C    // Extended data
+#define SMU_C2PMSG_90_OFFSET 0x00A68    // Response register (0=busy, 1=OK, FF=err)
 
 // GC register base offset on BC-250 (Cyan Skillfish)
 // Navi10 has GC registers at BAR5+0x0000; BC-250 shifts them by 0x1260
@@ -212,6 +221,21 @@ typedef struct _PSP_KIQ_SUBMIT_REQUEST {
     ULONG Reserved[3];       // Alignment padding
     ULONG Commands[64];      // PM4 commands
 } PSP_KIQ_SUBMIT_REQUEST, *PPSP_KIQ_SUBMIT_REQUEST;
+
+// Input for IOCTL_PSP_SMU_WAKE — send SMU command and read response
+typedef struct _PSP_SMU_WAKE_REQUEST {
+    ULONG Message;           // SMU message ID (e.g., 0x01=GetSmUInfo, 0x07=PowerGateIP)
+    ULONG Argument;          // Argument to pass to SMU
+    ULONG Reserved[2];
+} PSP_SMU_WAKE_REQUEST, *PPSP_SMU_WAKE_REQUEST;
+
+// Output for IOCTL_PSP_SMU_WAKE
+typedef struct _PSP_SMU_WAKE_RESPONSE {
+    ULONG Message;           // Echo of input message
+    ULONG Argument;          // Argument passed in
+    ULONG Response;          // Value read from C2PMSG_82 after command
+    ULONG Status;            // C2PMSG_90 response (0=busy, 1=OK, 0xFF=error)
+} PSP_SMU_WAKE_RESPONSE, *PPSP_SMU_WAKE_RESPONSE;
 
 #pragma pack(pop)
 
