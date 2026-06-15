@@ -51,15 +51,45 @@ if errorlevel 1 (
     exit /b 1
 )
 
+set "WDK_ROOT="
+if exist "E:\Program Files (x86)\Windows Kits\10\Include" (
+    set "WDK_ROOT=E:\Program Files (x86)\Windows Kits\10"
+) else if exist "C:\Program Files (x86)\Windows Kits\10\Include" (
+    set "WDK_ROOT=C:\Program Files (x86)\Windows Kits\10"
+) else (
+    echo ERROR: Windows Kits not found
+    exit /b 1
+)
+
 set "SCRIPT_DIR=%~dp0"
 set "PROJECT_DIR=%SCRIPT_DIR%.."
 set "OUTPUT_DIR=%PROJECT_DIR%\output"
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
+set "WDK_VERSION="
+for /f "delims=" %%V in ('dir /b /ad "%WDK_ROOT%\Include" ^| sort /r') do (
+    if exist "%WDK_ROOT%\Include\%%V\um\windows.h" (
+        set "WDK_VERSION=%%V"
+        goto :FoundWDK
+    )
+)
+echo ERROR: No Windows SDK headers found
+exit /b 1
+
+:FoundWDK
+echo Using Windows Kit version %WDK_VERSION%
+
 cl.exe /W3 /Zi /O2 /D_AMD64_ /DWIN64 ^
   /I"%PROJECT_DIR%\inc" ^
+  /I"%WDK_ROOT%\Include\%WDK_VERSION%\um" ^
+  /I"%WDK_ROOT%\Include\%WDK_VERSION%\shared" ^
+  /I"%WDK_ROOT%\Include\%WDK_VERSION%\ucrt" ^
   "%PROJECT_DIR%\src\test\test-psp-driver.c" ^
-  /Fe"%OUTPUT_DIR%\test-psp-driver.exe"
+  /Fe"%OUTPUT_DIR%\test-psp-driver.exe" ^
+  /link ^
+  /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VERSION%\um\x64" ^
+  /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VERSION%\ucrt\x64" ^
+  advapi32.lib
 
 if errorlevel 1 (
     echo Compilation FAILED!

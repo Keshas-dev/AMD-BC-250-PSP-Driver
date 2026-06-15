@@ -196,6 +196,13 @@ typedef struct _PSP_RING_FW_REQUEST {
     // Firmware data follows immediately in the input buffer after this struct
 } PSP_RING_FW_REQUEST, *PPSP_RING_FW_REQUEST;
 
+// For IOCTL_PSP_KIQ_LOAD_FW, input buffer contains this struct + firmware blob
+typedef struct _PSP_KIQ_LOAD_FW_REQUEST {
+    ULONG FwType;       // GFX_FW_TYPE code (CE=3, PFP=2, ME=1, etc.)
+    ULONG FwSize;       // Size of firmware blob that follows in the input buffer
+    // Firmware data follows immediately in the input buffer after this struct
+} PSP_KIQ_LOAD_FW_REQUEST, *PPSP_KIQ_LOAD_FW_REQUEST;
+
 // Output for IOCTL_PSP_GET_GPU_INFO — info GPU driver needs on init
 typedef struct _PSP_GPU_INFO {
     ULONG RingBufferPA;       // Physical address of the PSP ring buffer (low 32 bits)

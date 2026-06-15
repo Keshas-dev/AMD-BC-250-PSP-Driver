@@ -22,8 +22,8 @@ typedef struct _PSP_KIQ_SUBMIT_REQUEST {
 ## Build commands (from repo root, in VS2022 x64 Native Tools prompt)
 
 ```cmd
-scripts\build.bat           # -> output\PspDriver.sys + .inf + .cat + sign
-scripts\compile-test.bat    # -> output\test-psp-driver.exe
+build.bat                    # -> output\PspDriver.sys + .inf + .cat + sign
+scripts\compile-test.bat     # -> output\test-psp-driver.exe
 ```
 
 Manual alternative:

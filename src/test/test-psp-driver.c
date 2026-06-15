@@ -389,8 +389,9 @@ BOOL LoadFirmware(HANDLE hDevice, const char* filename)
     
     Log("Loading firmware: %s (%ld bytes)...\n", filename, fwSize);
     
-    ULONG resp = 0;  // Driver returns single ULONG: PA>>20
+    PSP_LOAD_FW_RESPONSE resp;
     DWORD returned = 0;
+    RtlZeroMemory(&resp, sizeof(resp));
     
     BOOL ok = DeviceIoControl(
         hDevice,
@@ -403,8 +404,11 @@ BOOL LoadFirmware(HANDLE hDevice, const char* filename)
     
     free(fwBuffer);
     
-    if (ok) {
-        Log("Firmware load: SUCCESS (PA>>20=0x%08X)\n", resp);
+    if (ok && returned == sizeof(resp)) {
+        Log("Firmware load: SUCCESS (PA>>20=0x%08X C2PMSG_81=0x%08X)\n",
+            resp.Status == 0 ? resp.MailboxStatus : 0, resp.MailboxStatus);
+    } else if (ok) {
+        Log("Firmware load: partial response (%u bytes, expected %u)\n", returned, sizeof(resp));
     } else {
         Log("Firmware load: FAILED (err=%lu)\n", GetLastError());
     }
@@ -568,6 +572,61 @@ BOOL KiqSubmit(HANDLE hDevice, PULONG commands, ULONG count)
     return ok;
 }
 
+BOOL KiqLoadFw(HANDLE hDevice, ULONG fwType, const char* filename)
+{
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) { Log("  FAILED: cannot open %s\n", filename); return FALSE; }
+    
+    fseek(fp, 0, SEEK_END);
+    long fwSize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    
+    if (fwSize <= 0 || fwSize > 1024*1024) { Log("  FAILED: invalid firmware size %ld\n", fwSize); fclose(fp); return FALSE; }
+    
+    size_t bufSize = sizeof(PSP_KIQ_LOAD_FW_REQUEST) + fwSize;
+    PSP_KIQ_LOAD_FW_REQUEST *req = (PSP_KIQ_LOAD_FW_REQUEST*)malloc(bufSize);
+    if (!req) { Log("  FAILED: cannot allocate %zu bytes\n", bufSize); fclose(fp); return FALSE; }
+    
+    req->FwType = fwType;
+    req->FwSize = (ULONG)fwSize;
+    fread(req + 1, 1, fwSize, fp);
+    fclose(fp);
+    
+    DWORD returned = 0;
+    ULONG resp = 0;
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_KIQ_LOAD_FW,
+        req, (DWORD)bufSize, &resp, sizeof(resp), &returned, NULL);
+    
+    if (ok) {
+        Log("  KIQ_LOAD_FW: type=%u size=%lu status=0x%08X\n", fwType, fwSize, resp);
+    } else {
+        Log("  FAILED (err=%lu)\n", GetLastError());
+    }
+    
+    free(req);
+    return ok;
+}
+
+BOOL SmuWake(HANDLE hDevice, ULONG message, ULONG argument)
+{
+    PSP_SMU_WAKE_REQUEST req;
+    PSP_SMU_WAKE_RESPONSE resp;
+    DWORD returned = 0;
+    RtlZeroMemory(&req, sizeof(req));
+    req.Message = message;
+    req.Argument = argument;
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_PSP_SMU_WAKE,
+        &req, sizeof(req), &resp, sizeof(resp), &returned, NULL);
+    if (ok && returned >= sizeof(PSP_SMU_WAKE_RESPONSE)) {
+        Log("SMU_WAKE: msg=0x%08X arg=0x%08X => resp=0x%08X status=%s\n",
+            resp.Message, resp.Argument, resp.Response,
+            resp.Status ? "OK" : "FAIL");
+    } else {
+        Log("SMU_WAKE FAILED (err=%lu)\n", GetLastError());
+    }
+    return ok;
+}
+
 void PrintUsage(const char *prog)
 {
     printf("Usage: %s [options]\n", prog);
@@ -595,6 +654,8 @@ void PrintUsage(const char *prog)
     printf("  -M                 Initialize TMR (Trusted Memory Region, 4MB)\n");
     printf("  -H                 Run comprehensive HW probe (mailbox + NBIO + ring)\n");
     printf("  -k <dwords...>     Submit PM4 commands via KIQ ring (hex dwords, up to 64)\n");
+    printf("  -Q <type> <file>   Load GPU FW via KIQ ring (type: 1=ME 2=PFP 3=CE 4=MEC 5=MEC2 8=RLC 9=SDMA 10=SDMA1)\n");
+    printf("  -S <msg> <arg>     Send SMU wake command (hex msgID, hex arg)\n");
     printf("  -l <logfile>       Write log to file\n");
     printf("\nExamples:\n");
     printf("  %s -i 0xFE800000 0x100000     Init HW with BAR5 at 0xFE800000\n", prog);
@@ -769,6 +830,12 @@ int main(int argc, char *argv[])
                 ret = 1;
             }
         }
+        else if (strcmp(argv[i], "-S") == 0 && i + 2 < argc) {
+            ULONG msg = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG arg = (ULONG)strtoul(argv[++i], NULL, 0);
+            ok = SmuWake(h, msg, arg);
+            if (!ok) { ret = 1; }
+        }
         else if (strcmp(argv[i], "-H") == 0) {
             ok = ComprehensiveProbe(h);
             if (!ok) { ret = 1; }
@@ -832,6 +899,14 @@ int main(int argc, char *argv[])
                 ret = 1;
             }
             i = j - 1; // Skip consumed args
+        }
+        else if (strcmp(argv[i], "-Q") == 0 && i + 2 < argc) {
+            ULONG fwType = (ULONG)strtoul(argv[i + 1], NULL, 0);
+            const char* filename = argv[i + 2];
+            Log("KIQ_LOAD_FW: type=%u file=%s\n", fwType, filename);
+            ok = KiqLoadFw(h, fwType, filename);
+            if (!ok) { ret = 1; }
+            i += 2;
         }
         else if (strcmp(argv[i], "-l") == 0) {
             i++; // Skip logfile argument (already handled)
