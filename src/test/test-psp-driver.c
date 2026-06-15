@@ -830,6 +830,12 @@ int main(int argc, char *argv[])
                 ret = 1;
             }
         }
+        else if (strcmp(argv[i], "-R") == 0 && i + 2 < argc) {
+            ULONG regId = (ULONG)strtoul(argv[++i], NULL, 0);
+            ULONG regVal = (ULONG)strtoul(argv[++i], NULL, 0);
+            ok = ProgReg(h, regId, regVal);
+            if (!ok) { ret = 1; }
+        }
         else if (strcmp(argv[i], "-S") == 0 && i + 2 < argc) {
             ULONG msg = (ULONG)strtoul(argv[++i], NULL, 0);
             ULONG arg = (ULONG)strtoul(argv[++i], NULL, 0);

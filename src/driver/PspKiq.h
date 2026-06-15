@@ -6,6 +6,7 @@
 
 NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, ULONG cmdBufSize);
 NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req);
+NTSTATUS PspKiqLoadFirmware(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize, PUCHAR FwData);
 VOID PspKiqCleanup(VOID);
 
 // KIQ register offsets (BAR5-relative) — BC-250 cyan_skillfish

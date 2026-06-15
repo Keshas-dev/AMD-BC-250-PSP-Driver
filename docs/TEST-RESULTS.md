@@ -92,3 +92,24 @@ test-psp-driver.exe -H
 ## Pataisymai (2026-06-14)
 - GC_BASE offset patvirtintas: 0x3260, 0x3264, 0x34FC veikia
 - FW type mapping pataisyta: RLC=8, SDMA=9, SDMA1=10 (buvęs klaida: SDMA=7, SDMA1=8)
+
+## Windows 11 26100 Compatibility (2026-06-15)
+
+### Problēma
+Direct BAR5 mapping per `MmMapIoSpace` yra blokuota Windows 11 26100, todėl PSP driveris negali pasiekti mailbox registru.
+
+### Sprendimas
+Realizuot GPU driver proxy fallback:
+1. PSP driver atidaro handle į GPU driverį (`\\Device\\AMDBC250DreamV43`)
+2. Naudoja `IOCTL_AMDBC250_BAR5_READ_PROXY` (0x900) ir `IOCTL_AMDBC250_BAR5_WRITE_PROXY` (0x901)
+3. `INIT_HW` naudoja proxy, kai `MmMapIoSpace` failina
+
+### Testavimo sekense
+```
+# Pirmiausia GPU driver (jis mapuoja BAR5)
+safe-test.exe -r 0x0000  # Perskaityti GPU_ID = 0x9FFF9700
+
+# Tada PSP driver
+test-psp-driver.exe -i 0xFE800000 0x200000   # INIT_HW - naudoja GPU proxy
+test-psp-driver.exe -m                       # C2PMSG_81 = 0xF0000010 (PSP alive)
+```

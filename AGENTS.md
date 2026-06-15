@@ -595,6 +595,27 @@ Reminder: check `E:\` drive is connected before build commands (user sometimes f
 1. **64-bit address parsing** - Changed `-i` option to use `strtoull()` for physical addresses
 2. **FW type mapping** - Corrected enum: CE=3, PFP=2, ME=1, SDMA=9, SDMA1=10, RLC=8 (was incorrect 6/8/9)
 
+## Windows 11 26100 Compatibility Fix (2026-06-15)
+
+### Problem
+On Windows 11 26100, `MmMapIoSpace` fails when trying to map GPU BAR5 (`0xFE800000`), returning NULL. This blocks all mailbox access since PSP mailbox registers live in BAR5 space.
+
+### Solution
+Implemented GPU driver proxy fallback:
+1. **PSP driver** (`PspCore.c`):
+   - Opens handle to GPU driver device (`\\Device\\AMDBC250DreamV43`)
+   - Uses `IOCTL_AMDBC250_BAR5_READ_PROXY` (0x900) and `IOCTL_AMDBC250_BAR5_WRITE_PROXY` (0x901)
+   - Falls back to proxy when `MmMapIoSpace` fails in `INIT_HW`
+
+2. **GPU driver** (`amdbc250_dream_kmd.c`):
+   - Already has proxy IOCTLs that access `DevExt->MmioVirtualBase`
+   - BAR5 is mapped by GPU driver's `INIT_HARDWARE` IOCTL
+
+### Required sequence
+1. Install GPU driver first (maps BAR5)
+2. Install PSP driver
+3. `INIT_HW` will use GPU proxy if direct mapping fails
+
 ## Test Results (2026-06-15)
 
 ### Pasileidimo eiga (driveris įdiegtas, Test Signing įjungtas)
@@ -608,6 +629,16 @@ test-psp-driver.exe -m                       # C2PMSG_81 - 0xF0000010 (SOS alive
 test-psp-driver.exe -U                       # NBIO via ring - GRBM UNLOCKED (0x3260 accessible)
 test-psp-driver.exe -R                       # CREATE_RING - ERROR_NOT_READY (TOS ring protocol not supported)
 test-psp-driver.exe -M                       # INIT_TMR - ERROR_NOT_READY (needs ring)
+```
+
+### Windows 11 26100 Test Results
+```
+# GPU driver first (maps BAR5)
+safe-test.exe -m  # READ_REG GPU_ID = 0x9FFF9700
+
+# Then PSP driver
+test-psp-driver.exe -i 0xFE800000 0x200000   # INIT_HW - uses GPU proxy
+test-psp-driver.exe -m                       # C2PMSG_81 - 0xF0000010 (PSP alive)
 ```
 
 ### Patvirtinta

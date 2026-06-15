@@ -137,7 +137,8 @@ link.exe /DRIVER /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry ^
   /OUT:"%OUTPUT_DIR%\PspDriver.sys" ^
   PspDriver.obj PspCore.obj PspKiq.obj PspSmu.obj ^
   ntoskrnl.lib wdm.lib hal.lib ^
-  /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VERSION%\km\x64"
+  /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VERSION%\km\x64" ^
+  /SECTION:Shared,RW
 
 if errorlevel 1 (
     echo WDM linking FAILED!
@@ -159,88 +160,58 @@ if not "%INF2CAT%"=="" (
     )
 )
 
-:: --- Create test certificate ---
-echo.
-echo ==========================================
-echo  SIGNING DRIVER (Test Certificate)
-echo ==========================================
-echo.
-
-set "CERT_PATH=%PROJECT_DIR%PspTestCert.cer"
-set "PFX_PATH=%PROJECT_DIR%PspTestCert.pfx"
-
-if not exist "%CERT_PATH%" (
-    echo Creating test certificate for driver signing...
-    echo   Trying PowerShell New-SelfSignedCertificate...
-    powershell -Command "New-SelfSignedCertificate -Type Custom -Subject 'CN=%CERT_NAME%' -KeyUsage DigitalSignature -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(10) -OutFile '%CERT_PATH%'" >nul 2>&1
-    if not exist "%CERT_PATH%" (
-        if not "%SIGNTOOLS%"=="" (
-            if exist "%SIGNTOOLS%\makecert.exe" (
-                echo   Trying makecert (legacy^)...
-                "%SIGNTOOLS%\makecert.exe" /r /pe /ss PrivateCertStore /n "CN=%CERT_NAME%" "%CERT_PATH%" >nul 2>&1
-            )
-        )
-    )
-    if exist "%CERT_PATH%" (
-        echo   Test certificate created: %CERT_NAME%
-    ) else (
-        echo   WARNING: Failed to create test certificate automatically.
-        echo            You can still use bcdedit /set testsigning on
-    )
-) else (
-    echo   Using existing certificate: %CERT_NAME%
-)
-
-:: --- Check if testsigning is enabled ---
-bcdedit /enum {current} 2>nul | findstr /i "testsigning" >nul 2>&1 && echo   Test Signing: ON || echo   Test Signing: OFF
-
 :: --- Sign driver ---
 if not "%SIGNTOOLS%"=="" (
     echo.
-    echo Signing PspDriver.sys...
-    
-    :: Try with store certificate first
-    "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" ^
-      "%OUTPUT_DIR%\PspDriver.sys" >nul 2>&1
-    
-    if errorlevel 1 (
-        :: Try with test certificate file
-        if exist "%CERT_PATH%" (
-            "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /f "%CERT_PATH%" ^
-              "%OUTPUT_DIR%\PspDriver.sys" >nul 2>&1
-        )
-    )
-    
-    if errorlevel 1 (
-        echo   WARNING: Driver signing failed!
-        echo   ----------------------------------------------------
-        echo   To load unsigned drivers, run as Administrator:
-        echo     bcdedit /set testsigning on
-        echo   Then REBOOT
-        echo   ----------------------------------------------------
-    ) else (
-        echo   Driver signed OK
-        
-        :: Verify signature
-        "%SIGNTOOLS%\signtool.exe" verify /pa "%OUTPUT_DIR%\PspDriver.sys" >nul 2>&1
-        if not errorlevel 1 (
-            echo   Signature verified
-        ) else (
-            echo   Signature verification failed (may still work in test mode)
-        )
-    )
-    
-    if exist "%OUTPUT_DIR%\PspDriver.cat" (
-        echo Signing catalog file...
-        "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" ^
-          "%OUTPUT_DIR%\PspDriver.cat" >nul 2>&1
+    echo ==========================================
+    echo  SIGNING DRIVERS
+    echo ==========================================
+    echo.
+
+    :: Create test certificate if needed
+    set "PFX_PATH=%PROJECT_DIR%PspTestCert.pfx"
+    if not exist "%PFX_PATH%" (
+        echo Creating test certificate...
+        powershell -Command "New-SelfSignedCertificate -Type Custom -Subject 'CN=%CERT_NAME%' -KeyUsage DigitalSignature -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddYears(10) -KeyExportPolicy Exportable" >nul 2>&1
         if errorlevel 1 (
-            if exist "%CERT_PATH%" (
-                "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /f "%CERT_PATH%" ^
-                  "%OUTPUT_DIR%\PspDriver.cat" >nul 2>&1
-            )
+            echo WARNING: Failed to create test certificate
         )
-        if not errorlevel 1 echo   Catalog signed OK
+    )
+
+    echo Signing PspDriver.sys...
+    "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" /v ^
+      "%OUTPUT_DIR%\PspDriver.sys" > "%OUTPUT_DIR%\sign-kmd.log" 2>&1
+    if errorlevel 1 (
+        type "%OUTPUT_DIR%\sign-kmd.log"
+        echo FATAL: KMD signing FAILED!
+        echo.
+        echo Try: Run build.bat as Administrator, or sign manually:
+        echo   signtool sign /fd SHA256 /a /s My /n %CERT_NAME% output\PspDriver.sys
+        pause
+        exit /b 1
+    ) else (
+        echo   KMD signed OK
+    )
+
+    :: Verify KMD signature
+    "%SIGNTOOLS%\signtool.exe" verify /pa /v "%OUTPUT_DIR%\PspDriver.sys" > "%OUTPUT_DIR%\verify-kmd.log" 2>&1
+    if errorlevel 1 (
+        echo   Signature verification failed (may still work in test mode)
+    ) else (
+        echo   Signature verified
+    )
+
+    :: Generate catalog file (optional)
+    if not "%INF2CAT%"=="" (
+        echo Generating catalog file...
+        "%INF2CAT%" /driver:"%OUTPUT_DIR%" /os:10_x64 /verbose >nul 2>&1
+    )
+
+    :: Sign catalog (optional)
+    if exist "%OUTPUT_DIR%\PspDriver.cat" (
+        echo Signing catalog...
+        "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" ^
+          "%OUTPUT_DIR%\PspDriver.cat" >nul 2>&1 && echo   Catalog signed OK
     )
 ) else (
     echo WARNING: No signing tools found - driver is UNSIGNED!

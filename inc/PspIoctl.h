@@ -38,12 +38,14 @@ extern "C" {
 #define IOCTL_PSP_KIQ_LOAD_FW         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_KIQ_GET_STATUS      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x823, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// DEVICE_EXTENSION — shared between driver files
+#ifdef _NTDDK_
 typedef struct _DEVICE_EXTENSION {
     PVOID       MmioBase;
     ULONG       MmioSize;
     PVOID       Bar0Base;
     ULONG       Bar0Size;
+    PVOID       GpuMmioBase;
+    ULONG       GpuMmioSize;
     PVOID       FwBuffer;
     PHYSICAL_ADDRESS FwPhysical;
     ULONG       FwSize;
@@ -56,6 +58,7 @@ typedef struct _DEVICE_EXTENSION {
     PVOID       PciCfgBase;
     ULONG       PciCfgSize;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
+#endif
 
 // Timeout for PSP firmware commands (ms)
 #define PSP_FW_WAIT_MS               5000

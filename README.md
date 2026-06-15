@@ -257,6 +257,15 @@ See `inc/PspIoctl.h` for full definitions:
 | `PSP_KIQ_SUBMIT` | 0x818 | KIQ ring submit (TODO) |
 | `PSP_INIT_TMR` | 0x819 | Init Trusted Memory Region |
 
+### GPU Driver Proxy IOCTLs (Windows 11 26100)
+
+When BAR5 mapping fails, the PSP driver uses these GPU driver proxy IOCTLs:
+
+| IOCTL | Code | Description |
+|-------|------|-------------|
+| `IOCTL_AMDBC250_BAR5_READ_PROXY` | 0x900 | Read BAR5 register via GPU driver |
+| `IOCTL_AMDBC250_BAR5_WRITE_PROXY` | 0x901 | Write BAR5 register via GPU driver |
+
 ## Architecture
 
 ```
@@ -266,7 +275,8 @@ test-psp-driver.exe  ---->   PspDriver.sys
 DeviceIoControl              ├─ DriverEntry (IoCreateDevice)
                              ├─ IOCTL dispatch
                              │   ├─ INIT_HW (MmMapIoSpace BAR5 0xFE800000)
-                             │   ├─ READ_REG / WRITE_REG (direct BAR5 MMIO)
+                             │   │   └─ Falls back to GPU proxy if mapping fails
+                             │   ├─ READ_REG / WRITE_REG (direct BAR5 MMIO or GPU proxy)
                              │   ├─ Mailbox C2PMSG (SYSDRV/SOS boot)
                              │   ├─ NBIO unlock signature registers
                              │   └─ Ring protocol (GPCOM, RBI)
@@ -281,6 +291,11 @@ GPU Driver (atikmdag.sys)
       ├─ PSP_WRITE_REG      Direct BAR5 MMIO writes via PSP driver
       ├─ PSP_GET_GPU_INFO   Ring buffer PA, SOS status
       └─ PSP_REG_PROG       Register programming (via ring or mailbox)
+
+Windows 11 26100 GPU Proxy Fallback:
+test-psp-driver.exe  ---->   PspDriver.sys  ---->   GPU Driver (atikmdag.sys)
+                           (ZwCreateFile)      (BAR5 proxy IOCTLs)
+                           (IOCTL_AMDBC250_*)    (MmioVirtualBase access)
 ```
 
 ## Current Status
@@ -292,6 +307,28 @@ GPU Driver (atikmdag.sys)
 - **Mailbox commands** — CMD 0x4 (SYSDRV) and CMD 0x8 (SOS) work
 - **PSP proxy bridge** — GPU driver can read/write registers through PSP driver
 - **GC registers at corrected offsets** — 0x3260, 0x3264, 0x34FC all return valid values
+- **Windows 11 26100 compatibility** — GPU proxy fallback when BAR5 mapping is blocked
+
+### Windows 11 26100 Compatibility
+
+On Windows 11 26100, direct BAR5 MMIO mapping via `MmMapIoSpace` is blocked. The PSP driver handles this by:
+
+1. **First attempting direct BAR5 mapping** via `INIT_HW` IOCTL
+2. **Falling back to GPU driver proxy** if mapping fails
+3. **Using `IOCTL_AMDBC250_BAR5_READ_PROXY` (0x900)** and **`IOCTL_AMDBC250_BAR5_WRITE_PROXY` (0x901)** to access GPU registers through the GPU driver
+
+**Required sequence:**
+1. Install GPU driver first (`atikmdag.sys`)
+2. GPU driver maps BAR5 and provides proxy IOCTLs
+3. Install PSP driver
+4. PSP driver opens handle to GPU driver and uses proxy for mailbox access
+
+**Test sequence for Windows 11 26100:**
+```cmd
+cd output
+test-psp-driver.exe -i 0xFE800000 0x200000   # Init BAR5 (will fallback to proxy if blocked)
+test-psp-driver.exe -m                       # Read C2PMSG_81 (PSP alive)
+```
 
 ### What Doesn't Work
 - **GPCOM ring creation** — SOS firmware does not support TOS ring protocol (C2PMSG_64 bit 31 never sets)
