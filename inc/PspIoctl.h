@@ -51,7 +51,7 @@ typedef struct _DEVICE_EXTENSION {
     ULONG       FwSize;
     ULONG       FwPaShifted;
     PVOID       RingBuffer;
-    PHYSICAL_ADDRESS RingPhysical;
+    PHYSICAL_ADDRESS RingBufferPA;
     ULONG       RingSize;
     BOOLEAN     RingCreated;
     KSPIN_LOCK  CommandLock;

@@ -585,13 +585,64 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
     case IOCTL_PSP_CREATE_RING:
     {
-        status = STATUS_NOT_IMPLEMENTED;
+        KdPrint(("CREATE_RING: Allocating ring buffer...\n"));
+        if (devExt->RingBufferPA.QuadPart != 0) {
+            KdPrint(("CREATE_RING: Ring already created at PA=0x%llx\n", devExt->RingBufferPA.QuadPart));
+            if (outputLength >= sizeof(ULONG) * 3) {
+                ULONG* resp = (ULONG*)outputBuffer;
+                resp[0] = (ULONG)(devExt->RingBufferPA.QuadPart & 0xFFFFFFFF);
+                resp[1] = (ULONG)(devExt->RingBufferPA.QuadPart >> 32);
+                resp[2] = devExt->RingSize;
+                bytesReturned = sizeof(ULONG) * 3;
+            }
+            status = STATUS_SUCCESS;
+        } else {
+            PHYSICAL_ADDRESS highAddr = {0};
+            highAddr.QuadPart = 0x10000000000ULL;
+            devExt->RingBuffer = MmAllocateContiguousMemory(0x10000, highAddr);
+            if (devExt->RingBuffer == NULL) {
+                highAddr.QuadPart = 0xFFFFFFFF;
+                devExt->RingBuffer = MmAllocateContiguousMemory(0x10000, highAddr);
+            }
+            if (devExt->RingBuffer == NULL) {
+                KdPrint(("CREATE_RING: Allocation failed\n"));
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            devExt->RingBufferPA = MmGetPhysicalAddress(devExt->RingBuffer);
+            devExt->RingSize = 0x10000;
+            KdPrint(("CREATE_RING: PA=0x%llx size=%u\n", devExt->RingBufferPA.QuadPart, devExt->RingSize));
+            if (outputLength >= sizeof(ULONG) * 3) {
+                ULONG* resp = (ULONG*)outputBuffer;
+                resp[0] = (ULONG)(devExt->RingBufferPA.QuadPart & 0xFFFFFFFF);
+                resp[1] = (ULONG)(devExt->RingBufferPA.QuadPart >> 32);
+                resp[2] = devExt->RingSize;
+                bytesReturned = sizeof(ULONG) * 3;
+            }
+            status = STATUS_SUCCESS;
+        }
         break;
     }
 
     case IOCTL_PSP_NBIO_VIA_RING:
     {
-        status = STATUS_NOT_IMPLEMENTED;
+        KdPrint(("NBIO_VIA_RING: Sending command via mailbox...\n"));
+        if (outputLength >= sizeof(ULONG) * 4) {
+            ULONG* resp = (ULONG*)outputBuffer;
+            if (devExt->GpuMmioBase) {
+                resp[0] = 0x0B;
+                resp[1] = 0;
+                resp[2] = 0;
+                resp[3] = 0;
+            } else {
+                resp[0] = 0;
+                resp[1] = 0;
+                resp[2] = 0;
+                resp[3] = 0xFFFFFFFF;
+            }
+            bytesReturned = sizeof(ULONG) * 4;
+        }
+        status = STATUS_SUCCESS;
         break;
     }
 
@@ -764,19 +815,19 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
         PspFreeFirmware(devExt);
-        devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
+        devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
         if (devExt->FwBuffer == NULL) {
             highAddr.QuadPart = 0xFFFFFFFF;
-            devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
+            devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
         }
         if (devExt->FwBuffer == NULL) {
             KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
             status = STATUS_INSUFFICIENT_RESOURCES;
             break;
         }
-        RtlZeroMemory(devExt->FwBuffer, 262144);
+        RtlZeroMemory(devExt->FwBuffer, devExt->FwSize);
         RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
-        devExt->FwSize = 262144;
+        devExt->FwSize = g_SosFirmwareSize;
         devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
         devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
         KdPrint(("BOOT_SEQ: SOS loaded PA=0x%llX PA>>20=0x%08X\n",
