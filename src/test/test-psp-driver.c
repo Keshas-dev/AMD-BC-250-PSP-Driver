@@ -169,6 +169,9 @@ BOOL GetPspStatus(HANDLE hDevice)
             (info.GrbmStatus != 0xFFFFFFFF) ? " *** UNLOCKED ***" : " (BLOCKED)");
         Log("  GC (0x4260)=0x%08X  HDP (0x05A0)=0x%08X  MMHUB (0x50D0)=0x%08X\n",
             info.GcCheck, info.HdpCheck, info.MmhubCheck);
+        Log("  ME_CNTL=0x%08X  (ME_HALT=%d PFP_HALT=%d)\n", info.MeCntl,
+            (info.MeCntl & 0x10000000) ? 1 : 0, (info.MeCntl & 0x40000000) ? 1 : 0);
+        Log("  GRBM_GFX_INDEX=0x%08X\n", info.GrbmGfxIndex);
         Log("  MMIO VA=0x%08X  Size=%u  Ring Created: %s\n", info.MmioVA, info.MmioSize,
             info.RingCreated ? "YES" : "NO");
     } else {
@@ -912,6 +915,46 @@ int main(int argc, char *argv[])
             Log("KIQ_LOAD_FW: type=%u file=%s\n", fwType, filename);
             ok = KiqLoadFw(h, fwType, filename);
             if (!ok) { ret = 1; }
+            i += 2;
+        }
+        else if (strcmp(argv[i], "-F") == 0 && i + 2 < argc) {
+            ULONG fwType = (ULONG)strtoul(argv[i + 1], NULL, 0);
+            const char* filename = argv[i + 2];
+            Log("LOAD_IP_FW_DIRECT: type=%u file=%s\n", fwType, filename);
+
+            FILE *fp = fopen(filename, "rb");
+            if (!fp) { Log("  FAILED: cannot open %s\n", filename); ret = 1; }
+            else {
+                fseek(fp, 0, SEEK_END);
+                long fwSize = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+                if (fwSize <= 0 || fwSize > 1024*1024) {
+                    Log("  FAILED: invalid firmware size %ld\n", fwSize);
+                    fclose(fp); ret = 1;
+                } else {
+                    size_t bufSize = sizeof(PSP_LOAD_IP_FW_REQUEST) + fwSize;
+                    PSP_LOAD_IP_FW_REQUEST *req = (PSP_LOAD_IP_FW_REQUEST*)malloc(bufSize);
+                    if (!req) { Log("  FAILED: cannot allocate %zu bytes\n", bufSize); fclose(fp); ret = 1; }
+                    else {
+                        req->FwType = fwType;
+                        req->FwSize = (ULONG)fwSize;
+                        fread(req + 1, 1, fwSize, fp);
+                        fclose(fp);
+
+                        PSP_LOAD_IP_FW_RESPONSE resp;
+                        DWORD returned = 0;
+                        BOOL ok2 = DeviceIoControl(h, IOCTL_PSP_LOAD_IP_FW_DIRECT,
+                            req, (DWORD)bufSize, &resp, sizeof(resp), &returned, NULL);
+                        if (ok2) {
+                            Log("  Status=0x%08X C2Pmsg35=0x%08X C2Pmsg81=0x%08X\n",
+                                resp.Status, resp.C2Pmsg35, resp.C2Pmsg81);
+                        } else {
+                            Log("  FAILED (err=%lu)\n", GetLastError());
+                        }
+                        free(req);
+                    }
+                }
+            }
             i += 2;
         }
         else if (strcmp(argv[i], "-l") == 0) {

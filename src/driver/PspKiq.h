@@ -7,6 +7,7 @@
 NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, ULONG cmdBufSize);
 NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req);
 NTSTATUS PspKiqLoadFirmware(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize, PUCHAR FwData);
+NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST req, PPSP_GPU_PM4_SUBMIT_RESPONSE resp);
 VOID PspKiqCleanup(VOID);
 
 // KIQ register offsets (BAR5-relative) — BC-250 cyan_skillfish

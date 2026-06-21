@@ -55,16 +55,11 @@ static PHYSICAL_ADDRESS g_WptrPollPa = {0};
 
 static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
 {
-    PVOID gpuBase;
     ULONG ringSizeDwords;
     ULONG pqControl;
 
-    if (!g_Bar5Mapping && !devExt->GpuMmioBase) {
-        KdPrint(("KIQ_HW: No GPU BAR5 access\n"));
-        return STATUS_DEVICE_NOT_READY;
-    }
-
-    gpuBase = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;
+    KdPrint(("KIQ_HW: Programming GPU HQD registers (g_Bar5Mapping=%p, GpuMmioBase=%p)\n",
+        g_Bar5Mapping, devExt->GpuMmioBase));
 
     /* 1. Halt ME + PFP before programming */
     PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, ME_CNTL_ME_HALT | ME_CNTL_PFP_HALT);
@@ -116,18 +111,26 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     PspGpuProxyWriteRegister(GPU_CP_HQD_PQ_WPTR_LO, 0);
     PspGpuProxyWriteRegister(GPU_CP_HQD_PQ_WPTR_HI, 0);
 
-    /* 12. Restore GRBM_GFX_INDEX to broadcast before activate */
-    PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
+    /* 12. Set KIQ_BASE (KIQ engine reads commands from here!) */
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_LO,
+        (ULONG)(g_KiqRingPa.QuadPart & 0xFFFFFFFF));
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_HI,
+        (ULONG)(g_KiqRingPa.QuadPart >> 32));
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_RPTR, 0);
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, 0);
+
+    /* 13. Re-select KIQ engine before activate (ME=1) — must be selected for HQD_ACTIVE */
+    PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_KIQ);
     KeStallExecutionProcessor(1);
 
-    /* 13. Activate queue */
+    /* 14. Activate queue */
     PspGpuProxyWriteRegister(GPU_CP_HQD_ACTIVE, 1);
     KeStallExecutionProcessor(1);
 
-    /* 14. Notify RLC scheduler */
+    /* 15. Notify RLC scheduler */
     PspGpuProxyWriteRegister(GPU_RLC_CP_SCHEDULERS, RLC_SCHEDULERS_KIQ);
 
-    /* 15. Resume CP (clear ME_HALT + PFP_HALT) */
+    /* 16. Resume CP (clear ME_HALT + PFP_HALT) */
     PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, 0);
     KeStallExecutionProcessor(100);
 
@@ -206,6 +209,15 @@ NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, UL
     g_KiqRingWptr = 0;
     g_KiqRingInitialized = TRUE;
 
+    /* Ensure GPU BAR5 access is available before programming HW registers */
+    if (!g_Bar5Mapping && !devExt->GpuMmioBase) {
+        KdPrint(("KIQ: No GPU BAR5, trying proxy init\n"));
+        NTSTATUS proxyStatus = PspGpuProxyInit(devExt);
+        if (!NT_SUCCESS(proxyStatus)) {
+            KdPrint(("KIQ: GPU proxy init failed (0x%08X), HW registers won't be programmed\n", proxyStatus));
+        }
+    }
+
     /* Program GPU HQD hardware registers */
     NTSTATUS hwStatus = PspKiqProgramHwRegisters(devExt);
     if (!NT_SUCCESS(hwStatus)) {
@@ -257,8 +269,10 @@ NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req)
         *(volatile PULONG)(g_WptrPollVa) = wptr;
     }
 
-    /* Update WPTR in GPU hardware register */
+    /* Update WPTR in GPU hardware registers — both HQD and KIQ paths */
     PspGpuProxyWriteRegister(GPU_CP_HQD_PQ_WPTR_LO, wptr);
+    PspGpuProxyWriteRegister(GPU_CP_HQD_PQ_WPTR_HI, 0);
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, wptr);
 
     return STATUS_SUCCESS;
 }
@@ -338,4 +352,79 @@ NTSTATUS PspKiqLoadFirmware(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize
 
     status = PspKiqSubmit(devExt, &req);
     return status;
+}
+
+NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST req, PPSP_GPU_PM4_SUBMIT_RESPONSE resp)
+{
+    ULONG i;
+    KIRQL irql;
+    ULONG wptr;
+
+    if (!g_KiqRingInitialized || !g_KiqRingVa) {
+        NTSTATUS st = PspKiqInit(devExt, 0, 0, 0);
+        if (!NT_SUCCESS(st)) return st;
+    }
+
+    if (!req || req->CommandCount == 0 || req->CommandCount > 64) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* Read SCRATCH before */
+    resp->ScratchBefore = PspGpuProxyReadRegister(0x32D4);
+
+    /* Read HQD_ACTIVE to check queue state */
+    resp->HqdActive = PspGpuProxyReadRegister(GPU_CP_HQD_ACTIVE);
+
+    /* Read WPTR before */
+    resp->HqdPqWptrBefore = PspGpuProxyReadRegister(GPU_CP_HQD_PQ_WPTR_LO);
+
+    /* Write PM4 commands to ring */
+    KeAcquireSpinLock(&g_KiqRingLock, &irql);
+    wptr = g_KiqRingWptr;
+    for (i = 0; i < req->CommandCount; i++) {
+        ((volatile PULONG)(g_KiqRingVa))[wptr] = req->Commands[i];
+        wptr++;
+        if (wptr * sizeof(ULONG) >= g_KiqRingSize) {
+            wptr = 0;
+        }
+    }
+    g_KiqRingWptr = wptr;
+    KeReleaseSpinLock(&g_KiqRingLock, irql);
+
+    /* Memory barrier */
+    KeMemoryBarrier();
+
+    /* Update WPTR in polling page */
+    if (g_WptrPollVa) {
+        *(volatile PULONG)(g_WptrPollVa) = wptr;
+    }
+
+    /* Kick GPU WPTR — both HQD and KIQ paths */
+    PspGpuProxyWriteRegister(GPU_CP_HQD_PQ_WPTR_LO, wptr);
+    PspGpuProxyWriteRegister(GPU_CP_HQD_PQ_WPTR_HI, 0);
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, wptr);
+
+    resp->Pm4Dwords = req->CommandCount;
+    resp->KiqRingWptr = wptr;
+
+    /* Wait if requested */
+    if (req->WaitMs > 0) {
+        LARGE_INTEGER delay;
+        delay.QuadPart = -(LONGLONG)10000 * req->WaitMs;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+
+    /* Read results */
+    resp->ScratchAfter = PspGpuProxyReadRegister(0x32D4);
+    resp->HqdPqWptrAfter = PspGpuProxyReadRegister(GPU_CP_HQD_PQ_WPTR_LO);
+    resp->WptrReadback = PspGpuProxyReadRegister(GPU_CP_KIQ_WPTR);
+    resp->KiqRingSize = g_KiqRingSize;
+    resp->KiqRingPa = g_KiqRingPa.LowPart;
+
+    KdPrint(("GPU_PM4: Scratch=0x%08X->0x%08X WPTR=%u->%u Active=0x%08X PM4=%u\n",
+        resp->ScratchBefore, resp->ScratchAfter,
+        resp->HqdPqWptrBefore, resp->HqdPqWptrAfter,
+        resp->HqdActive, req->CommandCount));
+
+    return STATUS_SUCCESS;
 }

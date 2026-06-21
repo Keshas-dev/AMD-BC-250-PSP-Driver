@@ -12,8 +12,10 @@ extern KSPIN_LOCK g_Bar5MappingLock;
 extern BOOLEAN g_GpuProxyAvailable;
 extern HANDLE g_GpuDriverHandle;
 
-#define IOCTL_AMDBC250_BAR5_READ_PROXY  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_AMDBC250_BAR5_WRITE_PROXY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* GPU driver uses raw IOCTL values 0x900/0x901 in its switch statement,
+ * NOT CTL_CODE values. We must match exactly. */
+#define IOCTL_AMDBC250_BAR5_READ_PROXY  0x900
+#define IOCTL_AMDBC250_BAR5_WRITE_PROXY 0x901
 
 static BOOLEAN g_GpuProxyInitialized = FALSE;
 
@@ -248,6 +250,141 @@ NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     }
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize, PUCHAR FwData)
+{
+    NTSTATUS status;
+    PVOID cmdBufVa = NULL;
+    PHYSICAL_ADDRESS cmdBufPa = {0};
+    PVOID fwBufVa = NULL;
+    PHYSICAL_ADDRESS fwBufPa = {0};
+    ULONG timeout;
+    ULONG cmdReg;
+    PUCHAR mboxBase;
+    KIRQL irql;
+    volatile PULONG cmdDwords;
+
+    if (FwSize == 0 || FwData == NULL || FwSize > 0x100000) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /* We need GPU BAR5 for mailbox access */
+    if (!g_Bar5Mapping && !devExt->GpuMmioBase) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    mboxBase = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;
+
+    /* Allocate 1024-byte command buffer (non-cached, below 4GB) */
+    {
+        PHYSICAL_ADDRESS low = {0}, high = {0}, boundary = {0};
+        high.QuadPart = 0xFFFFFFFFULL;
+        cmdBufVa = MmAllocateContiguousMemorySpecifyCache(
+            1024, low, high, boundary, MmNonCached);
+    }
+    if (!cmdBufVa) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(cmdBufVa, 1024);
+    cmdBufPa = MmGetPhysicalAddress(cmdBufVa);
+
+    /* Allocate non-cached buffer for firmware data */
+    {
+        PHYSICAL_ADDRESS low = {0}, high = {0}, boundary = {0};
+        high.QuadPart = 0xFFFFFFFFULL;
+        fwBufVa = MmAllocateContiguousMemorySpecifyCache(
+            FwSize, low, high, boundary, MmNonCached);
+    }
+    if (!fwBufVa) {
+        MmFreeContiguousMemory(cmdBufVa);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlCopyMemory(fwBufVa, FwData, FwSize);
+    fwBufPa = MmGetPhysicalAddress(fwBufVa);
+
+    /* Fill command buffer in PSP ring frame format:
+     * Offset  0: buf_size  = 1024
+     * Offset  4: body_size = 4 (dwords of params)
+     * Offset  8: cmd_id    = 0x06 (LOAD_IP_FW)
+     * Offset 12-24: reserved
+     * Offset 28: fw_pa_lo
+     * Offset 32: fw_pa_hi
+     * Offset 36: fw_size
+     * Offset 40: fw_type   */
+    cmdDwords = (volatile PULONG)cmdBufVa;
+    cmdDwords[0]  = 1024;                       /* buf_size */
+    cmdDwords[1]  = 4;                          /* body_size (dwords) */
+    cmdDwords[2]  = GFX_CMD_ID_LOAD_IP_FW;     /* cmd_id = 0x06 */
+    cmdDwords[3]  = 0;                          /* reserved */
+    cmdDwords[4]  = 0;                          /* reserved */
+    cmdDwords[5]  = 0;                          /* reserved */
+    cmdDwords[6]  = 0;                          /* reserved */
+    cmdDwords[7]  = (ULONG)(fwBufPa.QuadPart & 0xFFFFFFFF);  /* fw_pa_lo */
+    cmdDwords[8]  = (ULONG)(fwBufPa.QuadPart >> 32);         /* fw_pa_hi */
+    cmdDwords[9]  = FwSize;                     /* fw_size */
+    cmdDwords[10] = FwType;                     /* fw_type */
+
+    KdPrint(("LOAD_IP_FW_MAILBOX: type=%u size=%u cmdBufPA=0x%llX fwPA=0x%llX\n",
+             FwType, FwSize, cmdBufPa.QuadPart, fwBufPa.QuadPart));
+
+    /* Send via mailbox: C2PMSG_36/37 = command buffer PA, C2PMSG_35 = 0x06 */
+    KeAcquireSpinLock(&devExt->CommandLock, &irql);
+
+    if (g_GpuProxyAvailable) {
+        PspGpuProxyWriteRegister(PSP_C2PMSG_36_OFFSET, (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF));
+        PspGpuProxyWriteRegister(PSP_C2PMSG_37_OFFSET, (ULONG)(cmdBufPa.QuadPart >> 32));
+        PspGpuProxyWriteRegister(PSP_C2PMSG_35_OFFSET, GFX_CMD_ID_LOAD_IP_FW);
+    } else {
+        mboxBase = (g_Bar5Mapping != NULL) ? g_Bar5Mapping : mboxBase;
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_36_OFFSET),
+            (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF));
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_37_OFFSET),
+            (ULONG)(cmdBufPa.QuadPart >> 32));
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET),
+            GFX_CMD_ID_LOAD_IP_FW);
+    }
+
+    KeReleaseSpinLock(&devExt->CommandLock, irql);
+
+    /* Wait for completion (C2PMSG_35 clears to 0) */
+    for (timeout = 0; timeout < PSP_FW_WAIT_MS; timeout++) {
+        KeStallExecutionProcessor(1000);
+        if (g_GpuProxyAvailable) {
+            cmdReg = PspGpuProxyReadRegister(PSP_C2PMSG_35_OFFSET);
+        } else {
+            cmdReg = READ_REGISTER_ULONG(
+                (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET));
+        }
+        if (cmdReg == 0) {
+            KdPrint(("LOAD_IP_FW_MAILBOX: Completed after %u ms\n", timeout));
+            break;
+        }
+    }
+
+    /* Read C2PMSG_81 for status */
+    {
+        ULONG c2pmsg81 = 0;
+        if (g_GpuProxyAvailable) {
+            c2pmsg81 = PspGpuProxyReadRegister(PSP_C2PMSG_81_OFFSET);
+        } else {
+            c2pmsg81 = READ_REGISTER_ULONG(
+                (PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_81_OFFSET));
+        }
+        KdPrint(("LOAD_IP_FW_MAILBOX: C2PMSG_81=0x%08X timeout=%u cmdReg=0x%08X\n",
+                 c2pmsg81, timeout, cmdReg));
+
+        if (timeout >= PSP_FW_WAIT_MS) {
+            KdPrint(("LOAD_IP_FW_MAILBOX: TIMEOUT C2PMSG_35=0x%08X\n", cmdReg));
+            status = STATUS_TIMEOUT;
+        } else {
+            status = STATUS_SUCCESS;
+        }
+    }
+
+    /* Cleanup */
+    MmFreeContiguousMemory(cmdBufVa);
+    MmFreeContiguousMemory(fwBufVa);
+    return status;
 }
 
 NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt)

@@ -137,7 +137,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    KdPrint(("=== AMD BC-250 PSP Driver: DriverEntry ===\n"));
+    KdPrint(("=== AMD BC-250 PSP Driver v2.0: DriverEntry ===\n"));
 
     DriverObject->MajorFunction[IRP_MJ_CREATE] = PspCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = PspCreateClose;
@@ -327,6 +327,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 KdPrint(("INIT_HW: GPU BAR5 map failed at 0x%llX\n", physAddr.QuadPart));
                 break;
             }
+            // Also set MmioBase for NBIO_UNLOCK to work
+            if (devExt->MmioBase == NULL) {
+                devExt->MmioBase = devExt->GpuMmioBase;
+                devExt->MmioSize = size;
+            }
             if (g_Bar5Mapping == NULL) {
                 g_Bar5Mapping = devExt->GpuMmioBase;
                 g_Bar5Size = size;
@@ -372,6 +377,20 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
         ULONG offset = ((PULONG)inputBuffer)[0];
+        
+        // Try BAR0 first for NBIO registers (0xC100, 0xC180, etc.)
+        // These are accessible even without GPU driver proxy
+        if (offset >= 0xC000 && offset < 0x10000 && devExt->Bar0Base) {
+            if (outputLength < sizeof(ULONG)) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+            ULONG value = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->Bar0Base + offset));
+            ((PULONG)outputBuffer)[0] = value;
+            bytesReturned = sizeof(ULONG);
+            status = STATUS_SUCCESS;
+            break;
+        }
         
         if (devExt->GpuMmioBase) {
             if (offset >= devExt->GpuMmioSize) {
@@ -424,6 +443,13 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         PULONG params = (PULONG)inputBuffer;
         ULONG offset = params[0];
         ULONG value = params[1];
+        
+        // Try BAR0 first for NBIO registers (0xC100, 0xC180, etc.)
+        if ((offset >= 0xC000 && offset < 0x10000) && devExt->Bar0Base) {
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->Bar0Base + offset), value);
+            status = STATUS_SUCCESS;
+            break;
+        }
         
         if (devExt->GpuMmioBase) {
             if (offset >= devExt->GpuMmioSize) {
@@ -695,10 +721,31 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         info->FwPaShifted = devExt->FwPaShifted;
         info->NbioSig1 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET));
         info->NbioSig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
-        info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + (AMDBC250_GC_BASE + 0x2004)));
-        info->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
-        info->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + (AMDBC250_GC_BASE + 0x3000)));
-        info->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + 0x05A0));
+
+        /* GPU registers MUST be read from GPU BAR5, not PSP BAR0 */
+        PVOID gpuBase = devExt->GpuMmioBase ? devExt->GpuMmioBase : devExt->MmioBase;
+        if (devExt->GpuMmioBase) {
+            info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x2004)));
+            info->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + MMHUB_CHECK_OFFSET));
+            info->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x3000)));
+            info->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + 0x05A0));
+            info->MeCntl = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x3814)));
+            info->GrbmGfxIndex = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x2270)));
+        } else if (g_Bar5Mapping) {
+            info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + (AMDBC250_GC_BASE + 0x2004)));
+            info->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + MMHUB_CHECK_OFFSET));
+            info->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + (AMDBC250_GC_BASE + 0x3000)));
+            info->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + 0x05A0));
+            info->MeCntl = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + (AMDBC250_GC_BASE + 0x3814)));
+            info->GrbmGfxIndex = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + (AMDBC250_GC_BASE + 0x2270)));
+        } else {
+            info->GrbmStatus = 0xFFFFFFFF;
+            info->MmhubCheck = 0xFFFFFFFF;
+            info->GcCheck = 0xFFFFFFFF;
+            info->HdpCheck = 0xFFFFFFFF;
+            info->MeCntl = 0xFFFFFFFF;
+            info->GrbmGfxIndex = 0xFFFFFFFF;
+        }
         info->MmioVA = (ULONG)(ULONG_PTR)devExt->Bar0Base;
         info->MmioSize = devExt->Bar0Size;
         info->RingCreated = devExt->RingCreated ? 1 : 0;
@@ -1004,18 +1051,25 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
     case IOCTL_PSP_KIQ_LOAD_FW:
     {
-        PSP_KIQ_LOAD_FW_REQUEST* req = (PSP_KIQ_LOAD_FW_REQUEST*)inputBuffer;
-        if (inputLength < sizeof(PSP_KIQ_LOAD_FW_REQUEST) || req->FwSize == 0) {
+        KdPrint(("IOCTL_PSP_KIQ_LOAD_FW: inputLength=%u outputLength=%u\n", inputLength, outputLength));
+        
+        if (inputLength < sizeof(ULONG) * 2) {
+            KdPrint(("KIQ_LOAD_FW: buffer too small\n"));
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        if (inputLength < sizeof(PSP_KIQ_LOAD_FW_REQUEST) + req->FwSize) {
-            status = STATUS_BUFFER_TOO_SMALL;
+
+        ULONG fwType = *((PULONG)inputBuffer);
+        ULONG fwSize = *((PULONG)inputBuffer + 1);
+        KdPrint(("KIQ_LOAD_FW: fwType=%u fwSize=%u inputLength=%u\n", fwType, fwSize, inputLength));
+        
+        if (fwSize == 0 || fwSize > 0x100000 || inputLength < sizeof(ULONG) * 2 + fwSize) {
+            KdPrint(("KIQ_LOAD_FW: invalid params\n"));
+            status = STATUS_INVALID_PARAMETER;
             break;
         }
-        ULONG fwType = req->FwType;
-        ULONG fwSize = req->FwSize;
-        PUCHAR fwData = (PUCHAR)(req + 1);
+        
+        PUCHAR fwData = (PUCHAR)inputBuffer + sizeof(ULONG) * 2;
         if (!fwData) {
             status = STATUS_INVALID_PARAMETER;
             break;
@@ -1040,7 +1094,55 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         break;
     }
 
+    case IOCTL_PSP_LOAD_IP_FW_DIRECT:
+    {
+        if (inputLength < sizeof(PSP_LOAD_IP_FW_REQUEST)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PSP_LOAD_IP_FW_REQUEST* req = (PSP_LOAD_IP_FW_REQUEST*)inputBuffer;
+        if (req->FwSize == 0 || inputLength < sizeof(PSP_LOAD_IP_FW_REQUEST) + req->FwSize) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        PUCHAR fwData = (PUCHAR)(req + 1);
+        KdPrint(("IOCTL_PSP_LOAD_IP_FW_DIRECT: type=%u size=%u\n", req->FwType, req->FwSize));
+        status = PspLoadIpFwViaMailbox(devExt, req->FwType, req->FwSize, fwData);
+        if (outputLength >= sizeof(PSP_LOAD_IP_FW_RESPONSE)) {
+            PSP_LOAD_IP_FW_RESPONSE* resp = (PSP_LOAD_IP_FW_RESPONSE*)outputBuffer;
+            RtlZeroMemory(resp, sizeof(*resp));
+            resp->Status = (ULONG)status;
+            if (g_GpuProxyAvailable) {
+                resp->C2Pmsg35 = PspGpuProxyReadRegister(PSP_C2PMSG_35_OFFSET);
+                resp->C2Pmsg81 = PspGpuProxyReadRegister(PSP_C2PMSG_81_OFFSET);
+            }
+            bytesReturned = sizeof(PSP_LOAD_IP_FW_RESPONSE);
+        }
+        break;
+    }
+
+    case IOCTL_PSP_GPU_PM4_SUBMIT:
+    {
+        KdPrint(("IOCTL_PSP_GPU_PM4_SUBMIT: inputLen=%u outputLen=%u\n", inputLength, outputLength));
+        if (inputLength < sizeof(PSP_GPU_PM4_SUBMIT_REQUEST)) {
+            KdPrint(("  REJECTED: input %u < %u\n", inputLength, (ULONG)sizeof(PSP_GPU_PM4_SUBMIT_REQUEST)));
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (outputLength < sizeof(PSP_GPU_PM4_SUBMIT_RESPONSE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        PPSP_GPU_PM4_SUBMIT_REQUEST req = (PPSP_GPU_PM4_SUBMIT_REQUEST)inputBuffer;
+        PPSP_GPU_PM4_SUBMIT_RESPONSE resp = (PPSP_GPU_PM4_SUBMIT_RESPONSE)outputBuffer;
+        RtlZeroMemory(resp, sizeof(*resp));
+        status = PspGpuPm4Submit(devExt, req, resp);
+        bytesReturned = sizeof(PSP_GPU_PM4_SUBMIT_RESPONSE);
+        break;
+    }
+
     default:
+        KdPrint(("DEFAULT: unknown IOCTL 0x%08X\n", ioctlCode));
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
     }

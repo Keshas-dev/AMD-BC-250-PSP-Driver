@@ -14,6 +14,7 @@ ULONG PspGpuProxyReadRegister(ULONG offset);
 BOOLEAN PspGpuProxyWriteRegister(ULONG offset, ULONG value);
 
 NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command);
+NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize, PUCHAR FwData);
 NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt);
 VOID PspFreeTmr(VOID);
 NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt);

@@ -37,6 +37,8 @@ extern "C" {
 #define IOCTL_PSP_SMU_WAKE            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_KIQ_LOAD_FW         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_KIQ_GET_STATUS      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x823, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_LOAD_IP_FW_DIRECT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_GPU_PM4_SUBMIT      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #ifdef _NTDDK_
 typedef struct _DEVICE_EXTENSION {
@@ -175,6 +177,8 @@ typedef struct _PSP_STATUS_INFO {
     ULONG C2PMSG_64;           // Raw C2PMSG_64 value (ring control)
     ULONG GcCheck;             // GC register (0x3000)
     ULONG HdpCheck;            // HDP register (0x05A0)
+    ULONG MeCntl;              // CP_ME_CNTL (GC_BASE + 0x3814 = 0x4A74) — bit28=ME_HALT, bit30=PFP_HALT
+    ULONG GrbmGfxIndex;        // GRBM_GFX_INDEX (GC_BASE + 0x2270 = 0x34D0) — selects ME/PIPE/QUEUE
 } PSP_STATUS_INFO, *PPSP_STATUS_INFO;
 
 // For IOCTL_PSP_INIT_HW, input is physical address + size
@@ -232,6 +236,43 @@ typedef struct _PSP_KIQ_LOAD_FW_REQUEST {
     ULONG FwSize;       // Size of firmware blob that follows in the input buffer
     // Firmware data follows immediately in the input buffer after this struct
 } PSP_KIQ_LOAD_FW_REQUEST, *PPSP_KIQ_LOAD_FW_REQUEST;
+
+// For IOCTL_PSP_LOAD_IP_FW_DIRECT — load GPU firmware via mailbox command
+typedef struct _PSP_LOAD_IP_FW_REQUEST {
+    ULONG FwType;       // GFX_FW_TYPE code (ME=1, PFP=2, CE=3, MEC=4, etc.)
+    ULONG FwSize;       // Size of firmware blob that follows in the input buffer
+    // Firmware data follows immediately in the input buffer after this struct
+} PSP_LOAD_IP_FW_REQUEST, *PPSP_LOAD_IP_FW_REQUEST;
+
+typedef struct _PSP_LOAD_IP_FW_RESPONSE {
+    ULONG Status;           // NTSTATUS
+    ULONG C2Pmsg35;         // Mailbox command register after
+    ULONG C2Pmsg81;         // PSP status after command
+    ULONG Reserved;
+} PSP_LOAD_IP_FW_RESPONSE, *PPSP_LOAD_IP_FW_RESPONSE;
+
+// Input for IOCTL_PSP_GPU_PM4_SUBMIT — submit GPU PM4 via PSP KIQ ring
+typedef struct _PSP_GPU_PM4_SUBMIT_REQUEST {
+    ULONG CommandCount;      // Number of PM4 DWORDs (max 64)
+    ULONG Reserved;          // Alignment padding
+    ULONG WaitMs;            // Wait time in ms after kick (0 = no wait)
+    ULONG Commands[64];      // PM4 commands
+} PSP_GPU_PM4_SUBMIT_REQUEST, *PPSP_GPU_PM4_SUBMIT_REQUEST;
+
+// Output for IOCTL_PSP_GPU_PM4_SUBMIT
+typedef struct _PSP_GPU_PM4_SUBMIT_RESPONSE {
+    ULONG Status;            // NTSTATUS
+    ULONG ScratchBefore;     // SCRATCH (0x32D4) before PM4
+    ULONG ScratchAfter;      // SCRATCH (0x32D4) after wait
+    ULONG WptrReadback;      // WPTR readback after kick
+    ULONG KiqRingWptr;       // PSP KIQ ring WPTR
+    ULONG KiqRingSize;       // PSP KIQ ring size
+    ULONG KiqRingPa;         // PSP KIQ ring PA (low 32 bits)
+    ULONG HqdPqWptrBefore;   // HQD_PQ_WPTR_LO before kick
+    ULONG HqdPqWptrAfter;    // HQD_PQ_WPTR_LO after wait
+    ULONG HqdActive;         // HQD_ACTIVE readback
+    ULONG Pm4Dwords;         // Number of PM4 DWORDs written
+} PSP_GPU_PM4_SUBMIT_RESPONSE, *PPSP_GPU_PM4_SUBMIT_RESPONSE;
 
 // Output for IOCTL_PSP_KIQ_GET_STATUS
 typedef struct _PSP_KIQ_STATUS {

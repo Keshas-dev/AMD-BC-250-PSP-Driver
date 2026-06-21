@@ -7,7 +7,7 @@ echo ===================================================
 
 set "PROJECT_DIR=%~dp0"
 set "OUTPUT_DIR=%PROJECT_DIR%output"
-set "CERT_NAME=PspTestCert"
+set "CERT_NAME=AMD-BC250-Signer"
 
 :: --- Detect Visual Studio 2022 ---
 :: Searches multiple drives and editions (Community, Professional, Enterprise)
@@ -168,59 +168,52 @@ if not "%SIGNTOOLS%"=="" (
     echo ==========================================
     echo.
 
-    :: Create test certificate if needed
-    set "PFX_PATH=%PROJECT_DIR%PspTestCert.pfx"
-    if not exist "%PFX_PATH%" (
-        echo Creating test certificate...
-        powershell -Command "New-SelfSignedCertificate -Type Custom -Subject 'CN=%CERT_NAME%' -KeyUsage DigitalSignature -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddYears(10) -KeyExportPolicy Exportable" >nul 2>&1
-        if errorlevel 1 (
-            echo WARNING: Failed to create test certificate
-        )
-    )
-
+    :: Sign driver (uses same cert as GPU driver)
     echo Signing PspDriver.sys...
     "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" /v ^
       "%OUTPUT_DIR%\PspDriver.sys" > "%OUTPUT_DIR%\sign-kmd.log" 2>&1
     if errorlevel 1 (
         type "%OUTPUT_DIR%\sign-kmd.log"
-        echo FATAL: KMD signing FAILED!
+        echo FATAL: PSP signing FAILED!
         echo.
         echo Try: Run build.bat as Administrator, or sign manually:
-        echo   signtool sign /fd SHA256 /a /s My /n %CERT_NAME% output\PspDriver.sys
+        echo   signtool sign /fd SHA256 /a /s My /n AMD-BC250-Signer output\PspDriver.sys
         pause
         exit /b 1
     ) else (
-        echo   KMD signed OK
+        echo   PSP signed OK
     )
 
-    :: Verify KMD signature
+    :: Verify signature
     "%SIGNTOOLS%\signtool.exe" verify /pa /v "%OUTPUT_DIR%\PspDriver.sys" > "%OUTPUT_DIR%\verify-kmd.log" 2>&1
     if errorlevel 1 (
-        echo   Signature verification failed (may still work in test mode)
+        echo   Signature applied (test cert - verify may fail without testsigning)
     ) else (
-        echo   Signature verified
+        echo   PSP signature verified OK
     )
 
-    :: Generate catalog file (optional)
+    :: Generate catalog
     if not "%INF2CAT%"=="" (
         echo Generating catalog file...
         "%INF2CAT%" /driver:"%OUTPUT_DIR%" /os:10_x64 /verbose >nul 2>&1
     )
 
-    :: Sign catalog (optional)
+    :: Sign catalog
     if exist "%OUTPUT_DIR%\PspDriver.cat" (
-        echo Signing catalog...
         "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" ^
           "%OUTPUT_DIR%\PspDriver.cat" >nul 2>&1 && echo   Catalog signed OK
     )
-) else (
-    echo WARNING: No signing tools found - driver is UNSIGNED!
-    echo ----------------------------------------------------
-    echo To load this driver, run as Administrator:
-    echo   bcdedit /set testsigning on
-    echo Then REBOOT
-    echo ----------------------------------------------------
+    goto :DoneSigning
 )
+
+echo WARNING: No signing tools found - driver is UNSIGNED!
+echo ----------------------------------------------------
+echo To load this driver, run as Administrator:
+echo   bcdedit /set testsigning on
+echo Then REBOOT
+echo ----------------------------------------------------
+
+:DoneSigning
 
 echo.
 echo ==========================================
