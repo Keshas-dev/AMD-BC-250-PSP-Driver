@@ -614,6 +614,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         KdPrint(("CREATE_RING: Allocating ring buffer...\n"));
         if (devExt->RingBufferPA.QuadPart != 0) {
             KdPrint(("CREATE_RING: Ring already created at PA=0x%llx\n", devExt->RingBufferPA.QuadPart));
+            devExt->RingCreated = TRUE;
             if (outputLength >= sizeof(ULONG) * 3) {
                 ULONG* resp = (ULONG*)outputBuffer;
                 resp[0] = (ULONG)(devExt->RingBufferPA.QuadPart & 0xFFFFFFFF);
@@ -637,6 +638,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
             devExt->RingBufferPA = MmGetPhysicalAddress(devExt->RingBuffer);
             devExt->RingSize = 0x10000;
+            devExt->RingCreated = TRUE;
             KdPrint(("CREATE_RING: PA=0x%llx size=%u\n", devExt->RingBufferPA.QuadPart, devExt->RingSize));
             if (outputLength >= sizeof(ULONG) * 3) {
                 ULONG* resp = (ULONG*)outputBuffer;
