@@ -61,8 +61,16 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     KdPrint(("KIQ_HW: Programming GPU HQD registers (g_Bar5Mapping=%p, GpuMmioBase=%p)\n",
         g_Bar5Mapping, devExt->GpuMmioBase));
 
+    if (!g_Bar5Mapping && !devExt->GpuMmioBase) {
+        KdPrint(("KIQ_HW: No BAR5 mapping available, cannot program HQD\n"));
+        return STATUS_DEVICE_NOT_READY;
+    }
+
     /* 1. Halt ME + PFP before programming */
-    PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, ME_CNTL_ME_HALT | ME_CNTL_PFP_HALT);
+    if (!PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, ME_CNTL_ME_HALT | ME_CNTL_PFP_HALT)) {
+        KdPrint(("KIQ_HW: Failed to halt ME+PFP\n"));
+        return STATUS_DEVICE_NOT_READY;
+    }
     KeStallExecutionProcessor(10);
 
     /* 2. Select KIQ engine: GRBM_GFX_INDEX = ME=1 */

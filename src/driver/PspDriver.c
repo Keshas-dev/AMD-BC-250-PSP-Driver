@@ -87,11 +87,13 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
     stepStatus = PspSendMailboxCommand(devExt, 0x00000004);
     if (!NT_SUCCESS(stepStatus)) {
         KdPrint(("BOOT_SEQ: SYSDRV failed 0x%08X\n", stepStatus));
+        PspFreeFirmware(devExt);
         return stepStatus;
     }
 
     if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
         KdPrint(("BOOT_SEQ: SOS FW too large\n"));
+        PspFreeFirmware(devExt);
         return STATUS_INVALID_PARAMETER;
     }
     PspFreeFirmware(devExt);
@@ -114,6 +116,7 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
     stepStatus = PspSendMailboxCommand(devExt, 0x00000008);
     if (!NT_SUCCESS(stepStatus)) {
         KdPrint(("BOOT_SEQ: SOS failed 0x%08X\n", stepStatus));
+        PspFreeFirmware(devExt);
         return stepStatus;
     }
 
@@ -211,6 +214,15 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     PspFreeTmr();
     PspKiqCleanup();
     PspFreeFirmware(devExt);
+
+    /* Clean up GPU proxy state */
+    if (g_GpuDriverHandle != NULL) {
+        ZwClose(g_GpuDriverHandle);
+        g_GpuDriverHandle = NULL;
+    }
+    g_GpuProxyAvailable = FALSE;
+    g_Bar5Mapping = NULL;
+    g_Bar5Size = 0;
 
     if (devExt->PciCfgBase != NULL) {
         MmUnmapIoSpace(devExt->PciCfgBase, devExt->PciCfgSize);
@@ -851,6 +863,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         if (!NT_SUCCESS(stepStatus)) {
             KdPrint(("BOOT_SEQ: SYSDRV failed with 0x%08X, skipping SOS\n", stepStatus));
             status = stepStatus;
+            PspFreeFirmware(devExt);
             if (outputLength >= sizeof(results)) {
                 RtlCopyMemory(outputBuffer, results, sizeof(results));
                 bytesReturned = sizeof(results);
@@ -860,6 +873,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
         if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
             KdPrint(("BOOT_SEQ: SOS FW too large (%u > %u)\n", g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
+            PspFreeFirmware(devExt);
             status = STATUS_INVALID_PARAMETER;
             break;
         }
@@ -871,10 +885,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         }
         if (devExt->FwBuffer == NULL) {
             KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
+            PspFreeFirmware(devExt);
             status = STATUS_INSUFFICIENT_RESOURCES;
             break;
         }
-        RtlZeroMemory(devExt->FwBuffer, devExt->FwSize);
+        RtlZeroMemory(devExt->FwBuffer, g_SosFirmwareSize);
         RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
         devExt->FwSize = g_SosFirmwareSize;
         devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
@@ -981,6 +996,12 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
         PVOID targetBase = (devExt->GpuMmioBase) ? devExt->GpuMmioBase : devExt->MmioBase;
+        ULONG targetSize = devExt->GpuMmioBase ? devExt->GpuMmioSize : devExt->MmioSize;
+        if (regId >= targetSize) {
+            KdPrint(("IOCTL_PSP_REG_PROG: offset 0x%X out of bounds (size=%u)\n", regId, targetSize));
+            status = STATUS_ARRAY_BOUNDS_EXCEEDED;
+            break;
+        }
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)targetBase + regId), regVal);
         ((PULONG)outputBuffer)[0] = regVal;
         bytesReturned = sizeof(ULONG);
