@@ -7,6 +7,7 @@
 extern PVOID g_Bar5Mapping;
 extern SIZE_T g_Bar5Size;
 extern KSPIN_LOCK g_Bar5MappingLock;
+extern HANDLE g_GpuDriverHandle;
 extern BOOLEAN g_GpuProxyAvailable;
 
 NTSTATUS PspGpuProxyInit(PDEVICE_EXTENSION devExt);

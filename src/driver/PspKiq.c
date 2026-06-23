@@ -58,11 +58,11 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     ULONG ringSizeDwords;
     ULONG pqControl;
 
-    KdPrint(("KIQ_HW: Programming GPU HQD registers (g_Bar5Mapping=%p, GpuMmioBase=%p)\n",
-        g_Bar5Mapping, devExt->GpuMmioBase));
+    KdPrint(("KIQ_HW: Programming GPU HQD registers (g_Bar5Mapping=%p, GpuMmioBase=%p, GpuDriverHandle=%p)\n",
+        g_Bar5Mapping, devExt->GpuMmioBase, g_GpuDriverHandle));
 
-    if (!g_Bar5Mapping && !devExt->GpuMmioBase) {
-        KdPrint(("KIQ_HW: No BAR5 mapping available, cannot program HQD\n"));
+    if (!g_Bar5Mapping && !devExt->GpuMmioBase && g_GpuDriverHandle == NULL) {
+        KdPrint(("KIQ_HW: No BAR5 mapping and no proxy handle, cannot program HQD\n"));
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -160,7 +160,7 @@ NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, UL
         return STATUS_SUCCESS;
     }
 
-    if (!devExt->MmioBase) {
+    if (!devExt->MmioBase && g_GpuDriverHandle == NULL) {
         return STATUS_DEVICE_NOT_READY;
     }
 
