@@ -392,7 +392,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         
         // Try BAR0 first for NBIO registers (0xC100, 0xC180, etc.)
         // These are accessible even without GPU driver proxy
-        if (offset >= 0xC000 && offset < 0x10000 && devExt->Bar0Base) {
+        // NOTE: Narrow range to 0xC000-0xC1FF to avoid catching GPU ring/KIQ/HQD registers
+        // which are at 0xDA60+, 0xE060+ and are NOT accessible via PSP BAR0
+        if (offset >= 0xC000 && offset < 0xC200 && devExt->Bar0Base) {
             if (outputLength < sizeof(ULONG)) {
                 status = STATUS_BUFFER_TOO_SMALL;
                 break;
@@ -457,7 +459,8 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         ULONG value = params[1];
         
         // Try BAR0 first for NBIO registers (0xC100, 0xC180, etc.)
-        if ((offset >= 0xC000 && offset < 0x10000) && devExt->Bar0Base) {
+        // NOTE: Narrow range to 0xC000-0xC1FF to avoid catching GPU ring/KIQ/HQD registers
+        if ((offset >= 0xC000 && offset < 0xC200) && devExt->Bar0Base) {
             WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->Bar0Base + offset), value);
             status = STATUS_SUCCESS;
             break;
