@@ -1,3 +1,46 @@
+## Session 2026-06-24: Code Review + Linux Register Comparison
+
+### 17 Bugs Found in GPU Driver (some affect PSP)
+| # | Severity | File | Description |
+|---|----------|------|-------------|
+| 2 | **CRITICAL** | PspKiq.c:57 | **RLC_CP_SCHEDULERS at 0xECA1 is NOT 4-byte aligned** (0xECA1 & 3 = 1) — writes go to wrong register or cause bus error |
+| 4 | **CRITICAL** | PspCore.c:17 | **IOCTL name collision** — `IOCTL_AMDBC250_BAR5_READ_PROXY` = 0x80000BCC (CTL_CODE) in GPU ioctl.h but = 0x900 (raw) in PspCore.c; same name, different value |
+| 9 | **MEDIUM** | PspKiq.c:47-60 | `PspGpuProxyWriteRegister` return value **ignored in all callers** — writes silently fail |
+| 12 | **MEDIUM** | PspKiq.c:86-94 | **Race condition on g_GpuDriverHandle proxy init** — no lock, two threads can both call PspGpuProxyInit |
+
+### Linux Register Comparison — Key Findings
+
+**KIQ model is fundamentally different:**
+- Our driver uses KIQ_BASE/CNTL/RPTR/WPTR at 0xE060-0xE078 — NOT in Linux GFX10 headers
+- Linux uses CP_HQD_* registers (MQD model) via `gfx_v10_0_kiq_init_register()` for KIQ
+- Our KIQ_BASE approach works on BC-250 but is BC-250-specific
+
+**GRBM selection:**
+- Our driver writes `GRBM_GFX_INDEX` (0x34D0) for ME/PIPE/QUEUE select
+- Linux writes `mmGRBM_GFX_CNTL` (0x0dc2) via `nv_grbm_select()` — DIFFERENT register
+- 0x34D0 confirmed writable on BC-250 but may not be the intended register
+
+**HQD registers NBIO-blocked:**
+- All CP_HQD writes at 0xDAC0+ range silently dropped by NBIO on BC-250
+- Linux uses these for KIQ init; they are unusable on our hardware
+- KIQ alias at 0xE060+ is the only usable path
+
+### KIQ Progress — RPTR Still 0
+- GRBM_GFX_INDEX (0x34D0) confirmed writable — selects ME=1 correctly
+- HQD registers at 0xDAC0+ NBIO-blocked — ACTIVE=1, PQ_BASE, PQ_CONTROL, VMID writes all return 0
+- KIQ alias writability: BASE_LO (0xE060) ✅, RPTR (0xE06C) ✅, WPTR (0xE078) ✅, ACTIVE (0xE080). READ-ONLY: SIZE (0xE068, reads 0), PQ_CTL (0xE070, reads 0x81818181)
+- MEC firmware loaded successfully (cyan_skillfish2_mec.bin, version 0x90)
+- KIQ_RPTR stays 0 despite MEC loaded, KIQ_ACTIVE=1, WPTR set, valid NOP in ring
+- KIQ_SIZE=0 read-only prevents CP from knowing ring size
+- Previous "partial HQD write" (0xDEADBEEF→0x0000BEE0) was misleading — likely stale/aliased readback
+
+### Next Steps
+1. Verify KIU firmware presence — may need separate loading beyond MEC
+2. Try VRAM ring allocation if system aperture is blocker
+3. Find correct RLC_CP_SCHEDULERS offset (4-byte aligned)
+4. Add GRBM_GFX_CNTL register (Linux uses this, not GRBM_GFX_INDEX)
+5. Fix the 4 bugs that directly affect PSP driver (RLC_CP_SCHEDULERS misalignment, IOCTL name collision, ignored return values, race condition)
+
 ## Driver Fixes Applied
 
 ### KIQ HW Register Programming (2026-06-16)

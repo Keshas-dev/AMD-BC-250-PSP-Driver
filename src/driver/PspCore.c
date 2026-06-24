@@ -83,9 +83,14 @@ NTSTATUS PspGpuProxyInit(PDEVICE_EXTENSION devExt)
 
 ULONG PspGpuProxyReadRegister(ULONG offset)
 {
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
     if (g_Bar5Mapping != NULL) {
-        return READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset));
+        ULONG val = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset));
+        KeReleaseSpinLock(&g_Bar5MappingLock, irql);
+        return val;
     }
+    KeReleaseSpinLock(&g_Bar5MappingLock, irql);
     
     if (g_GpuDriverHandle != NULL) {
         ULONG inputOffset = offset;
@@ -108,10 +113,14 @@ ULONG PspGpuProxyReadRegister(ULONG offset)
 
 BOOLEAN PspGpuProxyWriteRegister(ULONG offset, ULONG value)
 {
+    KIRQL irql;
+    KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
     if (g_Bar5Mapping != NULL) {
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset), value);
+        KeReleaseSpinLock(&g_Bar5MappingLock, irql);
         return TRUE;
     }
+    KeReleaseSpinLock(&g_Bar5MappingLock, irql);
     
     if (g_GpuDriverHandle != NULL) {
         ULONG params[2] = {offset, value};

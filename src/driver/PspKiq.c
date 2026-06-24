@@ -1,8 +1,8 @@
 // PspKiq.c - KIQ (Queue) Ring functionality for AMD BC-250 PSP
 // Programs GPU KIQ registers so hardware can execute PM4 commands from the ring.
-// NOTE: Only KIQ_BASE/WPTR/RPTR registers are used. HQD registers (0xDAC0+)
-// are write-protected without CP firmware and GRBM_GFX_INDEX (0x34D0) is
-// dangerous on BC-250 (can cause GPU hang). Both are skipped.
+// NOTE: Only KIQ_BASE/WPTR/RPTR registers are used. HQD registers (0xDAC0+),
+// RLC_CP_SCHEDULERS (dangerous unaligned), and ME_CNTL (unhalts unloaded PFP/CE)
+// are deliberately NOT written. Firmware loader handles halt bits.
 #include <ntddk.h>
 #include <wdm.h>
 #include "PspIoctl.h"
@@ -30,6 +30,8 @@
 /* Global WPTR polling page */
 static PVOID g_WptrPollVa = NULL;
 static PHYSICAL_ADDRESS g_WptrPollPa = {0};
+
+static LONG g_KiqInitGuard = 0;
 
 static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
 {
@@ -72,12 +74,23 @@ NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, UL
 
     UNREFERENCED_PARAMETER(cmdBufSize);
 
-    if (g_KiqRingInitialized) {
+    if (InterlockedCompareExchange(&g_KiqInitGuard, 1, 0) != 0) {
+        if (g_KiqRingInitialized) return STATUS_SUCCESS;
+        while (!g_KiqRingInitialized) {
+            KeStallExecutionProcessor(1);
+        }
         return STATUS_SUCCESS;
     }
 
-    if (!devExt->MmioBase && g_GpuDriverHandle == NULL) {
-        return STATUS_DEVICE_NOT_READY;
+    /* If no direct BAR5 mapping AND no proxy handle, try proxy init first */
+    if (!devExt->MmioBase) {
+        if (g_GpuDriverHandle == NULL) {
+            NTSTATUS proxySt = PspGpuProxyInit(devExt);
+            if (!NT_SUCCESS(proxySt)) {
+                g_KiqInitGuard = 0;
+                return STATUS_DEVICE_NOT_READY;
+            }
+        }
     }
 
     /* Allocate ring buffer (non-cached for GPU coherency) */
@@ -95,6 +108,7 @@ NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, UL
                 lowAddr, highAddr, boundary, MmNonCached);
         }
         if (!g_KiqRingVa) {
+            g_KiqInitGuard = 0;
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         RtlZeroMemory(g_KiqRingVa, ringSize ? ringSize : 0x2000);

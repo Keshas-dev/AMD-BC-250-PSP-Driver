@@ -221,8 +221,13 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
         g_GpuDriverHandle = NULL;
     }
     g_GpuProxyAvailable = FALSE;
-    g_Bar5Mapping = NULL;
-    g_Bar5Size = 0;
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
+        g_Bar5Mapping = NULL;
+        g_Bar5Size = 0;
+        KeReleaseSpinLock(&g_Bar5MappingLock, irql);
+    }
 
     if (devExt->PciCfgBase != NULL) {
         MmUnmapIoSpace(devExt->PciCfgBase, devExt->PciCfgSize);
@@ -323,6 +328,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 physAddr.QuadPart, devExt->Bar0Base, size));
         } else {
             if (devExt->GpuMmioBase != NULL) {
+                KIRQL irql;
+                KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
+                g_Bar5Mapping = NULL;
+                KeReleaseSpinLock(&g_Bar5MappingLock, irql);
                 MmUnmapIoSpace(devExt->GpuMmioBase, devExt->GpuMmioSize);
             }
             devExt->GpuMmioBase = MmMapIoSpace(physAddr, size, MmNonCached);
@@ -345,8 +354,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 devExt->MmioSize = size;
             }
             if (g_Bar5Mapping == NULL) {
+                KIRQL irql;
+                KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
                 g_Bar5Mapping = devExt->GpuMmioBase;
                 g_Bar5Size = size;
+                KeReleaseSpinLock(&g_Bar5MappingLock, irql);
             }
             KdPrint(("INIT_HW: GPU BAR5 mapped: PA=0x%llX VA=%p size=%u (g_Bar5Mapping=%p)\n",
                 physAddr.QuadPart, devExt->GpuMmioBase, size, g_Bar5Mapping));
