@@ -53,8 +53,10 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     PspGpuProxyWriteRegister(GPU_CP_KIQ_RPTR, 0);
     PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, 0);
 
-    /* 3. Notify RLC scheduler */
-    PspGpuProxyWriteRegister(GPU_RLC_CP_SCHEDULERS, RLC_SCHEDULERS_KIQ);
+    /* 3. Notify RLC scheduler — SKIPPED: RLC_CP_SCHEDULERS at 0xECA1 is NOT 4-byte aligned
+     *    (0xECA1 & 3 = 1, writes go to 0xECA0). Correct aligned offset unknown.
+     *    KIQ works without RLC scheduler notification on BC-250. */
+    // PspGpuProxyWriteRegister(GPU_RLC_CP_SCHEDULERS, RLC_SCHEDULERS_KIQ);
 
     /* 4. Ensure CP is unhalted */
     PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, 0);

@@ -13,9 +13,11 @@ extern BOOLEAN g_GpuProxyAvailable;
 extern HANDLE g_GpuDriverHandle;
 
 /* GPU driver uses raw IOCTL values 0x900/0x901 in its switch statement,
- * NOT CTL_CODE values. We must match exactly. */
-#define IOCTL_AMDBC250_BAR5_READ_PROXY  0x900
-#define IOCTL_AMDBC250_BAR5_WRITE_PROXY 0x901
+ * NOT CTL_CODE values. We must match exactly.
+ * NOTE: Named IOCTL_AMDBC250_BAR5_READ_PROXY_RAW to avoid collision with
+ * GPU driver's CTL_CODE version (0x80000BCC) which is a different value. */
+#define IOCTL_AMDBC250_BAR5_READ_PROXY_RAW  0x900
+#define IOCTL_AMDBC250_BAR5_WRITE_PROXY_RAW 0x901
 
 static BOOLEAN g_GpuProxyInitialized = FALSE;
 
@@ -99,7 +101,7 @@ ULONG PspGpuProxyReadRegister(ULONG offset)
         NTSTATUS status;
         
         status = ZwDeviceIoControlFile(g_GpuDriverHandle, NULL, NULL, NULL, &ioStatus,
-                                        IOCTL_AMDBC250_BAR5_READ_PROXY,
+                                        IOCTL_AMDBC250_BAR5_READ_PROXY_RAW,
                                         &inputOffset, sizeof(inputOffset), 
                                         &outputValue, sizeof(outputValue));
         if (NT_SUCCESS(status)) {
@@ -128,7 +130,7 @@ BOOLEAN PspGpuProxyWriteRegister(ULONG offset, ULONG value)
         NTSTATUS status;
         
         status = ZwDeviceIoControlFile(g_GpuDriverHandle, NULL, NULL, NULL, &ioStatus,
-                                        IOCTL_AMDBC250_BAR5_WRITE_PROXY,
+                                        IOCTL_AMDBC250_BAR5_WRITE_PROXY_RAW,
                                         params, sizeof(params), NULL, 0);
         return NT_SUCCESS(status);
     }
