@@ -753,3 +753,60 @@ test-psp-driver.exe -m                       # C2PMSG_81 - 0xF0000010 (PSP alive
 - **Svarbiausias bug'as**: `g_RingBuffer[0x1000]` statinis masyvas (C53) turi neteisingą fizinį adresą
   - Reikia `MmAllocateContiguousMemory(0x1000)` vietoje statinio masyvo
   - Tačiau TOS ring protokolas neleidžiamas šio SOS → nėra prioritetas
+
+---
+
+## GPU Driver Progress (2026-06-26) — Affects PSP KIQ Path
+
+### Software PM4 Executor — KIQ_SIZE=0 Block Confirmed
+- **GPU driver implemented `DreamV3SwPm4Process`** — software PM4 executor that translates PM4 packets (IT_NOP, IT_WRITE_DATA, IT_EVENT_WRITE_EOP, IT_RELEASE_MEM, PM4_TYPE_0) to direct register MMIO writes
+- **FUNDAMENTAL BLOCKER**: KIQ_SIZE (0xE068) is factory **read-only = 0** — hardware thinks ring has 0 bytes, CP refuses to process
+- KIQ_SIZE not found in MEC firmware binary — check is **hardware-level**, not patchable
+- **PATH 3 fallback** in SEND_PM4 IOCTL: when PSP KIQ (Path 1) AND GfxRing (Path 2) are both unavailable, falls through to software PM4 executor
+
+### PSP Driver KIQ — Same Block
+- PSP driver's KIQ ring (via PspKiq.c) exhibits same behavior: WPTR advances but RPTR stays 0
+- **KIQ_SIZE=0 affects PSP KIQ too** — both GPU and PSP KIQ paths hit the same hardware block
+
+### IC_BASE Register Fixes (Affects FW Loading via PSP)
+- Fixed IC_BASE register offsets (was 0x7C10-0x7C18, corrected to 0x17390-0x17398)
+- Fixed IC_BASE_CNTL: write 0 (not 0x100), write LO/HI before CNTL to prevent premature DMA
+- Added UCODE_ADDR polling (500ms timeout) before unhalt to confirm DMA completion
+- **Sequence must match Linux**: write LO → HI → CNTL=0 → upload JT → write version → poll → unhalt
+
+### CP_HQD_* Registers Completely NBIO-Blocked (0xDAC0-0xDBFF)
+- ALL CP_HQD registers (ACTIVE, VMID, PQ_BASE, PQ_CONTROL, PQ_WPTR_LO, PQ_RPTR) confirmed NBIO-blocked
+- PSP driver's `PspKiqProgramHwRegisters` writes to these registers via GPU proxy — **writes are silently dropped**
+- GRBM_GFX_CNTL (0x2022) does NOT enable HQD access on BC-250
+- **KIQ_BASE alias at 0xE060+ is the only writable path** for KIQ on BC-250
+
+### KIQ_WPTR 9-bit Limit
+- KIQ_WPTR (0xE078) is only 9 bits (mask 0x1FF) — max ring 512 dwords (2048 bytes)
+- Values beyond 0x3FF read back as `value & 0x1FF`
+
+### MEC Firmware Execution Verified
+- Corrupting MEC ucode at offset 0x41830 → SCRATCH changed from written value to 0x00000000
+- Proves MEC engine executes loaded firmware and modifies memory
+- MEC2 firmware has real ARM64 ucode (MEC1 has 0x78 0x80 NOP pattern) but KIQ behavior identical
+
+### SCRATCH Register Behavior
+- SCRATCH (0x32D4) is writable via IOCTL but high nibble [31:28] hardware-masked (e.g., 0xCAFEBABE → 0x4AFEBABE)
+- Confirmed via IT_WRITE_DATA PM4 → direct MMIO readback shows masked value
+
+### RLC Firmware Loading Skipped
+- RLC registers (0x3A00-0x3A50) are in the FREEZE ZONE (0x3400-0x8100) on BC-250
+- BIOS/SMU handles RLC firmware loading
+- DreamV3InitRlc in rlc.c is a no-op
+
+### PM4 Header Format Correction
+- ALL existing test tools (GPU and PSP) used wrong PM4 TYPE3 header (`0xC0370003` instead of `0xC0023700`)
+- Correct: `PM4_TYPE3_HDR(op, count) = (3<<30) | ((count-1)<<16) | (op<<8)`
+- `0xC0370003` encodes opcode=0 (NOP), count=56 — wrong for IT_WRITE_DATA
+- `0xC0023700` encodes opcode=0x37 (IT_WRITE_DATA), count=4 — correct
+- Header fix confirmed by working software PM4 executor test
+
+### Path Forward
+- **Software PM4 executor is the working path** — all hardware ring paths factory-locked
+- PSP driver KIQ path (Path 1) remains as fallback but will hit KIQ_SIZE=0 block
+- GPU driver SEND_PM4 now has PATH 3 (software PM4) working as confirmed working bypass
+- All existing test tools using wrong headers need updating (not urgent since KIQ never processes)

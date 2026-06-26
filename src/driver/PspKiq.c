@@ -15,7 +15,7 @@
 #define GPU_CP_KIQ_BASE_HI              0xE064
 #define GPU_CP_KIQ_RPTR                 0xE06C
 #define GPU_CP_KIQ_WPTR                 0xE078
-#define GPU_RLC_CP_SCHEDULERS           0xECA1
+#define GPU_RLC_CP_SCHEDULERS           0xECA8
 
 /* CP_ME_CNTL bits */
 #define ME_CNTL_ME_HALT   (1u << 28)
@@ -30,6 +30,9 @@
 /* Global WPTR polling page */
 static PVOID g_WptrPollVa = NULL;
 static PHYSICAL_ADDRESS g_WptrPollPa = {0};
+
+/* Firmware DMA buffer — kept alive until next load or unload to prevent GPU DMA from reading freed memory */
+static PVOID g_FirmwareDmaBuffer = NULL;
 
 static LONG g_KiqInitGuard = 0;
 
@@ -53,8 +56,8 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     PspGpuProxyWriteRegister(GPU_CP_KIQ_RPTR, 0);
     PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, 0);
 
-    /* 3. Notify RLC scheduler — SKIPPED: RLC_CP_SCHEDULERS at 0xECA1 is NOT 4-byte aligned
-     *    (0xECA1 & 3 = 1, writes go to 0xECA0). Correct aligned offset unknown.
+    /* 3. Notify RLC scheduler — SKIPPED: RLC_CP_SCHEDULERS was previously at 0xECA1
+     *    (unaligned, not 4-byte aligned). Correct offset is 0xECA8 (empirically confirmed).
      *    KIQ works without RLC scheduler notification on BC-250. */
     // PspGpuProxyWriteRegister(GPU_RLC_CP_SCHEDULERS, RLC_SCHEDULERS_KIQ);
 
@@ -190,6 +193,23 @@ NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req)
     KeAcquireSpinLock(&g_KiqRingLock, &irql);
 
     wptr = g_KiqRingWptr;
+
+    /* Check ring capacity */
+    {
+        UINT32 ringDwords = g_KiqRingSize / sizeof(ULONG);
+        UINT32 rptr = PspGpuProxyReadRegister(GPU_CP_KIQ_RPTR);
+        UINT32 used;
+        if (wptr >= rptr) {
+            used = wptr - rptr;
+        } else {
+            used = ringDwords - rptr + wptr;
+        }
+        if (used + req->CommandCount > ringDwords) {
+            KeReleaseSpinLock(&g_KiqRingLock, irql);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+    }
+
     for (i = 0; i < req->CommandCount; i++) {
         ((volatile PULONG)(g_KiqRingVa))[wptr] = req->Commands[i];
         wptr++;
@@ -222,6 +242,12 @@ VOID PspKiqCleanup(VOID)
         PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, ME_CNTL_ME_HALT | ME_CNTL_PFP_HALT);
     }
 
+    /* Free firmware DMA buffer */
+    if (g_FirmwareDmaBuffer) {
+        MmFreeContiguousMemory(g_FirmwareDmaBuffer);
+        g_FirmwareDmaBuffer = NULL;
+    }
+
     /* Free WPTR polling page */
     if (g_WptrPollVa) {
         MmFreeContiguousMemory(g_WptrPollVa);
@@ -239,6 +265,7 @@ VOID PspKiqCleanup(VOID)
         g_KiqRingInitialized = FALSE;
         KdPrint(("PspKiqCleanup: ring buffer freed\n"));
     }
+    g_KiqInitGuard = 0;
 }
 
 NTSTATUS PspKiqLoadFirmware(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize, PUCHAR FwData)
@@ -265,13 +292,37 @@ NTSTATUS PspKiqLoadFirmware(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize
         return STATUS_INVALID_BUFFER_SIZE;
     }
 
+    /* Free previous firmware DMA buffer before allocating new one */
+    if (g_FirmwareDmaBuffer != NULL) {
+        MmFreeContiguousMemory(g_FirmwareDmaBuffer);
+        g_FirmwareDmaBuffer = NULL;
+    }
+
+    /* Allocate contiguous non-paged buffer for DMA — FwData may span multiple
+     * IOCTL pages; MmGetPhysicalAddress on SystemBuffer only returns the first page */
+    {
+        PHYSICAL_ADDRESS lowAddr, highAddr;
+        lowAddr.QuadPart = 0;
+        highAddr.QuadPart = 0xFFFFFFFFFFFFFFFFULL;
+        g_FirmwareDmaBuffer = MmAllocateContiguousMemorySpecifyCache(
+            FwSize, lowAddr, highAddr, lowAddr, MmNonCached);
+        if (g_FirmwareDmaBuffer == NULL) {
+            g_FirmwareDmaBuffer = MmAllocateContiguousMemory(FwSize, highAddr);
+        }
+        if (g_FirmwareDmaBuffer == NULL) {
+            KdPrint(("PspKiqLoadFirmware: DMA buffer alloc failed (size=%u)\n", FwSize));
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlCopyMemory(g_FirmwareDmaBuffer, FwData, FwSize);
+        fwPa = MmGetPhysicalAddress(g_FirmwareDmaBuffer);
+    }
+
     RtlZeroMemory(cmd, sizeof(cmd));
 
     cmd[0] = 1024;
     cmd[1] = 1;
     cmd[2] = 0x06; // LOAD_IP_FW
 
-    fwPa = MmGetPhysicalAddress(FwData);
     cmd[7] = (ULONG)(fwPa.QuadPart & 0xFFFFFFFF);
     cmd[8] = (ULONG)(fwPa.QuadPart >> 32);
     cmd[9] = FwSize;
@@ -288,6 +339,10 @@ NTSTATUS PspKiqLoadFirmware(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize
     }
 
     status = PspKiqSubmit(devExt, &req);
+
+    /* NOTE: g_FirmwareDmaBuffer is NOT freed here — GPU DMA may still be reading it.
+     * It is freed on the next PspKiqLoadFirmware call or in PspKiqCleanup. */
+
     return status;
 }
 
@@ -315,6 +370,23 @@ NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST r
     /* Write PM4 commands to ring */
     KeAcquireSpinLock(&g_KiqRingLock, &irql);
     wptr = g_KiqRingWptr;
+
+    /* Check ring capacity */
+    {
+        UINT32 ringDwords = g_KiqRingSize / sizeof(ULONG);
+        UINT32 rptr = PspGpuProxyReadRegister(GPU_CP_KIQ_RPTR);
+        UINT32 used;
+        if (wptr >= rptr) {
+            used = wptr - rptr;
+        } else {
+            used = ringDwords - rptr + wptr;
+        }
+        if (used + req->CommandCount > ringDwords) {
+            KeReleaseSpinLock(&g_KiqRingLock, irql);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+    }
+
     for (i = 0; i < req->CommandCount; i++) {
         ((volatile PULONG)(g_KiqRingVa))[wptr] = req->Commands[i];
         wptr++;
