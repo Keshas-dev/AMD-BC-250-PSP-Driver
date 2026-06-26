@@ -27,6 +27,9 @@
 /* WPTR polling page size */
 #define WPTR_POLL_PAGE_SIZE 0x1000
 
+/* KIQ_WPTR is 9-bit only (mask 0x1FF) — max ring = 512 DWORDs = 2048 bytes */
+#define KIQ_MAX_RING_SIZE   2048
+
 /* Global WPTR polling page */
 static PVOID g_WptrPollVa = NULL;
 static PHYSICAL_ADDRESS g_WptrPollPa = {0};
@@ -47,10 +50,16 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     }
 
     /* 1. Set KIQ_BASE (KIQ engine reads commands from here!) */
-    PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_LO,
-        (ULONG)(g_KiqRingPa.QuadPart & 0xFFFFFFFF));
-    PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_HI,
-        (ULONG)(g_KiqRingPa.QuadPart >> 32));
+    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_LO,
+            (ULONG)(g_KiqRingPa.QuadPart & 0xFFFFFFFF))) {
+        KdPrint(("KIQ_HW: Failed to write KIQ_BASE_LO\n"));
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_HI,
+            (ULONG)(g_KiqRingPa.QuadPart >> 32))) {
+        KdPrint(("KIQ_HW: Failed to write KIQ_BASE_HI\n"));
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     /* 2. Clear RPTR + WPTR */
     PspGpuProxyWriteRegister(GPU_CP_KIQ_RPTR, 0);
@@ -79,6 +88,14 @@ NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, UL
 
     UNREFERENCED_PARAMETER(cmdBufSize);
 
+    /* Cap ring size to KIQ_WPTR 9-bit limit (max 512 DWORDs = 2048 bytes) */
+    if (ringSize == 0) {
+        ringSize = KIQ_MAX_RING_SIZE;
+    } else if (ringSize > KIQ_MAX_RING_SIZE) {
+        KdPrint(("KIQ: ringSize %u capped to %u (9-bit WPTR limit)\n", ringSize, KIQ_MAX_RING_SIZE));
+        ringSize = KIQ_MAX_RING_SIZE;
+    }
+
     if (InterlockedCompareExchange(&g_KiqInitGuard, 1, 0) != 0) {
         if (g_KiqRingInitialized) return STATUS_SUCCESS;
         while (!g_KiqRingInitialized) {
@@ -104,21 +121,19 @@ NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, UL
         highAddr.QuadPart = 0x100000000ULL;
         boundary.QuadPart = 0;
         g_KiqRingVa = MmAllocateContiguousMemorySpecifyCache(
-            ringSize ? ringSize : 0x2000,
-            lowAddr, highAddr, boundary, MmNonCached);
+            ringSize, lowAddr, highAddr, boundary, MmNonCached);
         if (!g_KiqRingVa) {
             highAddr.QuadPart = 0xFFFFFFFF;
             g_KiqRingVa = MmAllocateContiguousMemorySpecifyCache(
-                ringSize ? ringSize : 0x2000,
-                lowAddr, highAddr, boundary, MmNonCached);
+                ringSize, lowAddr, highAddr, boundary, MmNonCached);
         }
         if (!g_KiqRingVa) {
             g_KiqInitGuard = 0;
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        RtlZeroMemory(g_KiqRingVa, ringSize ? ringSize : 0x2000);
+        RtlZeroMemory(g_KiqRingVa, ringSize);
         g_KiqRingPa = MmGetPhysicalAddress(g_KiqRingVa);
-        g_KiqRingSize = ringSize ? ringSize : 0x2000;
+        g_KiqRingSize = ringSize;
     }
 
     if (ringPA) {
@@ -230,7 +245,9 @@ NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req)
     }
 
     /* Update WPTR in GPU KIQ register */
-    PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, wptr);
+    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, wptr)) {
+        KdPrint(("KIQ: WARNING — Write WPTR=%u via proxy failed\n", wptr));
+    }
 
     return STATUS_SUCCESS;
 }
@@ -320,7 +337,7 @@ NTSTATUS PspKiqLoadFirmware(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize
     RtlZeroMemory(cmd, sizeof(cmd));
 
     cmd[0] = 1024;
-    cmd[1] = 1;
+    cmd[1] = 4;  /* body_size = 4 DWORDs (fw_pa_lo/hi, fw_size, fw_type) */
     cmd[2] = 0x06; // LOAD_IP_FW
 
     cmd[7] = (ULONG)(fwPa.QuadPart & 0xFFFFFFFF);
@@ -406,7 +423,9 @@ NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST r
     }
 
     /* Kick GPU via KIQ WPTR */
-    PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, wptr);
+    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, wptr)) {
+        KdPrint(("GPU_PM4: WARNING — Write WPTR=%u via proxy failed\n", wptr));
+    }
 
     resp->Pm4Dwords = req->CommandCount;
     resp->KiqRingWptr = wptr;

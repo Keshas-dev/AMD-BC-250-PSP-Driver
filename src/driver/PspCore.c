@@ -57,18 +57,25 @@ NTSTATUS PspOpenGpuDriver(void)
 NTSTATUS PspGpuProxyInit(PDEVICE_EXTENSION devExt)
 {
     ULONG testValue;
+    KIRQL irql;
+    
+    KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
     
     if (g_GpuProxyAvailable && g_GpuDriverHandle != NULL) {
+        KeReleaseSpinLock(&g_Bar5MappingLock, irql);
         return STATUS_SUCCESS;
     }
     
     if (g_GpuDriverHandle == NULL) {
         NTSTATUS status = PspOpenGpuDriver();
         if (!NT_SUCCESS(status)) {
+            KeReleaseSpinLock(&g_Bar5MappingLock, irql);
             KdPrint(("PSP_GPU_PROXY: Failed to open GPU driver: 0x%08X\n", status));
             return status;
         }
     }
+    
+    KeReleaseSpinLock(&g_Bar5MappingLock, irql);
     
     testValue = PspGpuProxyReadRegister(0);
     KdPrint(("PSP_GPU_PROXY: Test read from offset 0: 0x%08X\n", testValue));
@@ -78,8 +85,10 @@ NTSTATUS PspGpuProxyInit(PDEVICE_EXTENSION devExt)
         return STATUS_DEVICE_NOT_READY;
     }
     
+    KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
     g_GpuProxyAvailable = TRUE;
     g_GpuProxyInitialized = TRUE;
+    KeReleaseSpinLock(&g_Bar5MappingLock, irql);
     return STATUS_SUCCESS;
 }
 
@@ -213,9 +222,13 @@ NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command)
     mboxBase = (g_Bar5Mapping != NULL) ? g_Bar5Mapping : mboxBase;
 
     if (useGpuProxy && g_GpuProxyAvailable) {
-        PspGpuProxyWriteRegister(PSP_C2PMSG_36_OFFSET, (ULONG)(devExt->FwPhysical.QuadPart & 0xFFFFFFFF));
-        PspGpuProxyWriteRegister(PSP_C2PMSG_37_OFFSET, (ULONG)(devExt->FwPhysical.QuadPart >> 32));
-        PspGpuProxyWriteRegister(PSP_C2PMSG_35_OFFSET, command);
+        if (!PspGpuProxyWriteRegister(PSP_C2PMSG_36_OFFSET, (ULONG)(devExt->FwPhysical.QuadPart & 0xFFFFFFFF)) ||
+            !PspGpuProxyWriteRegister(PSP_C2PMSG_37_OFFSET, (ULONG)(devExt->FwPhysical.QuadPart >> 32)) ||
+            !PspGpuProxyWriteRegister(PSP_C2PMSG_35_OFFSET, command)) {
+            KeReleaseSpinLock(&devExt->CommandLock, irql);
+            KdPrint(("Mailbox: GPU proxy write failed\n"));
+            return STATUS_DEVICE_NOT_READY;
+        }
         KdPrint(("Mailbox: PA=0x%llX cmd=0x%08X written via GPU proxy\n",
             devExt->FwPhysical.QuadPart, command));
     } else {
@@ -342,9 +355,15 @@ NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwS
     KeAcquireSpinLock(&devExt->CommandLock, &irql);
 
     if (g_GpuProxyAvailable) {
-        PspGpuProxyWriteRegister(PSP_C2PMSG_36_OFFSET, (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF));
-        PspGpuProxyWriteRegister(PSP_C2PMSG_37_OFFSET, (ULONG)(cmdBufPa.QuadPart >> 32));
-        PspGpuProxyWriteRegister(PSP_C2PMSG_35_OFFSET, GFX_CMD_ID_LOAD_IP_FW);
+        if (!PspGpuProxyWriteRegister(PSP_C2PMSG_36_OFFSET, (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF)) ||
+            !PspGpuProxyWriteRegister(PSP_C2PMSG_37_OFFSET, (ULONG)(cmdBufPa.QuadPart >> 32)) ||
+            !PspGpuProxyWriteRegister(PSP_C2PMSG_35_OFFSET, GFX_CMD_ID_LOAD_IP_FW)) {
+            KeReleaseSpinLock(&devExt->CommandLock, irql);
+            KdPrint(("LOAD_IP_FW_MAILBOX: GPU proxy write failed\n"));
+            MmFreeContiguousMemory(cmdBufVa);
+            MmFreeContiguousMemory(fwBufVa);
+            return STATUS_DEVICE_NOT_READY;
+        }
     } else {
         mboxBase = (g_Bar5Mapping != NULL) ? g_Bar5Mapping : mboxBase;
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_36_OFFSET),

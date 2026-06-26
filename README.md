@@ -45,7 +45,16 @@ The GPU driver repo contains the full SMU v11.8 analysis. Key findings:
 
 See [GPU driver README](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver) for details.
 
-The PSP driver repository can also be found at: https://github.com/Keshas-dev/AMD-BC-250-PSP-Windows-Driver
+## Bug Fixes (2026-06-26)
+
+Four bugs were identified and fixed in a code review session:
+
+| # | File | Bug | Impact | Fix |
+|---|------|-----|--------|-----|
+| 1 | `PspKiq.c:323` | `body_size=1` in LOAD_IP_FW command should be `4` | Last 3 DWORDs of payload (fw_pa_hi, fw_size, fw_type) were zeroed — firmware load would use wrong physical address | Changed to `body_size=4` matching `PspCore.c:327` |
+| 2 | `PspKiq.c` | Default KIQ ring size `0x2000` (2048 DWORDs) exceeds 9-bit WPTR max (512 DWORDs) | WPTR wraps at 2048 but GPU only sees bottom 9 bits (0x000) — GPU reads from wrong ring location | Default capped at 2048 bytes (512 DWORDs) via `KIQ_MAX_RING_SIZE` |
+| 3 | `PspKiq.c`, `PspCore.c` | `PspGpuProxyWriteRegister` return BOOLEAN ignored throughout | Silent write failure — hardware register not programmed, no error reported | KIQ_BASE_LO/HI writes now fail-return; mailbox writes checked atomically; WPTR kick failures logged |
+| 4 | `PspCore.c:57-84` | Race condition in `PspGpuProxyInit` — `g_GpuDriverHandle` open + proxy check unprotected | Two threads could both open GPU driver handle; second overwrites first | Protected by `g_Bar5MappingLock` spinlock |
 
 ## Critical Discovery: BC-250 Register Map
 
@@ -89,7 +98,10 @@ Register reads at the corrected offsets return valid values with no system insta
 ```
 ├── src/
 │   ├── driver/          # Kernel driver source
-│   │   └── PspDriver.c
+│   │   ├── PspDriver.c  # DriverEntry, IOCTL dispatch
+│   │   ├── PspCore.c    # Mailbox, proxy bridge, firmware loading
+│   │   ├── PspKiq.c     # KIQ ring management
+│   │   └── PspSmu.c     # SMU v11.8 communication
 │   └── test/            # User-mode test tools
 │       └── test-psp-driver.c
 ├── inc/                 # Shared headers
@@ -104,7 +116,6 @@ Register reads at the corrected offsets return valid values with no system insta
 │   ├── install-driver.cmd
 │   └── uninstall-driver.cmd
 ├── docs/
-│   ├── tikslas.txt
 │   └── AGENTS.md
 ├── README.md
 └── .gitignore
@@ -254,7 +265,7 @@ See `inc/PspIoctl.h` for full definitions:
 | `PSP_GET_GPU_INFO` | 0x815 | Bridge info for GPU driver |
 | `PSP_REG_PROG` | 0x816 | Program register via ring |
 | `PSP_AUTOLOAD_RLC` | 0x817 | Trigger RLC autoload |
-| `PSP_KIQ_SUBMIT` | 0x818 | KIQ ring submit (TODO) |
+| `PSP_KIQ_SUBMIT` | 0x818 | KIQ ring submit |
 | `PSP_INIT_TMR` | 0x819 | Init Trusted Memory Region |
 
 ### GPU Driver Proxy IOCTLs (Windows 11 26100)
@@ -308,6 +319,7 @@ test-psp-driver.exe  ---->   PspDriver.sys  ---->   GPU Driver (atikmdag.sys)
 - **PSP proxy bridge** — GPU driver can read/write registers through PSP driver
 - **GC registers at corrected offsets** — 0x3260, 0x3264, 0x34FC all return valid values
 - **Windows 11 26100 compatibility** — GPU proxy fallback when BAR5 mapping is blocked
+- **All code review bugs fixed** — body_size mismatch, ring size cap (9-bit WPTR), proxy write return checks, race condition
 
 ### Windows 11 26100 Compatibility
 
