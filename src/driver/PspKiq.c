@@ -62,8 +62,12 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     }
 
     /* 2. Clear RPTR + WPTR */
-    PspGpuProxyWriteRegister(GPU_CP_KIQ_RPTR, 0);
-    PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, 0);
+    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_RPTR, 0)) {
+        KdPrint(("KIQ_HW: Failed to clear KIQ_RPTR\n"));
+    }
+    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, 0)) {
+        KdPrint(("KIQ_HW: Failed to clear KIQ_WPTR\n"));
+    }
 
     /* 3. Notify RLC scheduler — SKIPPED: RLC_CP_SCHEDULERS was previously at 0xECA1
      *    (unaligned, not 4-byte aligned). Correct offset is 0xECA8 (empirically confirmed).
@@ -71,7 +75,9 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     // PspGpuProxyWriteRegister(GPU_RLC_CP_SCHEDULERS, RLC_SCHEDULERS_KIQ);
 
     /* 4. Ensure CP is unhalted */
-    PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, 0);
+    if (!PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, 0)) {
+        KdPrint(("KIQ_HW: Failed to unhalt CP\n"));
+    }
     KeStallExecutionProcessor(100);
 
     KdPrint(("KIQ_HW: KIQ programmed — ring PA=0x%llX size=%u\n",

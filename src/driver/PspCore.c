@@ -95,21 +95,31 @@ NTSTATUS PspGpuProxyInit(PDEVICE_EXTENSION devExt)
 ULONG PspGpuProxyReadRegister(ULONG offset)
 {
     KIRQL irql;
+    HANDLE localHandle;
+    BOOLEAN useProxy = FALSE;
+
     KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
     if (g_Bar5Mapping != NULL) {
         ULONG val = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset));
         KeReleaseSpinLock(&g_Bar5MappingLock, irql);
         return val;
     }
+    /* Snapshot handle under lock — g_GpuDriverHandle is set once and never modified after init,
+     * so the handle is stable once observed as non-NULL. ZwDeviceIoControlFile is called
+     * outside the lock to avoid holding a spinlock during IOCTL dispatch. */
+    if (g_GpuDriverHandle != NULL) {
+        localHandle = g_GpuDriverHandle;
+        useProxy = TRUE;
+    }
     KeReleaseSpinLock(&g_Bar5MappingLock, irql);
     
-    if (g_GpuDriverHandle != NULL) {
+    if (useProxy) {
         ULONG inputOffset = offset;
         ULONG outputValue = 0;
         IO_STATUS_BLOCK ioStatus;
         NTSTATUS status;
         
-        status = ZwDeviceIoControlFile(g_GpuDriverHandle, NULL, NULL, NULL, &ioStatus,
+        status = ZwDeviceIoControlFile(localHandle, NULL, NULL, NULL, &ioStatus,
                                         IOCTL_AMDBC250_BAR5_READ_PROXY_RAW,
                                         &inputOffset, sizeof(inputOffset), 
                                         &outputValue, sizeof(outputValue));
@@ -125,20 +135,28 @@ ULONG PspGpuProxyReadRegister(ULONG offset)
 BOOLEAN PspGpuProxyWriteRegister(ULONG offset, ULONG value)
 {
     KIRQL irql;
+    HANDLE localHandle;
+    BOOLEAN useProxy = FALSE;
+
     KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
     if (g_Bar5Mapping != NULL) {
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset), value);
         KeReleaseSpinLock(&g_Bar5MappingLock, irql);
         return TRUE;
     }
+    /* Snapshot handle under lock — handle is stable once non-NULL (set once, never closed). */
+    if (g_GpuDriverHandle != NULL) {
+        localHandle = g_GpuDriverHandle;
+        useProxy = TRUE;
+    }
     KeReleaseSpinLock(&g_Bar5MappingLock, irql);
     
-    if (g_GpuDriverHandle != NULL) {
+    if (useProxy) {
         ULONG params[2] = {offset, value};
         IO_STATUS_BLOCK ioStatus;
         NTSTATUS status;
         
-        status = ZwDeviceIoControlFile(g_GpuDriverHandle, NULL, NULL, NULL, &ioStatus,
+        status = ZwDeviceIoControlFile(localHandle, NULL, NULL, NULL, &ioStatus,
                                         IOCTL_AMDBC250_BAR5_WRITE_PROXY_RAW,
                                         params, sizeof(params), NULL, 0);
         return NT_SUCCESS(status);

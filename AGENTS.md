@@ -1,14 +1,17 @@
-## Session 2026-06-24: Code Review + Linux Register Comparison
+## Session 2026-06-30: All PSP Bugs Fixed
 
-### 17 Bugs Found in GPU Driver (some affect PSP)
-| # | Severity | File | Description |
-|---|----------|------|-------------|
-| 2 | **CRITICAL** | PspKiq.c:57 | **RLC_CP_SCHEDULERS at 0xECA1 is NOT 4-byte aligned** (0xECA1 & 3 = 1) — writes go to wrong register or cause bus error |
-| 4 | **CRITICAL** | PspCore.c:17 | **IOCTL name collision** — `IOCTL_AMDBC250_BAR5_READ_PROXY` = 0x80000BCC (CTL_CODE) in GPU ioctl.h but = 0x900 (raw) in PspCore.c; same name, different value |
-| 9 | **MEDIUM** | PspKiq.c:47-60 | `PspGpuProxyWriteRegister` return value **ignored in all callers** — writes silently fail |
-| 12 | **MEDIUM** | PspKiq.c:86-94 | **Race condition on g_GpuDriverHandle proxy init** — no lock, two threads can both call PspGpuProxyInit |
+### PSP Bug Fix Status
 
-### Linux Register Comparison — Key Findings
+| # | Description | Status | Fix |
+|---|-------------|--------|-----|
+| 2 | RLC_CP_SCHEDULERS at 0xECA1 not 4-byte aligned (PspKiq.c:57) | **FIXED** | Uses 0xECA8 (empirically confirmed writable) |
+| 4 | IOCTL name collision — same name `IOCTL_AMDBC250_BAR5_READ_PROXY`, different values | **FIXED** | PSP uses `IOCTL_AMDBC250_BAR5_READ_PROXY_RAW` (0x900) to distinguish |
+| 9 | `PspGpuProxyWriteRegister` return value ignored in callers (PspKiq.c:47-60) | **FIXED** | Return values checked in PspKiqInit/PspKiqSubmit |
+| 12 | Race condition on g_GpuDriverHandle proxy init (PspKiq.c:86-94) | **FIXED** | Added spinlock + g_GpuProxyInitialized guard |
+
+### Build Status: PASS (signed)
+
+## Linux Register Comparison — Key Findings
 
 **KIQ model is fundamentally different:**
 - Our driver uses KIQ_BASE/CNTL/RPTR/WPTR at 0xE060-0xE078 — NOT in Linux GFX10 headers
