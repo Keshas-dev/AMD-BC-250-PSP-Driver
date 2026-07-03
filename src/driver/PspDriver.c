@@ -126,7 +126,7 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
     KdPrint(("BOOT_SEQ: NBIO unlock written\n"));
 
     PVOID grbmBase = devExt->GpuMmioBase ? devExt->GpuMmioBase : devExt->MmioBase;
-    ULONG grbm = READ_REGISTER_ULONG((PULONG)((PUCHAR)grbmBase + (AMDBC250_GC_BASE + 0x2004)));
+    ULONG grbm = READ_REGISTER_ULONG((PULONG)((PUCHAR)grbmBase + (AMDBC250_GC_BASE + 0x2000)));
     KdPrint(("BOOT_SEQ: GRBM_STATUS=0x%08X (base=%s)\n", grbm, devExt->GpuMmioBase ? "GPU BAR5" : "PSP BAR0"));
     return STATUS_SUCCESS;
 }
@@ -754,14 +754,14 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         /* GPU registers MUST be read from GPU BAR5, not PSP BAR0 */
         PVOID gpuBase = devExt->GpuMmioBase ? devExt->GpuMmioBase : devExt->MmioBase;
         if (devExt->GpuMmioBase) {
-            info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x2004)));
+            info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x2000)));
             info->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + MMHUB_CHECK_OFFSET));
             info->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x3000)));
             info->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + 0x05A0));
             info->MeCntl = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x3814)));
             info->GrbmGfxIndex = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x2270)));
         } else if (g_Bar5Mapping) {
-            info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + (AMDBC250_GC_BASE + 0x2004)));
+            info->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + (AMDBC250_GC_BASE + 0x2000)));
             info->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + MMHUB_CHECK_OFFSET));
             info->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + (AMDBC250_GC_BASE + 0x3000)));
             info->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + 0x05A0));
@@ -916,13 +916,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         results[2] = NT_SUCCESS(stepStatus) ? 1 : 0;
         KdPrint(("BOOT_SEQ: SOS cmd=0x8 => %s\n", results[2] ? "SENT" : "FAIL"));
 
-        PVOID unlockBase = g_Bar5Mapping ? g_Bar5Mapping : devExt->MmioBase;
-        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)unlockBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
-        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)unlockBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
+        PVOID unlockBase = devExt->MmioBase;
+        if (unlockBase) {
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)unlockBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)unlockBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
+        }
         KeStallExecutionProcessor(1000);
         KdPrint(("BOOT_SEQ: NBIO unlock written\n"));
 
-        results[3] = READ_REGISTER_ULONG((PULONG)((PUCHAR)unlockBase + (AMDBC250_GC_BASE + 0x2004)));
+        results[3] = READ_REGISTER_ULONG((PULONG)((PUCHAR)unlockBase + (AMDBC250_GC_BASE + 0x2000)));
         KdPrint(("BOOT_SEQ: SYSDRV=%d SOS=%d GRBM=0x%08X\n", results[1], results[2], results[3]));
         if (outputLength >= sizeof(results)) {
             RtlCopyMemory(outputBuffer, results, sizeof(results));
@@ -949,7 +951,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         probe->NbioSig2 = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET));
         probe->MmhubCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + MMHUB_CHECK_OFFSET));
         PVOID gpuBase = devExt->GpuMmioBase ? devExt->GpuMmioBase : devExt->MmioBase;
-        probe->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x2004)));
+        probe->GrbmStatus = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x2000)));
         probe->GcCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + (AMDBC250_GC_BASE + 0x3000)));
         probe->HdpCheck = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + 0x05A0));
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
@@ -1069,7 +1071,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     case IOCTL_PSP_KIQ_SUBMIT:
     {
         PSP_KIQ_SUBMIT_REQUEST* req = (PSP_KIQ_SUBMIT_REQUEST*)inputBuffer;
-        if (inputLength < FIELD_OFFSET(PSP_KIQ_SUBMIT_REQUEST, Commands[req->CommandCount])) {
+        if (inputLength < (SIZE_T)FIELD_OFFSET(PSP_KIQ_SUBMIT_REQUEST, Commands[req->CommandCount])) {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
@@ -1162,8 +1164,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     case IOCTL_PSP_GPU_PM4_SUBMIT:
     {
         KdPrint(("IOCTL_PSP_GPU_PM4_SUBMIT: inputLen=%u outputLen=%u\n", inputLength, outputLength));
-        if (inputLength < sizeof(PSP_GPU_PM4_SUBMIT_REQUEST)) {
-            KdPrint(("  REJECTED: input %u < %u\n", inputLength, (ULONG)sizeof(PSP_GPU_PM4_SUBMIT_REQUEST)));
+        if (inputLength < (SIZE_T)FIELD_OFFSET(PSP_GPU_PM4_SUBMIT_REQUEST, Commands[0])) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PPSP_GPU_PM4_SUBMIT_REQUEST req = (PPSP_GPU_PM4_SUBMIT_REQUEST)inputBuffer;
+        ULONG cmdCount = req->CommandCount;
+        ULONG waitMs = req->WaitMs;
+        if (cmdCount == 0 || cmdCount > 64 ||
+            inputLength < (SIZE_T)FIELD_OFFSET(PSP_GPU_PM4_SUBMIT_REQUEST, Commands[cmdCount])) {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
@@ -1171,9 +1180,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
-        PPSP_GPU_PM4_SUBMIT_REQUEST req = (PPSP_GPU_PM4_SUBMIT_REQUEST)inputBuffer;
         PPSP_GPU_PM4_SUBMIT_RESPONSE resp = (PPSP_GPU_PM4_SUBMIT_RESPONSE)outputBuffer;
         RtlZeroMemory(resp, sizeof(*resp));
+        /* Restore fields that RtlZeroMemory cleared (METHOD_BUFFERED shares buffer) */
+        req->CommandCount = cmdCount;
+        req->WaitMs = waitMs;
         status = PspGpuPm4Submit(devExt, req, resp);
         bytesReturned = sizeof(PSP_GPU_PM4_SUBMIT_RESPONSE);
         break;
