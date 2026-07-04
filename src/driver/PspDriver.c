@@ -62,24 +62,45 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
 {
     NTSTATUS stepStatus;
     PHYSICAL_ADDRESS highAddr;
+    PUCHAR fileData = NULL;
+    ULONG fileSize = 0;
     highAddr.QuadPart = 0x10000000000ULL;
 
-    if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
+    /* --- Load SYSDRV firmware --- */
+    /* Try file first (\SystemRoot\System32\drivers\bc-250\Sysdrv.bin) */
+    fileData = NULL; fileSize = 0;
+    stepStatus = PspLoadFirmwareFromFile(
+        L"\\SystemRoot\\System32\\drivers\\bc-250\\Sysdrv.bin",
+        &fileData, &fileSize);
+    if (NT_SUCCESS(stepStatus)) {
+        KdPrint(("BOOT_SEQ: SYSDRV from file (%u bytes)\n", fileSize));
+    } else if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
         KdPrint(("BOOT_SEQ: SYSDRV FW too large\n"));
         return STATUS_INVALID_PARAMETER;
+    } else {
+        fileSize = g_SysdrvFirmwareSize;
+        KdPrint(("BOOT_SEQ: SYSDRV from embedded (%u bytes)\n", fileSize));
     }
+
     PspFreeFirmware(devExt);
-    devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+    devExt->FwBuffer = MmAllocateContiguousMemory(fileSize, highAddr);
     if (devExt->FwBuffer == NULL) {
         highAddr.QuadPart = 0xFFFFFFFF;
-        devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+        devExt->FwBuffer = MmAllocateContiguousMemory(fileSize, highAddr);
     }
     if (devExt->FwBuffer == NULL) {
         KdPrint(("BOOT_SEQ: SYSDRV alloc failed\n"));
+        if (fileData != NULL) ExFreePoolWithTag(fileData, 'fw');
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
-    devExt->FwSize = g_SysdrvFirmwareSize;
+
+    if (fileData != NULL) {
+        RtlCopyMemory(devExt->FwBuffer, fileData, fileSize);
+        ExFreePoolWithTag(fileData, 'fw'); fileData = NULL;
+    } else {
+        RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, fileSize);
+    }
+    devExt->FwSize = fileSize;
     devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
     devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
     KdPrint(("BOOT_SEQ: SYSDRV PA>>20=0x%08X\n", devExt->FwPaShifted));
@@ -91,11 +112,22 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
         return stepStatus;
     }
 
-    if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
+    /* --- Load SOS firmware --- */
+    fileData = NULL; fileSize = 0;
+    stepStatus = PspLoadFirmwareFromFile(
+        L"\\SystemRoot\\System32\\drivers\\bc-250\\Sos.bin",
+        &fileData, &fileSize);
+    if (NT_SUCCESS(stepStatus)) {
+        KdPrint(("BOOT_SEQ: SOS from file (%u bytes)\n", fileSize));
+    } else if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
         KdPrint(("BOOT_SEQ: SOS FW too large\n"));
         PspFreeFirmware(devExt);
         return STATUS_INVALID_PARAMETER;
+    } else {
+        fileSize = g_SosFirmwareSize;
+        KdPrint(("BOOT_SEQ: SOS from embedded (%u bytes)\n", fileSize));
     }
+
     PspFreeFirmware(devExt);
     devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
     if (devExt->FwBuffer == NULL) {
@@ -104,11 +136,18 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
     }
     if (devExt->FwBuffer == NULL) {
         KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
+        if (fileData != NULL) ExFreePoolWithTag(fileData, 'fw');
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(devExt->FwBuffer, 262144);
-    RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
     devExt->FwSize = 262144;
+
+    if (fileData != NULL) {
+        RtlCopyMemory(devExt->FwBuffer, fileData, fileSize);
+        ExFreePoolWithTag(fileData, 'fw'); fileData = NULL;
+    } else {
+        RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
+    }
     devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
     devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
     KdPrint(("BOOT_SEQ: SOS PA>>20=0x%08X\n", devExt->FwPaShifted));
@@ -120,6 +159,7 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
         return stepStatus;
     }
 
+    /* --- NBIO unlock --- */
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG1_OFFSET), NBIO_SIG1_VALUE);
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + NBIO_SIG2_OFFSET), NBIO_SIG2_VALUE);
     KeStallExecutionProcessor(1000);
@@ -128,6 +168,162 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
     PVOID grbmBase = devExt->GpuMmioBase ? devExt->GpuMmioBase : devExt->MmioBase;
     ULONG grbm = READ_REGISTER_ULONG((PULONG)((PUCHAR)grbmBase + (AMDBC250_GC_BASE + 0x2000)));
     KdPrint(("BOOT_SEQ: GRBM_STATUS=0x%08X (base=%s)\n", grbm, devExt->GpuMmioBase ? "GPU BAR5" : "PSP BAR0"));
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS PspSendSmcBoot(PDEVICE_EXTENSION devExt)
+{
+    NTSTATUS status;
+    PVOID cmdBufVa = NULL, tocBufVa = NULL;
+    PHYSICAL_ADDRESS cmdBufPa = {0}, tocBufPa = {0}, highAddr;
+    ULONG timeout, cmdReg, tocSize, fwOffset, totalSize;
+    KIRQL irql;
+
+    highAddr.QuadPart = 0x10000000000ULL;
+
+    if (g_SmuFirmwareSize == 0 || g_SmuFirmwareSize > 0x100000) {
+        KdPrint(("SMC_BOOT: Invalid SMU firmware size=%u\n", g_SmuFirmwareSize));
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!devExt->MmioBase) {
+        KdPrint(("SMC_BOOT: No MMIO base\n"));
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    /* Allocate contiguous TOC buffer: toc_header(12) + toc_entry(16) + firmware */
+    tocSize = 28;
+    fwOffset = (tocSize + 0x7F) & ~0x7F;
+    totalSize = fwOffset + g_SmuFirmwareSize;
+
+    tocBufVa = MmAllocateContiguousMemory(totalSize, highAddr);
+    if (tocBufVa == NULL) {
+        highAddr.QuadPart = 0xFFFFFFFF;
+        tocBufVa = MmAllocateContiguousMemory(totalSize, highAddr);
+    }
+    if (tocBufVa == NULL) {
+        KdPrint(("SMC_BOOT: TOC alloc %u failed\n", totalSize));
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(tocBufVa, totalSize);
+    tocBufPa = MmGetPhysicalAddress(tocBufVa);
+
+    /* Build TOC structure (psp_gfx_toc_header + psp_gfx_toc_entry format) */
+    PUCHAR toc = (PUCHAR)tocBufVa;
+    PHYSICAL_ADDRESS fwPa;
+    fwPa.QuadPart = tocBufPa.QuadPart + fwOffset;
+
+    /* psp_gfx_toc_header: id(4) + entry_count(4) + total_size(4) */
+    *((PULONG)(toc + 0)) = 0;      /* toc_id (always 0) */
+    *((PULONG)(toc + 4)) = 1;      /* entry_count */
+    *((PULONG)(toc + 8)) = totalSize;  /* total_size */
+
+    /* psp_gfx_toc_entry: fw_type(4) + fw_size(4) + fw_pa(8) + reserved(0) */
+    *((PULONG)(toc + 12)) = 7;                    /* fw_type = PSP_GFX_FW_TYPE_PSP_SMC */
+    *((PULONG)(toc + 16)) = g_SmuFirmwareSize;
+    *((PULONG)(toc + 20)) = (ULONG)(fwPa.QuadPart & 0xFFFFFFFF);
+    *((PULONG)(toc + 24)) = (ULONG)(fwPa.QuadPart >> 32);
+
+    /* Copy SMU firmware */
+    RtlCopyMemory(toc + fwOffset, (PVOID)g_SmuFirmwareData, g_SmuFirmwareSize);
+
+    KdPrint(("SMC_BOOT: TOC PA=0x%llX fwPA=0x%llX total=%u\n",
+             tocBufPa.QuadPart, fwPa.QuadPart, totalSize));
+
+    /* Allocate GFX ring command buffer (matching PSP_CMD_BUFFER format) */
+    cmdBufVa = MmAllocateContiguousMemory(64, highAddr);
+    if (cmdBufVa == NULL) {
+        highAddr.QuadPart = 0xFFFFFFFF;
+        cmdBufVa = MmAllocateContiguousMemory(64, highAddr);
+    }
+    if (cmdBufVa == NULL) {
+        MmFreeContiguousMemory(tocBufVa);
+        KdPrint(("SMC_BOOT: CMD alloc failed\n"));
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(cmdBufVa, 64);
+    cmdBufPa = MmGetPhysicalAddress(cmdBufVa);
+
+    /* Build GFX ring command buffer (matching PspLoadIpFwViaMailbox format):
+     * Offset  0: buf_size
+     * Offset  4: body_size (dwords of params after reserved header)
+     * Offset  8: cmd_id
+     * Offset 12-24: reserved (4 dwords)
+     * Offset 28: param 0 (toc_pa_lo)
+     * Offset 32: param 1 (toc_pa_hi)
+     * Offset 36: param 2 (toc_size)  */
+    PULONG cmd = (PULONG)cmdBufVa;
+    cmd[0] = 64;                            /* total buf_size */
+    cmd[1] = 3;                             /* body_size = 3 (toc_pa_lo, toc_pa_hi, toc_size) */
+    cmd[2] = 0x20;                          /* cmd_id = GFX_CMD_ID_LOAD_TOC */
+    cmd[3] = 0;                             /* reserved */
+    cmd[4] = 0;                             /* reserved */
+    cmd[5] = 0;                             /* reserved */
+    cmd[6] = 0;                             /* reserved */
+    cmd[7] = (ULONG)(tocBufPa.QuadPart & 0xFFFFFFFF);   /* toc_pa_lo */
+    cmd[8] = (ULONG)(tocBufPa.QuadPart >> 32);           /* toc_pa_hi */
+    cmd[9] = totalSize;                     /* toc_size */
+
+    KdPrint(("SMC_BOOT: CMD PA=0x%llX\n", cmdBufPa.QuadPart));
+
+    /* Send via GFX ring protocol (C2PMSG_36/37 = cmd buffer PA, C2PMSG_35 = cmd_id) */
+    KeAcquireSpinLock(&devExt->CommandLock, &irql);
+
+    if (g_GpuProxyAvailable && (g_Bar5Mapping || devExt->GpuMmioBase)) {
+        PVOID mbox = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_36_OFFSET),
+            (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF));
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_37_OFFSET),
+            (ULONG)(cmdBufPa.QuadPart >> 32));
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_35_OFFSET), 0x20);
+    } else {
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_36_OFFSET),
+            (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF));
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_37_OFFSET),
+            (ULONG)(cmdBufPa.QuadPart >> 32));
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET), 0x20);
+    }
+
+    KeReleaseSpinLock(&devExt->CommandLock, irql);
+
+    /* Poll for completion */
+    for (timeout = 0; timeout < 3000; timeout++) {
+        KeStallExecutionProcessor(1000);
+        if (g_Bar5Mapping) {
+            cmdReg = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + PSP_C2PMSG_35_OFFSET));
+        } else if (devExt->GpuMmioBase) {
+            cmdReg = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->GpuMmioBase + PSP_C2PMSG_35_OFFSET));
+        } else {
+            cmdReg = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->MmioBase + PSP_C2PMSG_35_OFFSET));
+        }
+        if (cmdReg == 0) break;
+    }
+
+    /* Check results */
+    ULONG c2p81 = 0, smu66 = 0, smu82 = 0, smu90 = 0;
+    if (g_Bar5Mapping) {
+        c2p81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + PSP_C2PMSG_81_OFFSET));
+        smu66 = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + MP1_BASE + SMU_C2PMSG_66_OFFSET));
+        smu82 = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + MP1_BASE + SMU_C2PMSG_82_OFFSET));
+        smu90 = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + MP1_BASE + SMU_C2PMSG_90_OFFSET));
+    }
+
+    KdPrint(("SMC_BOOT: done timeout=%u C2PMSG_35=0x%08X C2PMSG_81=0x%08X\n", timeout, cmdReg, c2p81));
+    KdPrint(("SMC_BOOT: SMU [66]=0x%08X [82]=0x%08X [90]=0x%08X\n", smu66, smu82, smu90));
+
+    MmFreeContiguousMemory(cmdBufVa);
+    MmFreeContiguousMemory(tocBufVa);
+
+    if (timeout >= 3000) {
+        KdPrint(("SMC_BOOT: TIMEOUT\n"));
+        return STATUS_TIMEOUT;
+    }
+
+    if (smu66 != 0 || smu82 != 0 || smu90 != 0) {
+        KdPrint(("SMC_BOOT: SMU ALIVE!\n"));
+    } else {
+        KdPrint(("SMC_BOOT: SMU still dead\n"));
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -1064,7 +1260,142 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
     case IOCTL_PSP_LOAD_TOC:
     {
-        status = STATUS_NOT_IMPLEMENTED;
+        KdPrint(("IOCTL_PSP_LOAD_TOC\n"));
+
+        if (!g_Bar5Mapping && !devExt->GpuMmioBase) {
+            KdPrint(("LOAD_TOC: GPU BAR5 not mapped\n"));
+            status = STATUS_DEVICE_NOT_READY;
+            break;
+        }
+
+        /* Try loading SMU firmware from disk; fallback to embedded */
+        PUCHAR smuData = NULL;
+        ULONG smuSize = 0;
+        NTSTATUS fwStatus = PspLoadFirmwareFromFile(
+            L"\\SystemRoot\\System32\\drivers\\bc-250\\Smu.bin",
+            &smuData, &smuSize);
+        if (!NT_SUCCESS(fwStatus)) {
+            KdPrint(("LOAD_TOC: Smu.bin not found in bc-250, using embedded\n"));
+            smuData = (PUCHAR)g_SmuFirmwareData;
+            smuSize = g_SmuFirmwareSize;
+        } else {
+            KdPrint(("LOAD_TOC: Using SMU firmware from file (%u bytes)\n", smuSize));
+        }
+
+        if (smuSize == 0 || smuSize > 0x100000) {
+            KdPrint(("LOAD_TOC: Invalid SMU firmware size=%u\n", smuSize));
+            if (smuData != g_SmuFirmwareData && smuData != NULL)
+                ExFreePoolWithTag(smuData, 'fw');
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        PVOID cmdBufVa = NULL, tocBufVa = NULL;
+        PHYSICAL_ADDRESS cmdBufPa = {0}, tocBufPa = {0}, highAddr = {0};
+        ULONG tocSize, fwOffset, totalSize, timeout = 0, cmdReg = 0;
+        ULONG c2p81 = 0;
+        BOOLEAN fileLoaded = (smuData != g_SmuFirmwareData);
+
+        highAddr.QuadPart = 0x10000000000ULL;
+
+        tocSize = 28;
+        fwOffset = (tocSize + 0x7F) & ~0x7F;
+        totalSize = fwOffset + smuSize;
+
+        tocBufVa = MmAllocateContiguousMemory(totalSize, highAddr);
+        if (tocBufVa == NULL) {
+            highAddr.QuadPart = 0xFFFFFFFF;
+            tocBufVa = MmAllocateContiguousMemory(totalSize, highAddr);
+        }
+        if (tocBufVa == NULL) {
+            KdPrint(("LOAD_TOC: alloc %u failed\n", totalSize));
+            if (fileLoaded) ExFreePoolWithTag(smuData, 'fw');
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        RtlZeroMemory(tocBufVa, totalSize);
+        tocBufPa = MmGetPhysicalAddress(tocBufVa);
+
+        PUCHAR toc = (PUCHAR)tocBufVa;
+        PHYSICAL_ADDRESS fwPa;
+        fwPa.QuadPart = tocBufPa.QuadPart + fwOffset;
+
+        *((PULONG)(toc + 0)) = 0;
+        *((PULONG)(toc + 4)) = 1;
+        *((PULONG)(toc + 8)) = totalSize;
+        *((PULONG)(toc + 12)) = 7;          /* fw_type = PSP_GFX_FW_TYPE_PSP_SMC */
+        *((PULONG)(toc + 16)) = smuSize;
+        *((PULONG)(toc + 20)) = (ULONG)(fwPa.QuadPart & 0xFFFFFFFF);
+        *((PULONG)(toc + 24)) = (ULONG)(fwPa.QuadPart >> 32);
+        RtlCopyMemory(toc + fwOffset, smuData, smuSize);
+
+        if (fileLoaded) ExFreePoolWithTag(smuData, 'fw');
+
+        /* Command buffer */
+        cmdBufVa = MmAllocateContiguousMemory(64, highAddr);
+        if (cmdBufVa == NULL) {
+            highAddr.QuadPart = 0xFFFFFFFF;
+            cmdBufVa = MmAllocateContiguousMemory(64, highAddr);
+        }
+        if (cmdBufVa == NULL) {
+            MmFreeContiguousMemory(tocBufVa);
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        RtlZeroMemory(cmdBufVa, 64);
+        cmdBufPa = MmGetPhysicalAddress(cmdBufVa);
+
+        PULONG cmd = (PULONG)cmdBufVa;
+        cmd[0] = 64;  cmd[1] = 3;  cmd[2] = GFX_CMD_ID_LOAD_TOC;
+        cmd[3] = 0;  cmd[4] = 0;  cmd[5] = 0;  cmd[6] = 0;
+        cmd[7] = (ULONG)(tocBufPa.QuadPart & 0xFFFFFFFF);
+        cmd[8] = (ULONG)(tocBufPa.QuadPart >> 32);
+        cmd[9] = totalSize;
+
+        KdPrint(("LOAD_TOC: cmdPA=0x%llX tocPA=0x%llX total=%u\n",
+                 cmdBufPa.QuadPart, tocBufPa.QuadPart, totalSize));
+
+        PVOID mbox = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;
+        {
+            KIRQL irql;
+            KeAcquireSpinLock(&devExt->CommandLock, &irql);
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_36_OFFSET),
+                (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF));
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_37_OFFSET),
+                (ULONG)(cmdBufPa.QuadPart >> 32));
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_35_OFFSET),
+                GFX_CMD_ID_LOAD_TOC);
+            KeReleaseSpinLock(&devExt->CommandLock, irql);
+        }
+
+        for (timeout = 0; timeout < 3000; timeout++) {
+            KeStallExecutionProcessor(1000);
+            cmdReg = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_35_OFFSET));
+            if (cmdReg == 0) break;
+        }
+
+        c2p81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_81_OFFSET));
+        ULONG smu66 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + MP1_BASE + SMU_C2PMSG_66_OFFSET));
+        ULONG smu82 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + MP1_BASE + SMU_C2PMSG_82_OFFSET));
+        ULONG smu90 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + MP1_BASE + SMU_C2PMSG_90_OFFSET));
+
+        KdPrint(("LOAD_TOC: timeout=%u C2PMSG_35=0x%08X C2PMSG_81=0x%08X\n", timeout, cmdReg, c2p81));
+        KdPrint(("LOAD_TOC: SMU [66]=0x%08X [82]=0x%08X [90]=0x%08X\n", smu66, smu82, smu90));
+
+        if (outputLength >= sizeof(ULONG) * 5) {
+            PULONG resp = (PULONG)outputBuffer;
+            resp[0] = timeout >= 3000 ? 0 : 1;
+            resp[1] = c2p81;
+            resp[2] = smu66;
+            resp[3] = smu82;
+            resp[4] = smu90;
+            bytesReturned = sizeof(ULONG) * 5;
+        }
+
+        MmFreeContiguousMemory(cmdBufVa);
+        MmFreeContiguousMemory(tocBufVa);
+
+        status = timeout >= 3000 ? STATUS_TIMEOUT : STATUS_SUCCESS;
         break;
     }
 

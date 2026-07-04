@@ -16,11 +16,13 @@ BOOLEAN PspGpuProxyWriteRegister(ULONG offset, ULONG value);
 
 NTSTATUS PspSendMailboxCommand(PDEVICE_EXTENSION devExt, ULONG command);
 NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize, PUCHAR FwData);
+NTSTATUS PspSendSmcBoot(PDEVICE_EXTENSION devExt);
 NTSTATUS PspInitTmr(PDEVICE_EXTENSION devExt);
 VOID PspFreeTmr(VOID);
 NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt);
 BOOLEAN PspValidateFirmware(PUCHAR FirmwareData, ULONG FirmwareSize);
 VOID PspFreeFirmware(PDEVICE_EXTENSION devExt);
+NTSTATUS PspLoadFirmwareFromFile(PCWSTR FileName, PUCHAR* OutData, PULONG OutSize);
 
 extern BOOLEAN g_TmrInitialized;
 extern PVOID g_TmrBuffer;

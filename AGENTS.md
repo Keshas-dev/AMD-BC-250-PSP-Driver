@@ -90,12 +90,65 @@ typedef struct _PSP_KIQ_SUBMIT_REQUEST {
 - PSP driver (`PspDriver.c`): Uses `req->CommandCount` and `&req->Commands[0]`
 - GPU driver (`amdbc250_psp.c`): Uses `PSP_KIQ_SUBMIT_REQUEST` struct with proper padding
 
-## Build commands (from repo root, in VS2022 x64 Native Tools prompt)
+## SMU Firmware Loading via TOC (2026-07-04)
+
+### Progress
+- `PspSendSmcBoot` implemented (TOC structure + GFX ring command buffer) but **not called during boot**
+- `IOCTL_PSP_LOAD_TOC` (0x820) implemented — loads SMU firmware via TOC using GFX ring command buffer
+- TOC uses `GFX_CMD_ID_LOAD_TOC` (0x20) with `fw_type=7` (`PSP_GFX_FW_TYPE_PSP_SMC`)
+- SMU firmware `cyan_skillfish2_smc.bin` exists (267,970 bytes)
+- SOS confirmed alive: `C2PMSG_81 = 0xF0000010`
+
+### Current Status
+- **SMU registers all 0** after all attempts — `C2PMSG_66/82/90` dead
+- `IOCTL_PSP_LOAD_TOC` not tested yet (needs driver reinstall + reboot)
+- Without SMU, GFX/CP/SDMA blocks have no clock/power
+
+### Firmware Loading Flow
+```
+PspDoBootSequence:
+  1. SYSDRV → try bc-250\Sysdrv.bin, fallback embedded
+  2. SOS    → try bc-250\Sos.bin, fallback embedded
+  3. SMU    → NOT loaded during boot (needs GPU BAR5 mapped)
+
+IOCTL_PSP_LOAD_TOC (user-mode, after INIT_HW):
+  1. Try bc-250\Smu.bin, fallback embedded
+  2. Build TOC: {id=0, entry_count=1, total_size=28} + {fw_type=7, fw_size, fw_pa}
+  3. Send GFX_CMD_ID_LOAD_TOC via ring command buffer
+  4. Poll C2PMSG_35 for completion
+```
+
+## Build and Install (2026-07-04)
 
 ```cmd
-build.bat                    # -> output\PspDriver.sys + .inf + .cat + sign
-scripts\compile-test.bat     # -> output\test-psp-driver.exe
+build.bat                    # -> output\PspDriver.sys + .inf + .cat + .bin files + sign
 ```
+
+`build.bat` now:
+1. Extracts .bin files from `firmware_data.h` to `output\firmware\`
+2. **Copies .bin files to `output\`** alongside INF (for driver install)
+
+### Install via Device Manager
+- `PspDriver.inf` has `[Firmware_Files]` section — copies `Sysdrv.bin`, `Sos.bin`, `Smu.bin` to `C:\Windows\System32\drivers\bc-250\` automatically
+- **No separate xcopy needed** — INF handles firmware installation
+- Test tools: `output\toc-load-test.exe` (SMU TOC load), `output\psp-status-test.exe` (register check)
+
+### Manual firmware file locations
+| File | Source | Destination |
+|------|--------|-------------|
+| PspDriver.inf | `output\` | Selected via Device Manager |
+| PspDriver.sys | `output\` | `%SystemRoot%\System32\drivers\` (by INF) |
+| Sysdrv.bin | `output\` | `%SystemRoot%\System32\drivers\bc-250\` (by INF) |
+| Sos.bin | `output\` | `%SystemRoot%\System32\drivers\bc-250\` (by INF) |
+| Smu.bin | `output\` | `%SystemRoot%\System32\drivers\bc-250\` (by INF) |
+
+### DebugView Logs (KdPrint)
+- `BOOT_SEQ: SYSDRV from file (X bytes)` or `from embedded`
+- `BOOT_SEQ: SOS from file (X bytes)` or `from embedded`
+- `=== AMD BC-250 PSP Driver: Initialized ===`
+- `C2PMSG_81 = 0xF0000010` — SOS alive
+- `LOAD_TOC: Smu.bin not found in bc-250, using embedded`
+- `LOAD_TOC: SMU [66]=0x%08X [82]=0x%08X [90]=0x%08X`
 
 Manual alternative:
 ```

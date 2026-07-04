@@ -217,6 +217,23 @@ echo ----------------------------------------------------
 
 echo.
 echo ==========================================
+echo  EXTRACTING FIRMWARE .bin FILES
+echo ==========================================
+echo.
+
+:: Run firmware extraction
+python "%PROJECT_DIR%extract-firmware.py" >nul 2>&1
+if %errorlevel% equ 0 (
+    echo  Firmware extracted to %OUTPUT_DIR%\firmware\
+    :: Copy firmware alongside INF for driver install
+    copy /y "%OUTPUT_DIR%\firmware\*.bin" "%OUTPUT_DIR%\" >nul 2>&1
+    dir /b "%OUTPUT_DIR%\firmware\*.bin"
+) else (
+    echo  WARNING: Firmware extraction failed
+)
+
+echo.
+echo ==========================================
 echo  BUILD COMPLETED!
 echo ==========================================
 echo.
@@ -224,11 +241,16 @@ echo  Output directory: %OUTPUT_DIR%
 echo    PspDriver.sys   - WDM driver (kernel-mode)
 echo    PspDriver.inf   - Device installation file
 echo    PspDriver.cat   - Catalog file (if generated)
+echo    firmware\       - Firmware .bin files
 echo.
 echo  Install (run as Administrator):
 echo    1. Device Manager -^> Find "AMD BC-250 PSP"
 echo    2. Update Driver -^> Browse -^> %OUTPUT_DIR%
 echo    3. Reboot if prompted
+echo.
+echo  Post-install (copy firmware to system dir):
+echo    mkdir "%SystemRoot%\System32\drivers\bc-250\" 2^>nul
+echo    xcopy /y /i "%OUTPUT_DIR%\firmware\*.bin" "%SystemRoot%\System32\drivers\bc-250\"
 echo.
 echo  Test:
 echo    output\test-psp-driver.exe

@@ -499,3 +499,69 @@ NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt)
 
     return STATUS_SUCCESS;
 }
+
+/* Load firmware file from disk into a non-paged pool buffer.
+ * FileName format: L"\\SystemRoot\\System32\\drivers\\amdgpu\\navi10_smc.bin"
+ * Caller must free *OutData with ExFreePoolWithTag. */
+NTSTATUS PspLoadFirmwareFromFile(PCWSTR FileName, PUCHAR* OutData, PULONG OutSize)
+{
+    HANDLE hFile = NULL;
+    OBJECT_ATTRIBUTES objAttr;
+    IO_STATUS_BLOCK ioStatus;
+    UNICODE_STRING uniPath;
+    FILE_STANDARD_INFORMATION fileInfo;
+    NTSTATUS status;
+    PUCHAR buffer = NULL;
+
+    if (FileName == NULL || OutData == NULL || OutSize == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *OutData = NULL;
+    *OutSize = 0;
+
+    RtlInitUnicodeString(&uniPath, FileName);
+    InitializeObjectAttributes(&objAttr, &uniPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    status = ZwCreateFile(&hFile, GENERIC_READ, &objAttr, &ioStatus, NULL,
+                          FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
+                          FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("FW_FILE: Failed to open %wZ (0x%08X)\n", &uniPath, status));
+        return status;
+    }
+
+    status = ZwQueryInformationFile(hFile, &ioStatus, &fileInfo, sizeof(fileInfo), FileStandardInformation);
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("FW_FILE: Query info failed (0x%08X)\n", status));
+        ZwClose(hFile);
+        return status;
+    }
+
+    ULONG fileSize = (ULONG)fileInfo.EndOfFile.QuadPart;
+    if (fileSize == 0 || fileSize > PSP_MAX_FW_TOTAL) {
+        KdPrint(("FW_FILE: Invalid file size=%u\n", fileSize));
+        ZwClose(hFile);
+        return STATUS_FILE_TOO_LARGE;
+    }
+
+    buffer = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, fileSize, 'fw');
+    if (buffer == NULL) {
+        KdPrint(("FW_FILE: Alloc %u failed\n", fileSize));
+        ZwClose(hFile);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = ZwReadFile(hFile, NULL, NULL, NULL, &ioStatus, buffer, fileSize, NULL, NULL);
+    ZwClose(hFile);
+
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("FW_FILE: Read failed (0x%08X)\n", status));
+        ExFreePoolWithTag(buffer, 'fw');
+        return status;
+    }
+
+    KdPrint(("FW_FILE: Loaded %wZ (%u bytes)\n", &uniPath, fileSize));
+    *OutData = buffer;
+    *OutSize = fileSize;
+    return STATUS_SUCCESS;
+}
