@@ -225,6 +225,9 @@ echo.
 python "%PROJECT_DIR%extract-firmware.py" >nul 2>&1
 if %errorlevel% equ 0 (
     echo  Firmware extracted to %OUTPUT_DIR%\firmware\
+    :: Copy additional firmware (ASD, TA) if available
+    if exist "%OUTPUT_DIR%\asd_5.00.bin"  copy /y "%OUTPUT_DIR%\asd_5.00.bin"  "%OUTPUT_DIR%\firmware\Asd.bin" >nul
+    if exist "%OUTPUT_DIR%\ta_5.00.bin"   copy /y "%OUTPUT_DIR%\ta_5.00.bin"   "%OUTPUT_DIR%\firmware\Ta.bin" >nul
     :: Copy firmware alongside INF for driver install
     copy /y "%OUTPUT_DIR%\firmware\*.bin" "%OUTPUT_DIR%\" >nul 2>&1
     dir /b "%OUTPUT_DIR%\firmware\*.bin"

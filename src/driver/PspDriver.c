@@ -1044,29 +1044,53 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
         }
 
-        if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
-            KdPrint(("BOOT_SEQ: SYSDRV FW too large (%u > %u)\n", g_SysdrvFirmwareSize, PSP_MAX_FW_TOTAL));
-            status = STATUS_INVALID_PARAMETER;
-            break;
+        /* Try file-based SYSDRV, fallback to embedded */
+        {
+            PUCHAR fwData = NULL;
+            ULONG fwSize = 0;
+            if (NT_SUCCESS(PspLoadFirmwareFromFile(
+                    L"\\SystemRoot\\System32\\drivers\\bc-250\\Sysdrv.bin",
+                    &fwData, &fwSize)) && fwSize <= PSP_MAX_FW_TOTAL) {
+                PspFreeFirmware(devExt);
+                devExt->FwBuffer = MmAllocateContiguousMemory(fwSize, highAddr);
+                if (devExt->FwBuffer == NULL) {
+                    highAddr.QuadPart = 0xFFFFFFFF;
+                    devExt->FwBuffer = MmAllocateContiguousMemory(fwSize, highAddr);
+                }
+                if (devExt->FwBuffer) {
+                    RtlCopyMemory(devExt->FwBuffer, fwData, fwSize);
+                    devExt->FwSize = fwSize;
+                    devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
+                    devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
+                    KdPrint(("BOOT_SEQ: SYSDRV from file (%u bytes)\n", fwSize));
+                }
+                ExFreePoolWithTag(fwData, 'fw');
+            }
         }
-        PspFreeFirmware(devExt);
-        devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
         if (devExt->FwBuffer == NULL) {
-            highAddr.QuadPart = 0xFFFFFFFF;
+            if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
+                KdPrint(("BOOT_SEQ: SYSDRV FW too large (%u)\n", g_SysdrvFirmwareSize));
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            PspFreeFirmware(devExt);
             devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            if (devExt->FwBuffer == NULL) {
+                highAddr.QuadPart = 0xFFFFFFFF;
+                devExt->FwBuffer = MmAllocateContiguousMemory(g_SysdrvFirmwareSize, highAddr);
+            }
+            if (devExt->FwBuffer == NULL) {
+                KdPrint(("BOOT_SEQ: SYSDRV alloc failed\n"));
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
+            devExt->FwSize = g_SysdrvFirmwareSize;
+            devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
+            devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
+            KdPrint(("BOOT_SEQ: SYSDRV from embedded (%u bytes)\n", g_SysdrvFirmwareSize));
         }
-        if (devExt->FwBuffer == NULL) {
-            KdPrint(("BOOT_SEQ: SYSDRV alloc failed\n"));
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            break;
-        }
-        RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SysdrvFirmwareData, g_SysdrvFirmwareSize);
-        devExt->FwSize = g_SysdrvFirmwareSize;
-        devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
-        devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
         results[0] = devExt->FwPaShifted;
-        KdPrint(("BOOT_SEQ: SYSDRV loaded PA=0x%llX PA>>20=0x%08X\n",
-            devExt->FwPhysical.QuadPart, devExt->FwPaShifted));
 
         stepStatus = PspSendMailboxCommand(devExt, 0x00000004);
         results[1] = NT_SUCCESS(stepStatus) ? 1 : 0;
@@ -1082,31 +1106,54 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
 
-        if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
-            KdPrint(("BOOT_SEQ: SOS FW too large (%u > %u)\n", g_SosFirmwareSize, PSP_MAX_FW_TOTAL));
-            PspFreeFirmware(devExt);
-            status = STATUS_INVALID_PARAMETER;
-            break;
-        }
+        /* Try file-based SOS, fallback to embedded */
         PspFreeFirmware(devExt);
-        devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
+        {
+            PUCHAR fwData = NULL;
+            ULONG fwSize = 0;
+            if (NT_SUCCESS(PspLoadFirmwareFromFile(
+                    L"\\SystemRoot\\System32\\drivers\\bc-250\\Sos.bin",
+                    &fwData, &fwSize)) && fwSize <= PSP_MAX_FW_TOTAL) {
+                devExt->FwBuffer = MmAllocateContiguousMemory(fwSize, highAddr);
+                if (devExt->FwBuffer == NULL) {
+                    highAddr.QuadPart = 0xFFFFFFFF;
+                    devExt->FwBuffer = MmAllocateContiguousMemory(fwSize, highAddr);
+                }
+                if (devExt->FwBuffer) {
+                    RtlCopyMemory(devExt->FwBuffer, fwData, fwSize);
+                    devExt->FwSize = fwSize;
+                    devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
+                    devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
+                    KdPrint(("BOOT_SEQ: SOS from file (%u bytes)\n", fwSize));
+                }
+                ExFreePoolWithTag(fwData, 'fw');
+            }
+        }
         if (devExt->FwBuffer == NULL) {
-            highAddr.QuadPart = 0xFFFFFFFF;
+            if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
+                KdPrint(("BOOT_SEQ: SOS FW too large (%u)\n", g_SosFirmwareSize));
+                PspFreeFirmware(devExt);
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
             devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
+            if (devExt->FwBuffer == NULL) {
+                highAddr.QuadPart = 0xFFFFFFFF;
+                devExt->FwBuffer = MmAllocateContiguousMemory(g_SosFirmwareSize, highAddr);
+            }
+            if (devExt->FwBuffer == NULL) {
+                KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
+                PspFreeFirmware(devExt);
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            RtlZeroMemory(devExt->FwBuffer, g_SosFirmwareSize);
+            RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
+            devExt->FwSize = g_SosFirmwareSize;
+            devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
+            devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
+            KdPrint(("BOOT_SEQ: SOS from embedded (%u bytes)\n", g_SosFirmwareSize));
         }
-        if (devExt->FwBuffer == NULL) {
-            KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
-            PspFreeFirmware(devExt);
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            break;
-        }
-        RtlZeroMemory(devExt->FwBuffer, g_SosFirmwareSize);
-        RtlCopyMemory(devExt->FwBuffer, (PVOID)g_SosFirmwareData, g_SosFirmwareSize);
-        devExt->FwSize = g_SosFirmwareSize;
-        devExt->FwPhysical = MmGetPhysicalAddress(devExt->FwBuffer);
-        devExt->FwPaShifted = (ULONG)(devExt->FwPhysical.QuadPart >> 20);
-        KdPrint(("BOOT_SEQ: SOS loaded PA=0x%llX PA>>20=0x%08X\n",
-            devExt->FwPhysical.QuadPart, devExt->FwPaShifted));
 
         stepStatus = PspSendMailboxCommand(devExt, 0x00000008);
         results[2] = NT_SUCCESS(stepStatus) ? 1 : 0;
@@ -1268,9 +1315,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
 
-        /* Try loading SMU firmware from disk; fallback to embedded */
-        PUCHAR smuData = NULL;
-        ULONG smuSize = 0;
+        /* Load ASD, TA, and SMU firmware from disk */
+        PUCHAR asdData = NULL; ULONG asdSize = 0;
+        PUCHAR taData = NULL;  ULONG taSize = 0;
+        PUCHAR smuData = NULL; ULONG smuSize = 0;
+
+        PspLoadFirmwareFromFile(L"\\SystemRoot\\System32\\drivers\\bc-250\\Asd.bin",
+            &asdData, &asdSize);
+        PspLoadFirmwareFromFile(L"\\SystemRoot\\System32\\drivers\\bc-250\\Ta.bin",
+            &taData, &taSize);
         NTSTATUS fwStatus = PspLoadFirmwareFromFile(
             L"\\SystemRoot\\System32\\drivers\\bc-250\\Smu.bin",
             &smuData, &smuSize);
@@ -1286,21 +1339,33 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             KdPrint(("LOAD_TOC: Invalid SMU firmware size=%u\n", smuSize));
             if (smuData != g_SmuFirmwareData && smuData != NULL)
                 ExFreePoolWithTag(smuData, 'fw');
+            if (asdData) ExFreePoolWithTag(asdData, 'fw');
+            if (taData) ExFreePoolWithTag(taData, 'fw');
             status = STATUS_INVALID_PARAMETER;
             break;
         }
 
         PVOID cmdBufVa = NULL, tocBufVa = NULL;
         PHYSICAL_ADDRESS cmdBufPa = {0}, tocBufPa = {0}, highAddr = {0};
-        ULONG tocSize, fwOffset, totalSize, timeout = 0, cmdReg = 0;
+        ULONG fwOffsets[3], fwSizes[3], fwTypes[3];
+        ULONG entryCount = 0, timeout = 0, cmdReg = 0;
         ULONG c2p81 = 0;
-        BOOLEAN fileLoaded = (smuData != g_SmuFirmwareData);
 
         highAddr.QuadPart = 0x10000000000ULL;
 
-        tocSize = 28;
-        fwOffset = (tocSize + 0x7F) & ~0x7F;
-        totalSize = fwOffset + smuSize;
+        /* Build TOC: 12-byte header + 16-byte entries (ASD=5, TA=6, SMC=7) */
+        ULONG tocSize = 12;
+        if (asdData) { fwTypes[entryCount] = 5; fwSizes[entryCount] = asdSize; entryCount++; }
+        if (taData)  { fwTypes[entryCount] = 6; fwSizes[entryCount] = taSize;  entryCount++; }
+        fwTypes[entryCount] = 7; fwSizes[entryCount] = smuSize; entryCount++;
+
+        tocSize = 12 + entryCount * 16;
+        ULONG fwOffset = (tocSize + 0x7F) & ~0x7F;
+        ULONG totalSize = fwOffset;
+        for (ULONG i = 0; i < entryCount; i++) {
+            fwOffsets[i] = totalSize;
+            totalSize += fwSizes[i];
+        }
 
         tocBufVa = MmAllocateContiguousMemory(totalSize, highAddr);
         if (tocBufVa == NULL) {
@@ -1309,7 +1374,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         }
         if (tocBufVa == NULL) {
             KdPrint(("LOAD_TOC: alloc %u failed\n", totalSize));
-            if (fileLoaded) ExFreePoolWithTag(smuData, 'fw');
+            if (smuData != g_SmuFirmwareData && smuData) ExFreePoolWithTag(smuData, 'fw');
+            if (asdData) ExFreePoolWithTag(asdData, 'fw');
+            if (taData) ExFreePoolWithTag(taData, 'fw');
             status = STATUS_INSUFFICIENT_RESOURCES;
             break;
         }
@@ -1317,19 +1384,28 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         tocBufPa = MmGetPhysicalAddress(tocBufVa);
 
         PUCHAR toc = (PUCHAR)tocBufVa;
-        PHYSICAL_ADDRESS fwPa;
-        fwPa.QuadPart = tocBufPa.QuadPart + fwOffset;
-
         *((PULONG)(toc + 0)) = 0;
-        *((PULONG)(toc + 4)) = 1;
+        *((PULONG)(toc + 4)) = entryCount;
         *((PULONG)(toc + 8)) = totalSize;
-        *((PULONG)(toc + 12)) = 7;          /* fw_type = PSP_GFX_FW_TYPE_PSP_SMC */
-        *((PULONG)(toc + 16)) = smuSize;
-        *((PULONG)(toc + 20)) = (ULONG)(fwPa.QuadPart & 0xFFFFFFFF);
-        *((PULONG)(toc + 24)) = (ULONG)(fwPa.QuadPart >> 32);
-        RtlCopyMemory(toc + fwOffset, smuData, smuSize);
-
-        if (fileLoaded) ExFreePoolWithTag(smuData, 'fw');
+        for (ULONG i = 0; i < entryCount; i++) {
+            PHYSICAL_ADDRESS fwPa;
+            fwPa.QuadPart = tocBufPa.QuadPart + fwOffsets[i];
+            ULONG e = 12 + i * 16;
+            *((PULONG)(toc + e + 0)) = fwTypes[i];
+            *((PULONG)(toc + e + 4)) = fwSizes[i];
+            *((PULONG)(toc + e + 8)) = (ULONG)(fwPa.QuadPart & 0xFFFFFFFF);
+            *((PULONG)(toc + e + 12)) = (ULONG)(fwPa.QuadPart >> 32);
+        }
+        if (asdData) {
+            RtlCopyMemory(toc + fwOffsets[0], asdData, asdSize);
+            ExFreePoolWithTag(asdData, 'fw');
+        }
+        if (taData) {
+            RtlCopyMemory(toc + fwOffsets[1], taData, taSize);
+            ExFreePoolWithTag(taData, 'fw');
+        }
+        RtlCopyMemory(toc + fwOffsets[entryCount - 1], smuData, smuSize);
+        if (smuData != g_SmuFirmwareData) ExFreePoolWithTag(smuData, 'fw');
 
         /* Command buffer */
         cmdBufVa = MmAllocateContiguousMemory(64, highAddr);
@@ -1352,32 +1428,55 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         cmd[8] = (ULONG)(tocBufPa.QuadPart >> 32);
         cmd[9] = totalSize;
 
-        KdPrint(("LOAD_TOC: cmdPA=0x%llX tocPA=0x%llX total=%u\n",
-                 cmdBufPa.QuadPart, tocBufPa.QuadPart, totalSize));
+        KdPrint(("LOAD_TOC: cmdPA=0x%llX tocPA=0x%llX total=%u entries=%u\n",
+                 cmdBufPa.QuadPart, tocBufPa.QuadPart, totalSize, entryCount));
 
-        PVOID mbox = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;
+        /* Send via mailbox with PSP proxy fallback */
         {
             KIRQL irql;
             KeAcquireSpinLock(&devExt->CommandLock, &irql);
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_36_OFFSET),
-                (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF));
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_37_OFFSET),
-                (ULONG)(cmdBufPa.QuadPart >> 32));
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_35_OFFSET),
-                GFX_CMD_ID_LOAD_TOC);
+            if (g_GpuProxyAvailable) {
+                if (!PspGpuProxyWriteRegister(PSP_C2PMSG_36_OFFSET,
+                        (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF)) ||
+                    !PspGpuProxyWriteRegister(PSP_C2PMSG_37_OFFSET,
+                        (ULONG)(cmdBufPa.QuadPart >> 32)) ||
+                    !PspGpuProxyWriteRegister(PSP_C2PMSG_35_OFFSET,
+                        GFX_CMD_ID_LOAD_TOC)) {
+                    KeReleaseSpinLock(&devExt->CommandLock, irql);
+                    KdPrint(("LOAD_TOC: GPU proxy write failed\n"));
+                    MmFreeContiguousMemory(cmdBufVa);
+                    MmFreeContiguousMemory(tocBufVa);
+                    status = STATUS_DEVICE_NOT_READY;
+                    break;
+                }
+            } else {
+                PVOID mboxBase = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_36_OFFSET),
+                    (ULONG)(cmdBufPa.QuadPart & 0xFFFFFFFF));
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_37_OFFSET),
+                    (ULONG)(cmdBufPa.QuadPart >> 32));
+                WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET),
+                    GFX_CMD_ID_LOAD_TOC);
+            }
             KeReleaseSpinLock(&devExt->CommandLock, irql);
         }
 
-        for (timeout = 0; timeout < 3000; timeout++) {
-            KeStallExecutionProcessor(1000);
-            cmdReg = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_35_OFFSET));
-            if (cmdReg == 0) break;
+        /* Poll C2PMSG_35 for completion */
+        {
+            PVOID mboxBase = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;
+            for (timeout = 0; timeout < 3000; timeout++) {
+                KeStallExecutionProcessor(1000);
+                ULONG reg = (g_GpuProxyAvailable)
+                    ? PspGpuProxyReadRegister(PSP_C2PMSG_35_OFFSET)
+                    : READ_REGISTER_ULONG((PULONG)((PUCHAR)mboxBase + PSP_C2PMSG_35_OFFSET));
+                if (reg == 0) break;
+            }
         }
 
-        c2p81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_81_OFFSET));
-        ULONG smu66 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + MP1_BASE + SMU_C2PMSG_66_OFFSET));
-        ULONG smu82 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + MP1_BASE + SMU_C2PMSG_82_OFFSET));
-        ULONG smu90 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + MP1_BASE + SMU_C2PMSG_90_OFFSET));
+        c2p81 = PspGpuProxyReadRegister(PSP_C2PMSG_81_OFFSET);
+        ULONG smu66 = PspGpuProxyReadRegister(MP1_BASE + SMU_C2PMSG_66_OFFSET);
+        ULONG smu82 = PspGpuProxyReadRegister(MP1_BASE + SMU_C2PMSG_82_OFFSET);
+        ULONG smu90 = PspGpuProxyReadRegister(MP1_BASE + SMU_C2PMSG_90_OFFSET);
 
         KdPrint(("LOAD_TOC: timeout=%u C2PMSG_35=0x%08X C2PMSG_81=0x%08X\n", timeout, cmdReg, c2p81));
         KdPrint(("LOAD_TOC: SMU [66]=0x%08X [82]=0x%08X [90]=0x%08X\n", smu66, smu82, smu90));
@@ -1502,6 +1601,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         PPSP_GPU_PM4_SUBMIT_REQUEST req = (PPSP_GPU_PM4_SUBMIT_REQUEST)inputBuffer;
         ULONG cmdCount = req->CommandCount;
         ULONG waitMs = req->WaitMs;
+        /* Save Commands[0..7] that overlap response struct (METHOD_BUFFERED sharing) */
+        ULONG savedCmds[8];
+        ULONG saveCount = cmdCount < 8 ? cmdCount : 8;
+        RtlCopyMemory(savedCmds, req->Commands, saveCount * sizeof(ULONG));
         if (cmdCount == 0 || cmdCount > 64 ||
             inputLength < (SIZE_T)FIELD_OFFSET(PSP_GPU_PM4_SUBMIT_REQUEST, Commands[cmdCount])) {
             status = STATUS_INVALID_PARAMETER;
@@ -1516,6 +1619,7 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         /* Restore fields that RtlZeroMemory cleared (METHOD_BUFFERED shares buffer) */
         req->CommandCount = cmdCount;
         req->WaitMs = waitMs;
+        RtlCopyMemory(req->Commands, savedCmds, saveCount * sizeof(ULONG));
         status = PspGpuPm4Submit(devExt, req, resp);
         bytesReturned = sizeof(PSP_GPU_PM4_SUBMIT_RESPONSE);
         break;

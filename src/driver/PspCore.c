@@ -58,7 +58,7 @@ NTSTATUS PspGpuProxyInit(PDEVICE_EXTENSION devExt)
 {
     ULONG testValue;
     KIRQL irql;
-    BOOLEAN openedLocally = FALSE;
+    HANDLE localHandle = NULL;
     NTSTATUS status;
     
     KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
@@ -76,7 +76,14 @@ NTSTATUS PspGpuProxyInit(PDEVICE_EXTENSION devExt)
             return status;
         }
         KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
-        openedLocally = TRUE;
+        localHandle = g_GpuDriverHandle;
+        /* Check if another thread already initialized the proxy */
+        if (g_GpuProxyAvailable) {
+            ZwClose(localHandle);
+            g_GpuDriverHandle = NULL;
+            KeReleaseSpinLock(&g_Bar5MappingLock, irql);
+            return STATUS_SUCCESS;
+        }
     }
     
     KeReleaseSpinLock(&g_Bar5MappingLock, irql);
@@ -86,10 +93,12 @@ NTSTATUS PspGpuProxyInit(PDEVICE_EXTENSION devExt)
     
     if (testValue == 0xFFFFFFFF) {
         KdPrint(("PSP_GPU_PROXY: GPU driver proxy not responding correctly\n"));
-        if (openedLocally && g_GpuDriverHandle != NULL) {
+        KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
+        if (localHandle != NULL && g_GpuDriverHandle == localHandle) {
             ZwClose(g_GpuDriverHandle);
             g_GpuDriverHandle = NULL;
         }
+        KeReleaseSpinLock(&g_Bar5MappingLock, irql);
         return STATUS_DEVICE_NOT_READY;
     }
     

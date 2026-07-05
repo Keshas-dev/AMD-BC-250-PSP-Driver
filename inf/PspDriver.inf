@@ -8,12 +8,18 @@ DriverVer   = 06/12/2026,3.0.0.3
 
 [DestinationDirs]
 DefaultDestDir = 13
+Firmware_Files = 13,System32\drivers\bc-250
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
 PspDriver.sys = 1
+Asd.bin = 1,,firmware
+Ta.bin = 1,,firmware
+Sysdrv.bin = 1,,firmware
+Sos.bin = 1,,firmware
+Smu.bin = 1,,firmware
 
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64
@@ -22,10 +28,17 @@ PspDriver.sys = 1
 %DeviceDesc% = Psp_Device_Install, PCI\VEN_1022&DEV_143E&SUBSYS_00001022&REV_00
 
 [Psp_Device_Install.NT]
-CopyFiles = Drivers_Dir
+CopyFiles = Drivers_Dir, Firmware_Files
 
 [Drivers_Dir]
 PspDriver.sys
+
+[Firmware_Files]
+Asd.bin
+Ta.bin
+Sysdrv.bin
+Sos.bin
+Smu.bin
 
 [Psp_Device_Install.NT.Services]
 AddService = PspDriver,%SPSVCINST_ASSOCSERVICE%,Psp_Service_Inst

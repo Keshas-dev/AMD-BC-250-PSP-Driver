@@ -21,7 +21,7 @@ NTSTATUS PspSmuWake(PDEVICE_EXTENSION devExt, ULONG message, ULONG argument, PUL
     PAGED_CODE();
     KdPrint(("PSP_SMU: PspSmuWake msg=0x%08X arg=0x%08X\n", message, argument));
 
-    if (!g_Bar5Mapping && !g_GpuProxyAvailable) {
+    if (!g_Bar5Mapping && !devExt->GpuMmioBase && !g_GpuProxyAvailable) {
         KdPrint(("PSP_SMU: No GPU BAR5 access available\n"));
         return STATUS_NOT_SUPPORTED;
     }
