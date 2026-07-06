@@ -15,7 +15,11 @@
 #define GPU_CP_KIQ_BASE_HI              0xE064
 #define GPU_CP_KIQ_RPTR                 0xE06C
 #define GPU_CP_KIQ_WPTR                 0xE078
+#define GPU_CP_KIQ_ACTIVE               0xE080
 #define GPU_RLC_CP_SCHEDULERS           0xECA8
+#define GPU_GRBM_GFX_INDEX              0x34D0
+#define GPU_CP_HQD_PQ_CONTROL           0x90F0
+#define GPU_CP_HQD_ACTIVE               0x910C
 
 /* CP_ME_CNTL bits */
 #define ME_CNTL_ME_HALT   (1u << 28)
@@ -23,6 +27,14 @@
 
 /* RLC_CP_SCHEDULERS KIQ value: ENABLE=1, ME=1 */
 #define RLC_SCHEDULERS_KIQ 0xA0
+
+/* GRBM_GFX_INDEX: ME=1, PIPE=0, QUEUE=0 (selects KIQ engine) */
+#define GRBM_GFX_INDEX_KIQ         (1u << 16)
+/* GRBM_GFX_INDEX: SE_BROADCAST | QUEUE_BROADCAST | PIPE_BROADCAST | INSTANCE_BROADCAST */
+#define GRBM_GFX_INDEX_BROADCAST   (0xE0000000UL)
+
+/* CP_HQD_PQ_CONTROL: ring size = 4 DWORDs (only bit 0 stickable on BC-250) */
+#define CP_HQD_PQ_CONTROL_MIN_SIZE 0x00000001
 
 /* WPTR polling page size */
 #define WPTR_POLL_PAGE_SIZE 0x1000
@@ -49,36 +61,64 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
         return STATUS_DEVICE_NOT_READY;
     }
 
-    /* 1. Set KIQ_BASE (KIQ engine reads commands from here!) */
-    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_LO,
-            (ULONG)(g_KiqRingPa.QuadPart & 0xFFFFFFFF))) {
-        KdPrint(("KIQ_HW: Failed to write KIQ_BASE_LO\n"));
-        return STATUS_DEVICE_NOT_READY;
-    }
-    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_HI,
-            (ULONG)(g_KiqRingPa.QuadPart >> 32))) {
-        KdPrint(("KIQ_HW: Failed to write KIQ_BASE_HI\n"));
-        return STATUS_DEVICE_NOT_READY;
+    /* 1. Select KIQ engine via GRBM_GFX_INDEX (ME=1, PIPE=0, QUEUE=0) */
+    PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_KIQ);
+    KeStallExecutionProcessor(1);
+
+    /* 2. Deactivate queue before programming */
+    PspGpuProxyWriteRegister(GPU_CP_HQD_ACTIVE, 0);
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_ACTIVE, 0);
+    KeStallExecutionProcessor(1);
+
+    /* 3. Set ring buffer address via KIQ_BASE */
+    {
+        ULONG baseLo = (ULONG)(g_KiqRingPa.QuadPart & 0xFFFFFFFF);
+        ULONG baseHi = (ULONG)(g_KiqRingPa.QuadPart >> 32);
+        KdPrint(("KIQ_HW: Writing KIQ_BASE = 0x%08X_%08X (PA=0x%llX)\n",
+            baseHi, baseLo, g_KiqRingPa.QuadPart));
+        if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_LO, baseLo)) {
+            KdPrint(("KIQ_HW: Failed to write KIQ_BASE_LO\n"));
+            PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
+            return STATUS_DEVICE_NOT_READY;
+        }
+        KeStallExecutionProcessor(1);
+        ULONG readback = PspGpuProxyReadRegister(GPU_CP_KIQ_BASE_LO);
+        KdPrint(("KIQ_HW: KIQ_BASE_LO wrote=0x%08X readback=0x%08X\n", baseLo, readback));
+        if (readback != baseLo) {
+            KdPrint(("KIQ_HW: WARNING - KIQ_BASE_LO readback mismatch!\n"));
+        }
+        if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_BASE_HI, baseHi)) {
+            KdPrint(("KIQ_HW: Failed to write KIQ_BASE_HI\n"));
+            PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
+            return STATUS_DEVICE_NOT_READY;
+        }
     }
 
-    /* 2. Clear RPTR + WPTR */
-    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_RPTR, 0)) {
-        KdPrint(("KIQ_HW: Failed to clear KIQ_RPTR\n"));
-    }
-    if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, 0)) {
-        KdPrint(("KIQ_HW: Failed to clear KIQ_WPTR\n"));
-    }
+    /* 4. Set ring size via CP_HQD_PQ_CONTROL (only bit 0 sticks on BC-250 = 4 DWORDs) */
+    PspGpuProxyWriteRegister(GPU_CP_HQD_PQ_CONTROL, CP_HQD_PQ_CONTROL_MIN_SIZE);
 
-    /* 3. Notify RLC scheduler — SKIPPED: RLC_CP_SCHEDULERS was previously at 0xECA1
-     *    (unaligned, not 4-byte aligned). Correct offset is 0xECA8 (empirically confirmed).
-     *    KIQ works without RLC scheduler notification on BC-250. */
-    // PspGpuProxyWriteRegister(GPU_RLC_CP_SCHEDULERS, RLC_SCHEDULERS_KIQ);
+    /* 5. Clear RPTR + WPTR */
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_RPTR, 0);
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, 0);
+    KeStallExecutionProcessor(1);
 
-    /* 4. Ensure CP is unhalted */
-    if (!PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, 0)) {
-        KdPrint(("KIQ_HW: Failed to unhalt CP\n"));
-    }
+    /* 6. Ensure CP is unhalted */
+    PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, 0);
     KeStallExecutionProcessor(100);
+
+    /* 7. Reactivate queue */
+    PspGpuProxyWriteRegister(GPU_CP_HQD_ACTIVE, 1);
+    PspGpuProxyWriteRegister(GPU_CP_KIQ_ACTIVE, 1);
+    KeStallExecutionProcessor(1);
+
+    /* 8. Notify RLC scheduler to enable KIQ scheduling */
+    {
+        ULONG sched = PspGpuProxyReadRegister(GPU_RLC_CP_SCHEDULERS);
+        PspGpuProxyWriteRegister(GPU_RLC_CP_SCHEDULERS, sched | RLC_SCHEDULERS_KIQ);
+    }
+
+    /* 9. Restore GRBM_GFX_INDEX to broadcast */
+    PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
 
     KdPrint(("KIQ_HW: KIQ programmed — ring PA=0x%llX size=%u\n",
         g_KiqRingPa.QuadPart, g_KiqRingSize));
@@ -123,13 +163,23 @@ NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, UL
 
     /* Allocate ring buffer (non-cached for GPU coherency) */
     if (!g_KiqRingVa) {
-        lowAddr.QuadPart = 0;
-        highAddr.QuadPart = 0x100000000ULL;
+        /* Try below 2GB first for guaranteed non-zero low 32 bits */
+        lowAddr.QuadPart = 0x10000;  /* skip zero page */
+        highAddr.QuadPart = 0x80000000ULL;  /* below 2GB */
         boundary.QuadPart = 0;
         g_KiqRingVa = MmAllocateContiguousMemorySpecifyCache(
             ringSize, lowAddr, highAddr, boundary, MmNonCached);
+        /* Try below 4GB (above 2GB) */
         if (!g_KiqRingVa) {
-            highAddr.QuadPart = 0xFFFFFFFF;
+            lowAddr.QuadPart = 0x80000000ULL;
+            highAddr.QuadPart = 0x100000000ULL;
+            g_KiqRingVa = MmAllocateContiguousMemorySpecifyCache(
+                ringSize, lowAddr, highAddr, boundary, MmNonCached);
+        }
+        /* Last resort: try any address */
+        if (!g_KiqRingVa) {
+            lowAddr.QuadPart = 0;
+            highAddr.QuadPart = 0xFFFFFFFFFFFFFFFFULL;
             g_KiqRingVa = MmAllocateContiguousMemorySpecifyCache(
                 ringSize, lowAddr, highAddr, boundary, MmNonCached);
         }
@@ -140,6 +190,36 @@ NTSTATUS PspKiqInit(PDEVICE_EXTENSION devExt, ULONG64 ringPA, ULONG ringSize, UL
         RtlZeroMemory(g_KiqRingVa, ringSize);
         g_KiqRingPa = MmGetPhysicalAddress(g_KiqRingVa);
         g_KiqRingSize = ringSize;
+        KdPrint(("KIQ: ring allocated VA=%p PA=0x%llX size=%u\n",
+            g_KiqRingVa, g_KiqRingPa.QuadPart, g_KiqRingSize));
+        /* If PA low 32 bits is 0 (e.g. at 4GB boundary), try re-allocating */
+        if (g_KiqRingPa.LowPart == 0 && g_KiqRingPa.QuadPart != 0) {
+            KdPrint(("KIQ: PA LowPart=0 (0x%llX), re-trying allocation\n",
+                g_KiqRingPa.QuadPart));
+            MmFreeContiguousMemory(g_KiqRingVa);
+            g_KiqRingVa = NULL;
+            /* Force lower 2GB by trying a different approach */
+            lowAddr.QuadPart = 0x10000;
+            highAddr.QuadPart = 0x80000000ULL;
+            g_KiqRingVa = MmAllocateContiguousMemorySpecifyCache(
+                ringSize, lowAddr, highAddr, boundary, MmNonCached);
+            if (g_KiqRingVa) {
+                g_KiqRingPa = MmGetPhysicalAddress(g_KiqRingVa);
+                g_KiqRingSize = ringSize;
+            } else {
+                /* If still failing, try with lower priority */
+                g_KiqRingVa = MmAllocateContiguousMemory(ringSize, highAddr);
+                if (g_KiqRingVa) {
+                    g_KiqRingPa = MmGetPhysicalAddress(g_KiqRingVa);
+                    g_KiqRingSize = ringSize;
+                } else {
+                    g_KiqInitGuard = 0;
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
+            }
+        }
+        KdPrint(("KIQ: ring allocated (attempt 2) VA=%p PA=0x%llX LowPart=0x%08X size=%u\n",
+            g_KiqRingVa, g_KiqRingPa.QuadPart, g_KiqRingPa.LowPart, g_KiqRingSize));
     }
 
     if (ringPA) {
@@ -211,14 +291,18 @@ NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req)
         return STATUS_INVALID_PARAMETER;
     }
 
+    /* Select KIQ engine for all KIQ register accesses (RPTR read, WPTR write) */
+    PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_KIQ);
+    KeStallExecutionProcessor(1);
+
     KeAcquireSpinLock(&g_KiqRingLock, &irql);
 
     wptr = g_KiqRingWptr;
 
-    /* Check ring capacity */
+    /* Check ring capacity — mask RPTR to 9 bits (KIQ_WPTR is 9-bit, max 512 DWORDs) */
     {
         UINT32 ringDwords = g_KiqRingSize / sizeof(ULONG);
-        UINT32 rptr = PspGpuProxyReadRegister(GPU_CP_KIQ_RPTR);
+        UINT32 rptr = PspGpuProxyReadRegister(GPU_CP_KIQ_RPTR) & 0x000001FF;
         UINT32 used;
         if (wptr >= rptr) {
             used = wptr - rptr;
@@ -227,6 +311,7 @@ NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req)
         }
         if (used + req->CommandCount > ringDwords) {
             KeReleaseSpinLock(&g_KiqRingLock, irql);
+            PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
             return STATUS_BUFFER_TOO_SMALL;
         }
     }
@@ -255,11 +340,20 @@ NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req)
         KdPrint(("KIQ: WARNING — Write WPTR=%u via proxy failed\n", wptr));
     }
 
+    /* Restore GRBM_GFX_INDEX to broadcast */
+    PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
+
     return STATUS_SUCCESS;
 }
 
 VOID PspKiqCleanup(VOID)
 {
+    KIRQL irql;
+
+    /* Acquire ring lock to prevent race with PspKiqSubmit/PspGpuPm4Submit */
+    KeAcquireSpinLock(&g_KiqRingLock, &irql);
+    g_KiqRingInitialized = FALSE;
+
     /* Halt CP engines */
     if (g_Bar5Mapping || g_GpuDriverHandle) {
         PspGpuProxyWriteRegister(GPU_CP_ME_CNTL, ME_CNTL_ME_HALT | ME_CNTL_PFP_HALT);
@@ -285,10 +379,11 @@ VOID PspKiqCleanup(VOID)
         g_KiqRingPa.QuadPart = 0;
         g_KiqRingSize = 0;
         g_KiqRingWptr = 0;
-        g_KiqRingInitialized = FALSE;
         KdPrint(("PspKiqCleanup: ring buffer freed\n"));
     }
     g_KiqInitGuard = 0;
+
+    KeReleaseSpinLock(&g_KiqRingLock, irql);
 }
 
 NTSTATUS PspKiqLoadFirmware(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwSize, PUCHAR FwData)
@@ -375,14 +470,28 @@ NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST r
     KIRQL irql;
     ULONG wptr;
 
+    /* METHOD_BUFFERED: save fields BEFORE writing to response (same buffer!) */
+    ULONG savedCmdCount = req ? req->CommandCount : 0;
+    ULONG savedWaitMs = req ? req->WaitMs : 0;
+
     if (!g_KiqRingInitialized || !g_KiqRingVa) {
         NTSTATUS st = PspKiqInit(devExt, 0, 0, 0);
-        if (!NT_SUCCESS(st)) return st;
+        if (!NT_SUCCESS(st)) {
+            resp->Status = st;
+            return st;
+        }
     }
 
-    if (!req || req->CommandCount == 0 || req->CommandCount > 64) {
+    if (!req || savedCmdCount == 0 || savedCmdCount > 64) {
+        resp->Status = STATUS_INVALID_PARAMETER;
         return STATUS_INVALID_PARAMETER;
     }
+
+    resp->Status = STATUS_SUCCESS;
+
+    /* Select KIQ engine for all subsequent KIQ register accesses */
+    PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_KIQ);
+    KeStallExecutionProcessor(1);
 
     /* Read SCRATCH before */
     resp->ScratchBefore = PspGpuProxyReadRegister(0x32D4);
@@ -394,23 +503,24 @@ NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST r
     KeAcquireSpinLock(&g_KiqRingLock, &irql);
     wptr = g_KiqRingWptr;
 
-    /* Check ring capacity */
+    /* Check ring capacity — mask RPTR to 9 bits (KIQ_WPTR is 9-bit, max 512 DWORDs) */
     {
         UINT32 ringDwords = g_KiqRingSize / sizeof(ULONG);
-        UINT32 rptr = PspGpuProxyReadRegister(GPU_CP_KIQ_RPTR);
+        UINT32 rptr = PspGpuProxyReadRegister(GPU_CP_KIQ_RPTR) & 0x000001FF;
         UINT32 used;
         if (wptr >= rptr) {
             used = wptr - rptr;
         } else {
             used = ringDwords - rptr + wptr;
         }
-        if (used + req->CommandCount > ringDwords) {
+        if (used + savedCmdCount > ringDwords) {
             KeReleaseSpinLock(&g_KiqRingLock, irql);
+            PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
             return STATUS_BUFFER_TOO_SMALL;
         }
     }
 
-    for (i = 0; i < req->CommandCount; i++) {
+    for (i = 0; i < savedCmdCount; i++) {
         ((volatile PULONG)(g_KiqRingVa))[wptr] = req->Commands[i];
         wptr++;
         if (wptr * sizeof(ULONG) >= g_KiqRingSize) {
@@ -433,13 +543,13 @@ NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST r
         KdPrint(("GPU_PM4: WARNING — Write WPTR=%u via proxy failed\n", wptr));
     }
 
-    resp->Pm4Dwords = req->CommandCount;
+    resp->Pm4Dwords = savedCmdCount;
     resp->KiqRingWptr = wptr;
 
     /* Wait if requested */
-    if (req->WaitMs > 0) {
+    if (savedWaitMs > 0) {
         LARGE_INTEGER delay;
-        delay.QuadPart = -(LONGLONG)10000 * req->WaitMs;
+        delay.QuadPart = -(LONGLONG)10000 * savedWaitMs;
         KeDelayExecutionThread(KernelMode, FALSE, &delay);
     }
 
@@ -447,13 +557,17 @@ NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST r
     resp->ScratchAfter = PspGpuProxyReadRegister(0x32D4);
     resp->HqdPqWptrAfter = PspGpuProxyReadRegister(GPU_CP_KIQ_WPTR);
     resp->WptrReadback = PspGpuProxyReadRegister(GPU_CP_KIQ_WPTR);
+
+    /* Restore GRBM_GFX_INDEX */
+    PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
     resp->KiqRingSize = g_KiqRingSize;
     resp->KiqRingPa = g_KiqRingPa.LowPart;
+    resp->HqdActive = PspGpuProxyReadRegister(GPU_CP_HQD_ACTIVE);
 
-    KdPrint(("GPU_PM4: Scratch=0x%08X->0x%08X WPTR=%u->%u PM4=%u\n",
+    KdPrint(("GPU_PM4: Scratch=0x%08X->0x%08X WPTR=%u->%u PM4=%u PA=0x%llX HqdActive=%u\n",
         resp->ScratchBefore, resp->ScratchAfter,
         resp->HqdPqWptrBefore, resp->HqdPqWptrAfter,
-        req->CommandCount));
+        savedCmdCount, g_KiqRingPa.QuadPart, resp->HqdActive));
 
     return STATUS_SUCCESS;
 }

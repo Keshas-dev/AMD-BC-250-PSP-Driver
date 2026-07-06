@@ -117,7 +117,14 @@ ULONG PspGpuProxyReadRegister(ULONG offset)
 
     KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
     if (g_Bar5Mapping != NULL) {
-        ULONG val = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset));
+        ULONG val;
+        __try {
+            val = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            KdPrint(("PSP_GPU_PROXY: Read at offset 0x%X caused exception, fallback\n", offset));
+            KeReleaseSpinLock(&g_Bar5MappingLock, irql);
+            return 0xFFFFFFFF;
+        }
         KeReleaseSpinLock(&g_Bar5MappingLock, irql);
         return val;
     }
@@ -157,7 +164,13 @@ BOOLEAN PspGpuProxyWriteRegister(ULONG offset, ULONG value)
 
     KeAcquireSpinLock(&g_Bar5MappingLock, &irql);
     if (g_Bar5Mapping != NULL) {
-        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset), value);
+        __try {
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + offset), value);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            KdPrint(("PSP_GPU_PROXY: Write at offset 0x%X caused exception\n", offset));
+            KeReleaseSpinLock(&g_Bar5MappingLock, irql);
+            return FALSE;
+        }
         KeReleaseSpinLock(&g_Bar5MappingLock, irql);
         return TRUE;
     }

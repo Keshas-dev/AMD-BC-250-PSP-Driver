@@ -298,17 +298,26 @@ NTSTATUS PspSendSmcBoot(PDEVICE_EXTENSION devExt)
         if (cmdReg == 0) break;
     }
 
-    /* Check results */
-    ULONG c2p81 = 0, smu66 = 0, smu82 = 0, smu90 = 0;
-    if (g_Bar5Mapping) {
-        c2p81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + PSP_C2PMSG_81_OFFSET));
-        smu66 = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + MP1_BASE + SMU_C2PMSG_66_OFFSET));
-        smu82 = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + MP1_BASE + SMU_C2PMSG_82_OFFSET));
-        smu90 = READ_REGISTER_ULONG((PULONG)((PUCHAR)g_Bar5Mapping + MP1_BASE + SMU_C2PMSG_90_OFFSET));
+    /* Check results — SMU register reads must use SMN via NBIO bridge (BAR5+0x38/0x3C) */
+    ULONG c2p81 = 0;
+    ULONG smu66 = 0, smu82 = 0, smu90 = 0;
+    if (g_Bar5Mapping || devExt->GpuMmioBase) {
+        PVOID mbox = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;
+        c2p81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + PSP_C2PMSG_81_OFFSET));
+        /* SMU via SMN (MP1 NOT mapped in BAR5 on BC-250) */
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + 0x38), 0x03B10A08);
+        KeStallExecutionProcessor(1);
+        smu66 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + 0x3C));
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + 0x38), 0x03B10A48);
+        KeStallExecutionProcessor(1);
+        smu82 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + 0x3C));
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)mbox + 0x38), 0x03B10A68);
+        KeStallExecutionProcessor(1);
+        smu90 = READ_REGISTER_ULONG((PULONG)((PUCHAR)mbox + 0x3C));
     }
 
     KdPrint(("SMC_BOOT: done timeout=%u C2PMSG_35=0x%08X C2PMSG_81=0x%08X\n", timeout, cmdReg, c2p81));
-    KdPrint(("SMC_BOOT: SMU [66]=0x%08X [82]=0x%08X [90]=0x%08X\n", smu66, smu82, smu90));
+    KdPrint(("SMC_BOOT: SMU [66]=0x%08X (SMN) [82]=0x%08X [90]=0x%08X\n", smu66, smu82, smu90));
 
     MmFreeContiguousMemory(cmdBufVa);
     MmFreeContiguousMemory(tocBufVa);
@@ -1474,12 +1483,19 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         }
 
         c2p81 = PspGpuProxyReadRegister(PSP_C2PMSG_81_OFFSET);
-        ULONG smu66 = PspGpuProxyReadRegister(MP1_BASE + SMU_C2PMSG_66_OFFSET);
-        ULONG smu82 = PspGpuProxyReadRegister(MP1_BASE + SMU_C2PMSG_82_OFFSET);
-        ULONG smu90 = PspGpuProxyReadRegister(MP1_BASE + SMU_C2PMSG_90_OFFSET);
+        /* SMU registers via SMN (MP1 NOT mapped in BAR5 on BC-250) */
+        PspGpuProxyWriteRegister(0x38, 0x03B10A08);
+        KeStallExecutionProcessor(1);
+        ULONG smu66 = PspGpuProxyReadRegister(0x3C);
+        PspGpuProxyWriteRegister(0x38, 0x03B10A48);
+        KeStallExecutionProcessor(1);
+        ULONG smu82 = PspGpuProxyReadRegister(0x3C);
+        PspGpuProxyWriteRegister(0x38, 0x03B10A68);
+        KeStallExecutionProcessor(1);
+        ULONG smu90 = PspGpuProxyReadRegister(0x3C);
 
         KdPrint(("LOAD_TOC: timeout=%u C2PMSG_35=0x%08X C2PMSG_81=0x%08X\n", timeout, cmdReg, c2p81));
-        KdPrint(("LOAD_TOC: SMU [66]=0x%08X [82]=0x%08X [90]=0x%08X\n", smu66, smu82, smu90));
+        KdPrint(("LOAD_TOC: SMU [66]=0x%08X (SMN) [82]=0x%08X [90]=0x%08X\n", smu66, smu82, smu90));
 
         if (outputLength >= sizeof(ULONG) * 5) {
             PULONG resp = (PULONG)outputBuffer;
@@ -1601,15 +1617,16 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         PPSP_GPU_PM4_SUBMIT_REQUEST req = (PPSP_GPU_PM4_SUBMIT_REQUEST)inputBuffer;
         ULONG cmdCount = req->CommandCount;
         ULONG waitMs = req->WaitMs;
-        /* Save Commands[0..7] that overlap response struct (METHOD_BUFFERED sharing) */
-        ULONG savedCmds[8];
-        ULONG saveCount = cmdCount < 8 ? cmdCount : 8;
-        RtlCopyMemory(savedCmds, req->Commands, saveCount * sizeof(ULONG));
+        /* Validate cmdCount BEFORE reading Commands[] (prevents OOB read) */
         if (cmdCount == 0 || cmdCount > 64 ||
             inputLength < (SIZE_T)FIELD_OFFSET(PSP_GPU_PM4_SUBMIT_REQUEST, Commands[cmdCount])) {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
+        /* Save Commands[0..7] that overlap response struct (METHOD_BUFFERED sharing) */
+        ULONG savedCmds[8];
+        ULONG saveCount = cmdCount < 8 ? cmdCount : 8;
+        RtlCopyMemory(savedCmds, req->Commands, saveCount * sizeof(ULONG));
         if (outputLength < sizeof(PSP_GPU_PM4_SUBMIT_RESPONSE)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;

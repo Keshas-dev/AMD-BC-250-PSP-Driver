@@ -8,18 +8,18 @@ DriverVer   = 06/12/2026,3.0.0.3
 
 [DestinationDirs]
 DefaultDestDir = 13
-Firmware_Files = 13,System32\drivers\bc-250
+Firmware_Files = 12, bc-250
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
 PspDriver.sys = 1
-Asd.bin = 1,,firmware
-Ta.bin = 1,,firmware
-Sysdrv.bin = 1,,firmware
-Sos.bin = 1,,firmware
-Smu.bin = 1,,firmware
+Asd.bin = 1, firmware
+Ta.bin = 1, firmware
+Sysdrv.bin = 1, firmware
+Sos.bin = 1, firmware
+Smu.bin = 1, firmware
 
 [Manufacturer]
 %ManufacturerName% = Standard,NTamd64

@@ -1,3 +1,25 @@
+## CRITICAL: Pre-build code analysis agent
+- **ALWAYS** run the Code Reviewer agent BEFORE every build to catch bugs, wrong register offsets, and logic errors.
+- The agent must check: IOCTL handler parameter validation, register offset correctness against hw.h, method_buffered buffer sharing, pointer safety, and memory leaks.
+- Never build without prior agent code review.
+
+## CRITICAL: Never jump to "hardware limitation" conclusions
+- All tests must be run with firmware files properly installed at the correct path (`C:\Windows\System32\drivers\bc-250\`).
+- Verify firmware installation FIRST before any hardware diagnostic conclusion.
+- Tests must be repeated multiple times, across reboots, before concluding hardware is dead.
+- An SMU or engine appearing dead is often a firmware-not-loaded problem, not a hardware limitation.
+
+## CRITICAL: INF DestinationDirs syntax (easy to get wrong)
+- `DIRID_12` = `%SystemRoot%\System32\drivers\` — use for firmware files in `bc-250\`
+- `DIRID_13` = `%SystemRoot%\System32\DriverStore\FileRepository\` — NOT for runtime files!
+- WRONG: `Firmware_Files = 13,System32\drivers\bc-250` → creates `...\drivers\System32\drivers\bc-250\` (double path!)
+- WRONG: `Firmware_Files = 13, bc-250` → creates `...\DriverStore\FileRepository\bc-250\` (wrong parent dir!)
+- CORRECT: `Firmware_Files = 12, bc-250` → creates `...\drivers\bc-250\` ✅
+- Also in `SourceDisksFiles`:
+  - WRONG: `Asd.bin = 1,,firmware` ← third field is `size`, not `subdir` (extra comma!)
+  - CORRECT: `Asd.bin = 1, firmware` ← second field is `subdir`
+- Check BOTH GPU (`inf\amdbc250_dream.inf`) and PSP (`inf\PspDriver.inf`) INF files.
+
 ## Session 2026-06-30: All PSP Bugs Fixed
 
 ### PSP Bug Fix Status
