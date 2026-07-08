@@ -168,7 +168,7 @@ typedef struct _PSP_STATUS_INFO {
     ULONG FwPaShifted;         // PA>>20 of firmware buffer
     ULONG NbioSig1;            // NBIO signature register 0xC100
     ULONG NbioSig2;            // NBIO signature register 0xC180
-    ULONG GrbmStatus;          // GRBM_STATUS (GC_BASE + 0x2004 = 0x3264)
+    ULONG GrbmStatus;          // GRBM_STATUS (GC_BASE + 0x2000 = 0x3260)
     ULONG MmhubCheck;          // MMHUB check register (0x50D0)
     ULONG MmioVA;              // BAR5 virtual address
     ULONG MmioSize;            // BAR5 mapped size
@@ -209,7 +209,7 @@ typedef struct _PSP_PROBE_INFO {
     ULONG NbioSig1;
     ULONG NbioSig2;
     ULONG MmhubCheck;
-    ULONG GrbmStatus;          // GRBM_STATUS (GC_BASE + 0x2004 = 0x3264)
+    ULONG GrbmStatus;          // GRBM_STATUS (GC_BASE + 0x2000 = 0x3260)
     ULONG GcCheck;
     ULONG HdpCheck;
     // Ring state

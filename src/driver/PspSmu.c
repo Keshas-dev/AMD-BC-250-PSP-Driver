@@ -54,23 +54,47 @@ NTSTATUS PspSmuWake(PDEVICE_EXTENSION devExt, ULONG message, ULONG argument, PUL
     KdPrint(("PSP_SMU: before [66]=0x%08X [82]=0x%08X [90]=0x%08X\n",
         before66, before82, before90));
 
-    /* SMU mailbox protocol: write arg, write msg, poll response */
-    SmnWrite(devExt, SMU_SMN_C2PMSG_82, argument);
+    /* SMU mailbox protocol (bc250-collective verified):
+     * 1. Write RSP=0 to C2PMSG_90 (clear response)
+     * 2. Write ARG to C2PMSG_82
+     * 3. Write CMD to C2PMSG_66
+     * 4. Poll RSP (C2PMSG_90) for 0x01=OK, 0xFF=fail, 0xFE=unknown, 0xFD=rejected, 0xFC=busy
+     * 5. Read result from ARG (C2PMSG_82), NOT from RSP (C2PMSG_90) */
+    SmnWrite(devExt, SMU_SMN_C2PMSG_90, 0);       /* Step 1: Clear response register */
+    KeStallExecutionProcessor(1);
+    SmnWrite(devExt, SMU_SMN_C2PMSG_82, argument); /* Step 2: Write argument */
     KeStallExecutionProcessor(10);
-    SmnWrite(devExt, SMU_SMN_C2PMSG_66, message);
+    SmnWrite(devExt, SMU_SMN_C2PMSG_66, message);   /* Step 3: Write message = trigger */
     KeStallExecutionProcessor(10);
 
-    KdPrint(("PSP_SMU: msg/param written via SMN, polling [90]...\n"));
+    KdPrint(("PSP_SMU: msg/param written via SMN, polling [90] for 0x01...\n"));
 
     *pResponse = 0;
     for (timeout = 0; timeout < SMU_RESPONSE_TIMEOUT_MS; timeout++) {
         KeStallExecutionProcessor(1000);
         ULONG resp = SmnRead(devExt, SMU_SMN_C2PMSG_90);
-        if (resp != 0 && resp != 0xFFFFFFFF) {
-            *pResponse = resp;
-            KdPrint(("PSP_SMU: response=0x%08X after %u ms\n", resp, timeout));
+        if (resp == 0x01) {
+            /* Step 5: Success — read result from ARG register */
+            *pResponse = SmnRead(devExt, SMU_SMN_C2PMSG_82);
+            KdPrint(("PSP_SMU: response=0x%08X after %u ms\n", *pResponse, timeout));
             return STATUS_SUCCESS;
         }
+        if (resp == 0xFF) {
+            KdPrint(("PSP_SMU: SMU returned error (0xFF) after %u ms\n", timeout));
+            *pResponse = 0xFFFFFFFF;
+            return STATUS_UNSUCCESSFUL;
+        }
+        if (resp == 0xFE) {
+            KdPrint(("PSP_SMU: SMU returned unknown cmd (0xFE) after %u ms\n", timeout));
+            *pResponse = 0xFFFFFFFE;
+            return STATUS_NOT_SUPPORTED;
+        }
+        if (resp == 0xFD) {
+            KdPrint(("PSP_SMU: SMU rejected cmd (0xFD) after %u ms\n", timeout));
+            *pResponse = 0xFFFFFFFD;
+            return STATUS_ACCESS_DENIED;
+        }
+        /* 0xFC = busy, 0 = not started — continue polling */
     }
 
     ULONG after66 = SmnRead(devExt, SMU_SMN_C2PMSG_66);
@@ -78,5 +102,6 @@ NTSTATUS PspSmuWake(PDEVICE_EXTENSION devExt, ULONG message, ULONG argument, PUL
     ULONG after90 = SmnRead(devExt, SMU_SMN_C2PMSG_90);
     KdPrint(("PSP_SMU: TIMEOUT [66]=0x%08X [82]=0x%08X [90]=0x%08X\n",
         after66, after82, after90));
+    *pResponse = after82;
     return STATUS_TIMEOUT;
 }

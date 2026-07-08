@@ -56,8 +56,8 @@ static NTSTATUS PspKiqProgramHwRegisters(PDEVICE_EXTENSION devExt)
     KdPrint(("KIQ_HW: Programming KIQ registers (g_Bar5Mapping=%p, GpuMmioBase=%p, GpuDriverHandle=%p)\n",
         g_Bar5Mapping, devExt->GpuMmioBase, g_GpuDriverHandle));
 
-    if (!g_Bar5Mapping && !devExt->GpuMmioBase && g_GpuDriverHandle == NULL) {
-        KdPrint(("KIQ_HW: No BAR5 mapping and no proxy handle, cannot program KIQ\n"));
+    if (!g_Bar5Mapping && !devExt->GpuMmioBase && g_GpuDriverHandle == NULL && !g_GpuProxyAvailable) {
+        KdPrint(("KIQ_HW: No BAR5 mapping, no GpuMmioBase, no proxy handle, and proxy not available\n"));
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -337,7 +337,9 @@ NTSTATUS PspKiqSubmit(PDEVICE_EXTENSION devExt, PPSP_KIQ_SUBMIT_REQUEST req)
 
     /* Update WPTR in GPU KIQ register */
     if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, wptr)) {
-        KdPrint(("KIQ: WARNING — Write WPTR=%u via proxy failed\n", wptr));
+        KdPrint(("KIQ: ERROR — Write WPTR=%u via proxy failed\n", wptr));
+        PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
+        return STATUS_DEVICE_NOT_READY;
     }
 
     /* Restore GRBM_GFX_INDEX to broadcast */
@@ -540,7 +542,10 @@ NTSTATUS PspGpuPm4Submit(PDEVICE_EXTENSION devExt, PPSP_GPU_PM4_SUBMIT_REQUEST r
 
     /* Kick GPU via KIQ WPTR */
     if (!PspGpuProxyWriteRegister(GPU_CP_KIQ_WPTR, wptr)) {
-        KdPrint(("GPU_PM4: WARNING — Write WPTR=%u via proxy failed\n", wptr));
+        KdPrint(("GPU_PM4: ERROR — Write WPTR=%u via proxy failed\n", wptr));
+        PspGpuProxyWriteRegister(GPU_GRBM_GFX_INDEX, GRBM_GFX_INDEX_BROADCAST);
+        resp->Status = STATUS_DEVICE_NOT_READY;
+        return STATUS_DEVICE_NOT_READY;
     }
 
     resp->Pm4Dwords = savedCmdCount;

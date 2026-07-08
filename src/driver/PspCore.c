@@ -341,8 +341,8 @@ NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwS
         return STATUS_INVALID_PARAMETER;
     }
 
-    /* We need GPU BAR5 for mailbox access */
-    if (!g_Bar5Mapping && !devExt->GpuMmioBase) {
+    /* We need GPU BAR5 for mailbox access (proxy path handles it below) */
+    if (!g_Bar5Mapping && !devExt->GpuMmioBase && !g_GpuProxyAvailable) {
         return STATUS_DEVICE_NOT_READY;
     }
     mboxBase = g_Bar5Mapping ? g_Bar5Mapping : devExt->GpuMmioBase;

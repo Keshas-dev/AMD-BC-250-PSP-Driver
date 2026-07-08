@@ -129,18 +129,18 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
     }
 
     PspFreeFirmware(devExt);
-    devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
+    devExt->FwBuffer = MmAllocateContiguousMemory(fileSize, highAddr);
     if (devExt->FwBuffer == NULL) {
         highAddr.QuadPart = 0xFFFFFFFF;
-        devExt->FwBuffer = MmAllocateContiguousMemory(262144, highAddr);
+        devExt->FwBuffer = MmAllocateContiguousMemory(fileSize, highAddr);
     }
     if (devExt->FwBuffer == NULL) {
         KdPrint(("BOOT_SEQ: SOS alloc failed\n"));
         if (fileData != NULL) ExFreePoolWithTag(fileData, 'fw');
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    RtlZeroMemory(devExt->FwBuffer, 262144);
-    devExt->FwSize = 262144;
+    RtlZeroMemory(devExt->FwBuffer, fileSize);
+    devExt->FwSize = fileSize;
 
     if (fileData != NULL) {
         RtlCopyMemory(devExt->FwBuffer, fileData, fileSize);
@@ -1176,7 +1176,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         KeStallExecutionProcessor(1000);
         KdPrint(("BOOT_SEQ: NBIO unlock written\n"));
 
-        results[3] = READ_REGISTER_ULONG((PULONG)((PUCHAR)unlockBase + (AMDBC250_GC_BASE + 0x2000)));
+        results[3] = unlockBase
+            ? READ_REGISTER_ULONG((PULONG)((PUCHAR)unlockBase + (AMDBC250_GC_BASE + 0x2000)))
+            : 0xFFFFFFFF;
         KdPrint(("BOOT_SEQ: SYSDRV=%d SOS=%d GRBM=0x%08X\n", results[1], results[2], results[3]));
         if (outputLength >= sizeof(results)) {
             RtlCopyMemory(outputBuffer, results, sizeof(results));
@@ -1242,8 +1244,13 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         info->TMSSize = g_TmrSize;
         info->GfxVersion = 10;
         PVOID gpuBase = devExt->GpuMmioBase ? devExt->GpuMmioBase : devExt->MmioBase;
-        info->C2pmsg64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + PSP_C2PMSG_64_OFFSET));
-        info->C2pmsg81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + PSP_C2PMSG_81_OFFSET));
+        if (gpuBase) {
+            info->C2pmsg64 = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + PSP_C2PMSG_64_OFFSET));
+            info->C2pmsg81 = READ_REGISTER_ULONG((PULONG)((PUCHAR)gpuBase + PSP_C2PMSG_81_OFFSET));
+        } else {
+            info->C2pmsg64 = 0xFFFFFFFF;
+            info->C2pmsg81 = 0xFFFFFFFF;
+        }
         KdPrint(("IOCTL_PSP_GET_GPU_INFO: C2pmsg64=0x%08X C2pmsg81=0x%08X\n", info->C2pmsg64, info->C2pmsg81));
         info->TmrInitialized = g_TmrInitialized ? 1 : 0;
         bytesReturned = sizeof(PSP_GPU_INFO);
@@ -1587,7 +1594,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             break;
         }
         PSP_LOAD_IP_FW_REQUEST* req = (PSP_LOAD_IP_FW_REQUEST*)inputBuffer;
-        if (req->FwSize == 0 || inputLength < sizeof(PSP_LOAD_IP_FW_REQUEST) + req->FwSize) {
+        /* Check upper bound to prevent integer overflow in addition below */
+        if (req->FwSize == 0 || req->FwSize > 0x100000 ||
+            inputLength < sizeof(PSP_LOAD_IP_FW_REQUEST) + req->FwSize) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
@@ -1595,6 +1604,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         KdPrint(("IOCTL_PSP_LOAD_IP_FW_DIRECT: type=%u size=%u\n", req->FwType, req->FwSize));
         status = PspLoadIpFwViaMailbox(devExt, req->FwType, req->FwSize, fwData);
         if (outputLength >= sizeof(PSP_LOAD_IP_FW_RESPONSE)) {
+            /* NOTE: METHOD_BUFFERED means inputBuffer == outputBuffer.
+             * RtlZeroMemory(resp) will also zero req->FwType/FwSize/CommandCount.
+             * This is safe here because all input fields have been consumed
+             * before the zero. The PM4_SUBMIT handler (below) explicitly
+             * saves/restores overlapping fields for the same reason. */
             PSP_LOAD_IP_FW_RESPONSE* resp = (PSP_LOAD_IP_FW_RESPONSE*)outputBuffer;
             RtlZeroMemory(resp, sizeof(*resp));
             resp->Status = (ULONG)status;
