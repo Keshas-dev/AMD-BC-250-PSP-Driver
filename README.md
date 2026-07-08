@@ -1,244 +1,136 @@
 # AMD BC-250 PSP Windows Driver
 
-> "If you need a tool and nobody has built it yet, then build it yourself."
-
 Windows kernel-mode (WDM) diagnostic driver for the AMD BC-250 Platform Security Processor (PSP).
 Companion to the [AMD BC-250 GPU Driver](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver).
 
-This driver provides low-level PSP access for register diagnostics, firmware analysis,
-and hardware exploration on the AMD BC-250 (Cyan Skillfish) platform. Designed to coexist
-alongside the GPU driver — both use the same certificate and signing infrastructure.
+Provides low-level PSP/SMU access for register diagnostics, firmware loading, and hardware
+exploration on the AMD BC-250 (Cyan Skillfish). Uses the same `AMD-BC250-Signer` test cert
+as the GPU driver — both coexist on the same system.
 
-## GitHub Repository
+## GitHub
 
-This project is part of the [AMD BC-250 Windows Driver collection](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver) — GPU driver and PSP driver repositories work together.
-
-The PSP driver repository is located at:
-- **GPU Driver**: https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver
 - **PSP Driver**: https://github.com/Keshas-dev/AMD-BC-250-PSP-Windows-Driver
+- **GPU Driver**: https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver
 
-## Overview
+## Capabilities
 
-This driver provides low-level access to the AMD BC-250 PSP hardware via:
-- **BAR5 MMIO register mapping** — Direct hardware register access through the PSP's view of GPU registers
-- **Mailbox interface** (C2PMSG) — Communication with PSP firmware for boot and control
-- **IOCTL interface** — User-mode applications can read/write registers, load firmware, and probe hardware
-- **PSP proxy bridge** — Supplies register access to the GPU driver when direct GPU MMIO is unavailable
+- **BAR5 MMIO mapping** via `MmMapIoSpace` (or GPU proxy fallback on Win11 26100)
+- **SMU v88.6.0 mailbox** via SMN (NBIO 0x38/0x3C path) — frequency control, feature enable/disable
+- **PSP C2PMSG mailbox** — SOS boot, firmware loading (RLC, MEC, SDMA, etc.)
+- **GC/MMHUB/HDP/NBIO/DF register access** at corrected BC-250 offsets
+- **IOCTL interface** — register R/W, firmware load, SMU messages, KIQ submit
 
-## Hardware
+## Latest Fix: Driver Signing (2026-07-08)
 
-- **Device**: `PCI\VEN_1022&DEV_143E` (AMD PSP)
-- **Platform**: AMD BC-250 (Cyan Skillfish, codename "ROBIN")
-- **GPU**: AMD BC-250 [1002:13FE] — non-standard register map vs Navi10
-- **BIOS**: Version 5.00 (`BC250_5.00_clv.bin`) / P3.00 (`BC250_3.00.ROM`)
-- **Architecture**: WDM (native NT kernel driver)
-
-## Companion Project: SMU v11.8 Discoveries
-
-The GPU driver repo contains the full SMU v11.8 analysis. Key findings:
-- **MP1_BASE** = 0x16000 (byte offset in BAR5) — SMU mailbox registers
-- **C2PMSG_66/82/90** at 0x16A08/0x16A48/0x16A68 — corrected offsets (was Navi10 0x16104+)
-- **THM_BASE** = 0x16600 — thermal sensor registers (was 0x8000)
-- **Protocol**: clear C2PMSG_90 → arg to C2PMSG_82 → msg to C2PMSG_66 → poll C2PMSG_90
-- **BC-250 SMU v11.8 is minimal**: no PowerUpGfx, no EnableDpmFeature, no SetFanSpeedPercent
-- **Use RequestActiveWgp (0x18)** to power up WGPs, SetCoreEnableMask (0x2C) for CU enable
-
-See [GPU driver README](https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver) for details.
-
-## Bug Fixes (2026-06-26)
-
-Four bugs were identified and fixed in a code review session:
-
-| # | File | Bug | Impact | Fix |
-|---|------|-----|--------|-----|
-| 1 | `PspKiq.c:323` | `body_size=1` in LOAD_IP_FW command should be `4` | Last 3 DWORDs of payload (fw_pa_hi, fw_size, fw_type) were zeroed — firmware load would use wrong physical address | Changed to `body_size=4` matching `PspCore.c:327` |
-| 2 | `PspKiq.c` | Default KIQ ring size `0x2000` (2048 DWORDs) exceeds 9-bit WPTR max (512 DWORDs) | WPTR wraps at 2048 but GPU only sees bottom 9 bits (0x000) — GPU reads from wrong ring location | Default capped at 2048 bytes (512 DWORDs) via `KIQ_MAX_RING_SIZE` |
-| 3 | `PspKiq.c`, `PspCore.c` | `PspGpuProxyWriteRegister` return BOOLEAN ignored throughout | Silent write failure — hardware register not programmed, no error reported | KIQ_BASE_LO/HI writes now fail-return; mailbox writes checked atomically; WPTR kick failures logged |
-| 4 | `PspCore.c:57-84` | Race condition in `PspGpuProxyInit` — `g_GpuDriverHandle` open + proxy check unprotected | Two threads could both open GPU driver handle; second overwrites first | Protected by `g_Bar5MappingLock` spinlock |
-
-## Critical Discovery: BC-250 Register Map
-
-**BC-250 (Cyan Skillfish) does NOT use the standard Navi10 register layout.**
-
-All hardware registers in the 0x2000-0x2FFF range on BC-250 are shifted by `GC_BASE = 0x1260` bytes.
-Standard Navi10 register offsets must be adjusted:
-
+**Root cause**: `build.bat` searched only `x64\` for Inf2Cat, but WDK 10.0.26100.0 installs it in `x86\`:
 ```
-BAR5_offset = 0x1260 + Navi10_offset
+E:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\Inf2Cat.exe
 ```
+Without Inf2Cat, build fell back to `makecat.exe` which generates an incomplete catalog (1565 bytes vs
+Inf2Cat's 4439 bytes). Windows rejected the System-class driver with "not digitally signed".
 
-This means:
-- `CC_GC_SHADER_ARRAY_CONFIG` at Navi10 offset 0x2004 → BC-250 offset **0x3264**
-- `GRBM_STATUS` at Navi10 offset 0x2000 → BC-250 offset **0x3260**
-- `SPI_PG_ENABLE_STATIC_WGP_MASK` at Navi10 offset 0x229C → BC-250 offset **0x34FC**
+**Fix** (`build.bat`):
+1. Search both `x86\` and `x64\` paths for Inf2Cat
+2. Sign `.sys` FIRST, then generate `.cat` with Inf2Cat, then sign `.cat`
+3. Fixed OS parameter from invalid `11_X64` to valid `10_X64`
+4. Updated INF `DriverVer` to `07/08/2026,3.0.0.4`
 
-### Corrected Register Offsets
+## SMU v88.6.0 via SMN
 
-| Register | Navi10 Offset | BC-250 BAR5 Offset |
-|----------|--------------|-------------------|
-| GRBM_STATUS | 0x2000 | **0x3260** |
-| CC_GC_SHADER_ARRAY_CONFIG | 0x2004 | **0x3264** |
-| GRBM_STATUS2 | 0x2008 | **0x3268** |
-| GRBM_SOFT_RESET | 0x200C | **0x326C** |
-| SPI_PG_ENABLE_STATIC_WGP_MASK | 0x229C | **0x34FC** |
-| RLC_PG_ALWAYS_ON_WGP_MASK | 0x2B04 | **0x3D64** |
-| CP scratch registers | 0x2074+ | **0x32D4+** |
-| SDMA registers | 0x2600+ | **0x3860+** |
+SMU mailbox registers are NOT mapped into BAR5 on BC-250 (reads 0). Access via SMN using
+NBIO's PCIE index/data registers at BAR5+0x38/0x3C:
 
-### Impact
+| Register | SMN Address | Purpose |
+|----------|-------------|---------|
+| Queue 0 CMD | 0x03B10A08 | Freq/voltage control |
+| Queue 0 RSP | 0x03B10A68 | Response |
+| Queue 0 ARG | 0x03B10A48 | Parameter |
+| Queue 2 CMD | 0x03B10528 | Feature enable/disable |
+| Queue 2 ARG | 0x03B10998 | Feature mask |
+| Queue 3 CMD | 0x03B10A20 | Temp, perf profile |
+| Queue 3 ARG | 0x03B10A88 | Parameter |
 
-All previous `0xFFFFFFFF` reads at offsets 0x2000-0x2FFF were caused by addressing unmapped
-BAR5 space — **NOT by NBIO firewall blocking**. The NBIO on BC-250 does NOT block GC/GRBM/SDMA
-registers at the corrected offsets. This was confirmed via Linux devmem reads on the actual hardware.
-
-Register reads at the corrected offsets return valid values with no system instability.
+**Key SMU messages (proven safe):**
+- Q3 0x01 — TestMessage
+- Q0 0x02 — GetSmuVersion (returns 0x00580600 = 88.6.0)
+- Q0 0x3D — GetEnabledSmuFeatures (returns 0xDD602C7D)
+- Q0 0x39 — ForceGfxFreq (MHz, requires voltage+profile set first)
+- Q0 0x3B — ForceGfxVid
+- Q2 0x06 — DisableSmuFeatures (mask: bit2=GFXOFF, bit3=CG, bit4=PG)
 
 ## Repository Structure
 
 ```
-├── src/
-│   ├── driver/          # Kernel driver source
-│   │   ├── PspDriver.c  # DriverEntry, IOCTL dispatch
-│   │   ├── PspCore.c    # Mailbox, proxy bridge, firmware loading
-│   │   ├── PspKiq.c     # KIQ ring management
-│   │   └── PspSmu.c     # SMU v11.8 communication
-│   └── test/            # User-mode test tools
-│       └── test-psp-driver.c
-├── inc/                 # Shared headers
-│   ├── PspIoctl.h
+├── build.bat              # Build + sign driver (run from repo root)
+├── inc/
+│   ├── PspIoctl.h         # IOCTL definitions
 │   └── firmware_data.h
-├── inf/                 # Device installation files
-│   └── PspDriver.inf
-├── scripts/             # Build + setup scripts
-│   ├── build.bat        # Driver build + sign
-│   ├── compile-test.bat # Test tool compiler
-│   ├── enable-testsigning.cmd
-│   ├── install-driver.cmd
-│   └── uninstall-driver.cmd
+├── inf/
+│   └── PspDriver.inf      # Device installation
+├── src/driver/
+│   ├── PspDriver.c        # DriverEntry, IOCTL dispatch
+│   ├── PspCore.c          # Mailbox, proxy bridge, firmware loading
+│   ├── PspKiq.c           # KIQ ring management
+│   └── PspSmu.c           # SMU v11.8 communication
+├── scripts/
+│   └── PspDriver.cdf      # makecat CDF (fallback if Inf2Cat unavailable)
 ├── docs/
 │   └── AGENTS.md
-├── README.md
-└── .gitignore
+└── README.md
 ```
 
 ## Prerequisites
 
-- **Visual Studio 2022** (Pro or Community) with "Desktop development with C++" workload
-- **Windows Driver Kit (WDK) 10.0.26100.0** (Windows 11 24H2 SDK)
-- **Windows 11 SDK** (included with VS2022)
-- **E: drive** required — build scripts hardcode paths to `E:\VS2022\...` and `E:\Win11_WDK\...`
-- Test signing enabled (see below)
-
-> **Note**: If your VS/WDK is installed on C:, edit `scripts\build.bat` to update the paths before building.
-
-### Signing Requirements
-
-Windows 10/11 requires drivers to be **digitally signed** to load. This project uses test certificates
-for development. Secure Boot must be **OFF** in BIOS.
-
-**Step 1: Enable Test Mode**
-```cmd
-bcdedit /set testsigning on
-```
-Or use the helper script:
-```cmd
-scripts\enable-testsigning.cmd
-```
-**REBOOT required.** After reboot, you should see "Test Mode" watermark.
-
-**Step 2: Build + Sign**
-```cmd
-cd scripts
-build.bat
-```
-The build script creates a test certificate (`AMD-BC250-Signer`) and signs the driver.
-Install the certificate to `LocalMachine\Root` and `LocalMachine\TrustedPublisher` if prompted.
-
-**Production**: For production use, drivers must be WHQL-signed or have an EV certificate.
+- **Visual Studio 2022** + **WDK 10.0.26100.0** (auto-detected on C:, D:, or E: drive)
+- Test signing: `bcdedit /set testsigning on`, Secure Boot OFF
 
 ## Building
 
 ### Driver
 ```cmd
-cd scripts
 build.bat
 ```
-Output: `output\PspDriver.sys`, `PspDriver.inf`, `PspDriver.cat`
+Output: `output\PspDriver.sys`, `output\PspDriver.inf`, `output\PspDriver.cat`, `output\firmware\*.bin`
 
-### Test Tool
-```cmd
-cd scripts
-compile-test.bat
-```
-Output: `output\test-psp-driver.exe`
+Build signs .sys → Inf2Cat generates .cat → signs .cat, matching the GPU driver's build process.
 
 ## Installation
 
-**Important**: Uninstall any previous version first, then reboot before installing.
+**Important**: Uninstall previous versions first (Device Manager → Uninstall with "Delete driver"), reboot.
 
-**Option 1: Automated (pnputil)**
-```cmd
-scripts\install-driver.cmd
-```
-
-**Option 2: Manual via Device Manager**
+**Option 1: Manual via Device Manager**
 1. Build the driver
-2. Open Device Manager
-3. Find "AMD BC-250 PSP" device (or unknown device with `PCI\VEN_1022&DEV_143E`)
-4. Update Driver → Browse → `output\`
-5. Reboot
+2. Device Manager → AMD BC-250 PSP → Update Driver → Browse → `output\`
+3. Reboot
+
+**Option 2: Automated**
+```cmd
+reinstall-psp-fix.bat
+```
 
 **Uninstall:**
-```cmd
-scripts\uninstall-driver.cmd
-```
-Then reboot.
+Device Manager → AMD BC-250 PSP → Uninstall device (check "Delete driver software") → reboot.
 
-## Testing
+## Testing (run from GPU repo)
 
-```cmd
-# Hardware init (map BAR5 MMIO at 0xFE800000, 2MB)
-output\test-psp-driver.exe -i 0xFE800000 0x200000
-
-# Connectivity test (reads C2PMSG mailbox registers)
-output\test-psp-driver.exe -t
-
-# Load firmware (persistent buffer, not freed after load)
-output\test-psp-driver.exe -f cyan_skillfish2_sos_extracted.bin
-
-# Two-stage PSP boot (embedded FW + SYSDRV + SOS)
-output\test-psp-driver.exe -B
-
-# Create PSP GPCOM ring (psp_v11_0_8 protocol)
-output\test-psp-driver.exe -R
-
-# Load GPU firmware via PSP ring (8 files)
-output\test-psp-driver.exe -A
-
-# Or load single GPU firmware
-output\test-psp-driver.exe -L 9 cyan_skillfish2_sdma.bin
-
-# NBIO unlock + signature registers
-output\test-psp-driver.exe -U
-
-# Full status snapshot
-output\test-psp-driver.exe -s
-
-# Read any register (use corrected BC-250 offsets)
-output\test-psp-driver.exe -r 0x3264
-
-# Quick help
-output\test-psp-driver.exe
-```
-
-### Full GPU bring-up sequence
+The GPU driver repo contains all test tools. Build them there, then copy `output\*.exe` here or run from GPU repo:
 
 ```cmd
-cd output
-test-psp-driver.exe -i 0xFE800000 0x200000   # Init BAR5
-test-psp-driver.exe -B                        # Load SYSDRV + SOS
-test-psp-driver.exe -R                        # Create GPCOM ring
-test-psp-driver.exe -A                        # Load all GPU FW (CE, PFP, ME, MEC, MEC2, RLC, SDMA0, SDMA1)
+# PSP driver status + BAR5 mapping
+cd C:\AMD-BC-250\AMD-BC-250-Windows-Driver-main
+output\psp-status-test.exe
+
+# SMU mailbox via SMN
+output\bar5-smn-test.exe
+
+# SMU telemetry monitor
+output\smu-monitor.exe
+
+# SMU frequency control (governor sequence)
+output\governor-sequence.exe
+
+# DCN display probe
+output\dcn-init-test.exe
 ```
 
 ## IOCTL Interface
@@ -312,55 +204,35 @@ test-psp-driver.exe  ---->   PspDriver.sys  ---->   GPU Driver (atikmdag.sys)
 ## Current Status
 
 ### What Works
-- **PSP driver loads and boots SOS** — SOS pre-loaded by BIOS, mailbox commands work
-- **Register reads/writes** at all offsets via BAR5 MMIO (GC, MMHUB, HDP, NBIO, DF)
-- **NBIO unlock** — signature registers written successfully
-- **Mailbox commands** — CMD 0x4 (SYSDRV) and CMD 0x8 (SOS) work
-- **PSP proxy bridge** — GPU driver can read/write registers through PSP driver
-- **GC registers at corrected offsets** — 0x3260, 0x3264, 0x34FC all return valid values
-- **Windows 11 26100 compatibility** — GPU proxy fallback when BAR5 mapping is blocked
-- **All code review bugs fixed** — body_size mismatch, ring size cap (9-bit WPTR), proxy write return checks, race condition
-
-### Windows 11 26100 Compatibility
-
-On Windows 11 26100, direct BAR5 MMIO mapping via `MmMapIoSpace` is blocked. The PSP driver handles this by:
-
-1. **First attempting direct BAR5 mapping** via `INIT_HW` IOCTL
-2. **Falling back to GPU driver proxy** if mapping fails
-3. **Using `IOCTL_AMDBC250_BAR5_READ_PROXY` (0x900)** and **`IOCTL_AMDBC250_BAR5_WRITE_PROXY` (0x901)** to access GPU registers through the GPU driver
-
-**Required sequence:**
-1. Install GPU driver first (`atikmdag.sys`)
-2. GPU driver maps BAR5 and provides proxy IOCTLs
-3. Install PSP driver
-4. PSP driver opens handle to GPU driver and uses proxy for mailbox access
-
-**Test sequence for Windows 11 26100:**
-```cmd
-cd output
-test-psp-driver.exe -i 0xFE800000 0x200000   # Init BAR5 (will fallback to proxy if blocked)
-test-psp-driver.exe -m                       # Read C2PMSG_81 (PSP alive)
-```
+- ✅ **PSP driver loads, BAR5 maps**, SOS alive (C2PMSG_81=0xF0000010)
+- ✅ **SMU v88.6.0 mailbox via SMN** — TestMessage, GetSmuVersion, GetEnabledSmuFeatures, ForceGfxFreq
+- ✅ **Governor sequence safe** — Q3 temp → Q0 unforce → Q3 profile → Q0 force VID → Q0 force freq
+- ✅ **Frequency control** (1500→1166 MHz) — SMU accepts freq/voltage changes
+- ✅ **Feature enable/disable** via SMU Q2 (GFXOFF, CG, PG — all disableable)
+- ✅ **GC/MMHUB/HDP/NBIO/DF register access** at corrected BC-250 offsets
+- ✅ **PSP mailbox firmware loading** — RLC, MEC, ME, PFP, CE, SDMA all load OK
+- ✅ **IRP_MJ_DEVICE_CONTROL** — all 30+ IOCTL handlers operational
+- ✅ **GPU driver proxy bridge** for Win11 26100 fallback
+- ✅ **Both drivers digitally signed** — Inf2Cat .cat generation fixed (x86 path)
+- ✅ **All code review bugs fixed** — IP FW load, ring size cap, proxy return checks, spinlock races, SMU protocol
 
 ### What Doesn't Work
-- **GPCOM ring creation** — SOS firmware does not support TOS ring protocol (C2PMSG_64 bit 31 never sets)
-- **GPU firmware loading via ring** — blocked by ring protocol not being supported
-- **TMR init** — requires ring protocol
-- **Mailbox-based PROG_REG** — PSP accepts command but write is silently ignored by SOS
+- ❌ **Compute/GFX execution** — WGPs permanently fused off (SPI_PG_MASK=RO 0)
+- ❌ **GPCOM/TOS ring protocol** — SOS doesn't support ring-based commands
+- ❌ **KIQ ring processing** — KIQ_BASE/KIQ_SIZE hardwired to 0
+- ❌ **DCN display output** — timing registers read-only (DMCUB FW not loaded)
+- ❌ **Mailbox-based PROG_REG** — PSP accepts command, write silently ignored
 
-### Register Access (BC-250 Corrected Offsets)
+### Register Access Ranges
 | Block | BAR5 Offset | Access | Notes |
 |-------|-------------|--------|-------|
-| GPU_ID | 0x0000 | Read | Returns 0x9FFF9700 |
-| HDP | 0x05A0+ | Read/Write | Memory coherency |
-| GC | 0x3260-0x3FFF | Read/Write | Shifted by GC_BASE=0x1260 |
-| MMHUB | 0x5000+ | Read/Write | Memory management |
-| NBIO | 0xC100+ | Read/Write | Control registers |
+| GPU_ID | 0x0000 | Read | 0x9FFF9700 |
+| HDP | 0x05A0+ | R/W | Memory coherency |
+| GC | 0x3260-0x3FFF | R/W | GC_BASE=0x1260 shifted |
+| MMHUB | 0x5000+ | R/W | Memory management |
+| NBIO | 0xC100+ | R/W | PCIe config |
 | DF | 0x1A000+ | Read | Data Fabric |
-| PSP mailbox | 0x1056C+ | Read/Write | C2PMSG registers (PSP driver only) |
-
-> **NBIO does NOT block GC/GRBM/SDMA registers at corrected offsets.** This was confirmed
-> via Linux devmem tests. All previous 0xFFFFFFFF reads were caused by using wrong offsets.
+| PSP | 0x1056C+ | R/W | C2PMSG mailbox |
 
 ## Related Projects
 
