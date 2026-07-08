@@ -916,3 +916,31 @@ test-psp-driver.exe -m                       # C2PMSG_81 - 0xF0000010 (PSP alive
 - PSP driver KIQ path (Path 1) remains as fallback but will hit KIQ_SIZE=0 block
 - GPU driver SEND_PM4 now has PATH 3 (software PM4) working as confirmed working bypass
 - All existing test tools using wrong headers need updating (not urgent since KIQ never processes)
+
+## 2026-07-08: PSP driver signing fix
+
+### Root cause
+`build.bat` only searched `x64\` subdirectory for Inf2Cat:
+```
+if exist "%WDK_ROOT%\bin\%WDK_VERSION%\x64\Inf2Cat.exe"
+```
+But on WDK 10.0.26100.0, Inf2Cat is only in `x86\`:
+```
+E:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\Inf2Cat.exe
+```
+When not found in `x64\`, build fell back to `makecat.exe` which generates an incomplete catalog (1565 bytes vs Inf2Cat's 4439 bytes). Windows PnP rejected this simplified catalog for System class drivers with "not digitally signed" error.
+
+### Fix (build.bat)
+1. Added `x86\` path search for Inf2Cat (search both x64 and x86)
+2. Fixed build order: sign .sys FIRST, then generate .cat with Inf2Cat, then sign .cat
+3. Fixed Inf2Cat OS parameter from invalid `11_X64` to valid `10_X64`
+4. Added makecat fallback only when Inf2Cat is completely unavailable
+
+### INF fix
+- Restored `CatalogFile = PspDriver.cat` (was removed by earlier build hack)
+- Updated `DriverVer` to `07/08/2026,3.0.0.4`
+
+### Result
+- PSP driver installs without signature errors (both .sys embedded + .cat catalog signed)
+- Both GPU and PSP driver build processes are now structurally identical
+

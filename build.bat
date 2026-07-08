@@ -103,6 +103,48 @@ if "%SIGNTOOLS%"=="" (
     echo WARNING: signtool.exe not found - will skip signing
 )
 
+:: --- Also check older WDK bin path for signtool ---
+if "%SIGNTOOLS%"=="" (
+    for %%D in (C D E F G H) do (
+        for /f "delims=" %%V in ('dir /b /ad "%%D:\Program Files (x86)\Windows Kits\10\bin" 2^>nul') do (
+            if exist "%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\signtool.exe" (
+                set "SIGNTOOLS=%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64"
+                echo Found signtool in older WDK bin\%%V
+                goto :FoundSignTool
+            )
+        )
+    )
+)
+:FoundSignTool
+
+:: --- Also check older WDK bin path for Inf2Cat or makecat ---
+if "%INF2CAT%"=="" (
+    set "MAKECAT="
+    for %%D in (C D E F G H) do (
+        for /f "delims=" %%V in ('dir /b /ad "%%D:\Program Files (x86)\Windows Kits\10\bin" 2^>nul') do (
+            if exist "%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x86\Inf2Cat.exe" (
+                set "INF2CAT=%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x86\Inf2Cat.exe"
+                echo Found Inf2Cat in WDK bin\%%V\x86
+                goto :FoundCatalogTool
+            )
+            if exist "%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\Inf2Cat.exe" (
+                set "INF2CAT=%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\Inf2Cat.exe"
+                echo Found Inf2Cat in WDK bin\%%V\x64
+                goto :FoundCatalogTool
+            )
+        )
+    )
+    :: If no Inf2Cat found, search for makecat as fallback
+    for %%D in (C D E F G H) do (
+        for /f "delims=" %%V in ('dir /b /ad "%%D:\Program Files (x86)\Windows Kits\10\bin" 2^>nul') do (
+            if "%MAKECAT%"=="" if exist "%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\makecat.exe" (
+                set "MAKECAT=%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\makecat.exe"
+            )
+        )
+    )
+)
+:FoundCatalogTool
+
 :: --- Create output directory ---
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
@@ -149,17 +191,6 @@ if errorlevel 1 (
 echo Copying INF file...
 copy "%PROJECT_DIR%inf\PspDriver.inf" "%OUTPUT_DIR%\" >nul
 
-:: --- Generate catalog file ---
-if not "%INF2CAT%"=="" (
-    echo Generating catalog file...
-    "%INF2CAT%" /driver:"%OUTPUT_DIR%" /os:10_X64,11_X64 /verbose >nul 2>&1
-    if exist "%OUTPUT_DIR%\PspDriver.cat" (
-        echo   Catalog generated OK
-    ) else (
-        echo   Catalog generation failed (non-fatal)
-    )
-)
-
 :: --- Sign driver ---
 if not "%SIGNTOOLS%"=="" (
     echo.
@@ -192,16 +223,38 @@ if not "%SIGNTOOLS%"=="" (
         echo   PSP signature verified OK
     )
 
-    :: Generate catalog
+    :: Generate catalog AFTER signing (so hashes match signed .sys)
     if not "%INF2CAT%"=="" (
-        echo Generating catalog file...
-        "%INF2CAT%" /driver:"%OUTPUT_DIR%" /os:10_x64 /verbose >nul 2>&1
+        echo Generating catalog file with Inf2Cat...
+        "%INF2CAT%" /driver:"%OUTPUT_DIR%" /os:10_X64 /verbose
+        if errorlevel 1 (
+            echo   WARNING: Inf2Cat catalog generation failed
+        ) else (
+            echo   Catalog generated OK
+        )
+    ) else if not "%MAKECAT%"=="" (
+        echo Generating catalog file with makecat...
+        pushd "%OUTPUT_DIR%"
+        "%MAKECAT%" /v "%PROJECT_DIR%scripts\PspDriver.cdf" >nul 2>&1
+        if errorlevel 1 (
+            echo   WARNING: makecat catalog generation failed
+        ) else (
+            echo   Catalog generated OK
+        )
+        popd
+    ) else (
+        echo   WARNING: No catalog generation tool found - keeping existing .cat if present
     )
 
-    :: Sign catalog
+    :: Sign catalog (if generated)
     if exist "%OUTPUT_DIR%\PspDriver.cat" (
         "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" ^
-          "%OUTPUT_DIR%\PspDriver.cat" >nul 2>&1 && echo   Catalog signed OK
+          "%OUTPUT_DIR%\PspDriver.cat"
+        if errorlevel 1 (
+            echo   WARNING: Catalog signing failed
+        ) else (
+            echo   Catalog signed OK
+        )
     )
     goto :DoneSigning
 )
