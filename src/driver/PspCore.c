@@ -342,6 +342,13 @@ NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwS
     }
 
     /* We need GPU BAR5 for mailbox access (proxy path handles it below) */
+    if (g_Bar5Mapping == NULL) {
+        NTSTATUS proxyStatus = PspGpuProxyInit(devExt);
+        if (!NT_SUCCESS(proxyStatus)) {
+            KdPrint(("LOAD_IP_FW_MAILBOX: GPU proxy init failed: 0x%08X\n", proxyStatus));
+            return STATUS_DEVICE_NOT_READY;
+        }
+    }
     if (!g_Bar5Mapping && !devExt->GpuMmioBase && !g_GpuProxyAvailable) {
         return STATUS_DEVICE_NOT_READY;
     }
@@ -454,6 +461,9 @@ NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwS
         if (timeout >= PSP_FW_WAIT_MS) {
             KdPrint(("LOAD_IP_FW_MAILBOX: TIMEOUT C2PMSG_35=0x%08X\n", cmdReg));
             status = STATUS_TIMEOUT;
+        } else if (c2pmsg81 != 0) {
+            KdPrint(("LOAD_IP_FW_MAILBOX: PSP error C2PMSG_81=0x%08X\n", c2pmsg81));
+            status = STATUS_UNSUCCESSFUL;
         } else {
             status = STATUS_SUCCESS;
         }
@@ -519,6 +529,10 @@ NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt)
         }
     }
 
+    if (devExt->Bar0Base == NULL && devExt->GpuMmioBase == NULL) {
+        KdPrint(("PSP: Auto-init FAILED — no MMIO base available\n"));
+        return STATUS_DEVICE_NOT_READY;
+    }
     return STATUS_SUCCESS;
 }
 

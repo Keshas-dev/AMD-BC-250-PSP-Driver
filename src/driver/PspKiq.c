@@ -1,8 +1,9 @@
 // PspKiq.c - KIQ (Queue) Ring functionality for AMD BC-250 PSP
 // Programs GPU KIQ registers so hardware can execute PM4 commands from the ring.
 // NOTE: Only KIQ_BASE/WPTR/RPTR registers are used. HQD registers (0xDAC0+),
-// RLC_CP_SCHEDULERS (dangerous unaligned), and ME_CNTL (unhalts unloaded PFP/CE)
-// are deliberately NOT written. Firmware loader handles halt bits.
+// RLC_CP_SCHEDULERS (dangerous unaligned) are deliberately NOT written.
+// ME_CNTL IS written (=0) below to unhalt the CP before KIQ activation.
+// Firmware loader handles PFP/CE halt bits.
 #include <ntddk.h>
 #include <wdm.h>
 #include "PspIoctl.h"
@@ -18,7 +19,7 @@
 #define GPU_CP_KIQ_ACTIVE               0xE080
 #define GPU_RLC_CP_SCHEDULERS           0xECA8
 #define GPU_GRBM_GFX_INDEX              0x34D0
-#define GPU_CP_HQD_PQ_CONTROL           0x90F0
+#define GPU_CP_HQD_PQ_CONTROL           0x9148  /* CP_HQD_PQ_CONTROL (mmCP_HQD_PQ_CONTROL=0x1FBA) */
 #define GPU_CP_HQD_ACTIVE               0x910C
 
 /* CP_ME_CNTL bits */

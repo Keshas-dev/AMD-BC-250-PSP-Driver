@@ -329,11 +329,11 @@ NTSTATUS PspSendSmcBoot(PDEVICE_EXTENSION devExt)
 
     if (smu66 != 0 || smu82 != 0 || smu90 != 0) {
         KdPrint(("SMC_BOOT: SMU ALIVE!\n"));
-    } else {
-        KdPrint(("SMC_BOOT: SMU still dead\n"));
+        return STATUS_SUCCESS;
     }
 
-    return STATUS_SUCCESS;
+    KdPrint(("SMC_BOOT: SMU still dead\n"));
+    return STATUS_DEVICE_NOT_READY;
 }
 
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
@@ -654,6 +654,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
             ULONG value = PspGpuProxyReadRegister(offset);
             KdPrint(("READ_REG: proxy returned 0x%08X\n", value));
+            if (value == 0xFFFFFFFF) {
+                KdPrint(("READ_REG: GPU proxy read failed\n"));
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
             if (outputLength < sizeof(ULONG)) {
                 status = STATUS_BUFFER_TOO_SMALL;
                 break;
@@ -704,8 +709,12 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 status = STATUS_DEVICE_NOT_READY;
                 break;
             }
-            PspGpuProxyWriteRegister(offset, value);
-            status = STATUS_SUCCESS;
+            if (!PspGpuProxyWriteRegister(offset, value)) {
+                KdPrint(("WRITE_REG: GPU proxy write failed\n"));
+                status = STATUS_DEVICE_NOT_READY;
+            } else {
+                status = STATUS_SUCCESS;
+            }
         }
         break;
     }
@@ -886,23 +895,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
     case IOCTL_PSP_NBIO_VIA_RING:
     {
-        KdPrint(("NBIO_VIA_RING: Sending command via mailbox...\n"));
-        if (outputLength >= sizeof(ULONG) * 4) {
-            ULONG* resp = (ULONG*)outputBuffer;
-            if (devExt->GpuMmioBase) {
-                resp[0] = 0x0B;
-                resp[1] = 0;
-                resp[2] = 0;
-                resp[3] = 0;
-            } else {
-                resp[0] = 0;
-                resp[1] = 0;
-                resp[2] = 0;
-                resp[3] = 0xFFFFFFFF;
-            }
-            bytesReturned = sizeof(ULONG) * 4;
-        }
-        status = STATUS_SUCCESS;
+        /* GFX_CMD_ID_PROG_REG (0x0B) is NOT implemented on this SOS
+         * (PspInitTmr prints "ring protocol not supported"). The old handler
+         * returned STATUS_SUCCESS with a fake response — report it honestly. */
+        KdPrint(("NBIO_VIA_RING: GFX_CMD_ID_PROG_REG (0x0B) not implemented on this SOS\n"));
+        status = STATUS_NOT_SUPPORTED;
         break;
     }
 
