@@ -332,7 +332,7 @@ NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwS
     PVOID fwBufVa = NULL;
     PHYSICAL_ADDRESS fwBufPa = {0};
     ULONG timeout;
-    ULONG cmdReg;
+    ULONG cmdReg = 0;
     PUCHAR mboxBase;
     KIRQL irql;
     volatile PULONG cmdDwords;
@@ -461,11 +461,14 @@ NTSTATUS PspLoadIpFwViaMailbox(PDEVICE_EXTENSION devExt, ULONG FwType, ULONG FwS
         if (timeout >= PSP_FW_WAIT_MS) {
             KdPrint(("LOAD_IP_FW_MAILBOX: TIMEOUT C2PMSG_35=0x%08X\n", cmdReg));
             status = STATUS_TIMEOUT;
-        } else if (c2pmsg81 != 0) {
+        } else if (c2pmsg81 == 0xF0000010 || c2pmsg81 == 0) {
+            /* C2PMSG_81 = 0xF0000010 means SOS is alive / command accepted.
+             * 0 means SOS cleared the status after a successful load.
+             * Both indicate success. */
+            status = STATUS_SUCCESS;
+        } else {
             KdPrint(("LOAD_IP_FW_MAILBOX: PSP error C2PMSG_81=0x%08X\n", c2pmsg81));
             status = STATUS_UNSUCCESSFUL;
-        } else {
-            status = STATUS_SUCCESS;
         }
     }
 

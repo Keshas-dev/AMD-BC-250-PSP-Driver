@@ -76,6 +76,7 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
         KdPrint(("BOOT_SEQ: SYSDRV from file (%u bytes)\n", fileSize));
     } else if (g_SysdrvFirmwareSize > PSP_MAX_FW_TOTAL) {
         KdPrint(("BOOT_SEQ: SYSDRV FW too large\n"));
+        if (fileData != NULL) ExFreePoolWithTag(fileData, 'fw');
         return STATUS_INVALID_PARAMETER;
     } else {
         fileSize = g_SysdrvFirmwareSize;
@@ -121,6 +122,7 @@ NTSTATUS PspDoBootSequence(PDEVICE_EXTENSION devExt)
         KdPrint(("BOOT_SEQ: SOS from file (%u bytes)\n", fileSize));
     } else if (g_SosFirmwareSize > PSP_MAX_FW_TOTAL) {
         KdPrint(("BOOT_SEQ: SOS FW too large\n"));
+        if (fileData != NULL) ExFreePoolWithTag(fileData, 'fw');
         PspFreeFirmware(devExt);
         return STATUS_INVALID_PARAMETER;
     } else {
@@ -787,9 +789,9 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         ULONG off = params[2];
         ULONG value = 0xFFFFFFFF;
         if (devExt->PciCfgBase != NULL) {
-            ULONG addr = (bus * 0x100000) + (devFn * 0x1000) + (off & ~3);
-            if (addr + sizeof(ULONG) <= devExt->PciCfgSize) {
-                value = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->PciCfgBase + addr));
+            ULONG64 addr64 = ((ULONG64)bus * 0x100000) + ((ULONG64)devFn * 0x1000) + (off & ~3);
+            if (addr64 + sizeof(ULONG) <= devExt->PciCfgSize) {
+                value = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->PciCfgBase + (ULONG)addr64));
             }
         }
         if (value == 0xFFFFFFFF) {
