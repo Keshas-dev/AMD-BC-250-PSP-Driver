@@ -9,8 +9,62 @@
 extern "C" {
 #endif
 
-// Device name and symbolic link
-#define PSP_DEVICE_NAME    L"\\\\.\\AmdBcPsp"
+// GPU driver device (replaces separate PSP driver — direct BAR5 mailbox IOCTLs)
+#define GPU_DEVICE_NAME    L"\\\\.\\AMDBC250DreamV43"
+
+// GPU driver raw IOCTL codes (0x900+ are raw, not CTL_CODE-packed)
+#define IOCTL_GPU_BAR5_READ_PROXY_RAW   0x900   // IN: ULONG offset → OUT: ULONG value
+#define IOCTL_GPU_BAR5_WRITE_PROXY_RAW  0x901   // IN: ULONG[2] {offset, value} → OUT: none
+
+// GPU driver CTL_CODE-based IOCTLs using FILE_DEVICE_AMDBC250(0x8000) + IOCTL_INDEX(0x270)
+// These values come from the GPU driver's amdbc250_ioctl.h
+#define IOCTL_GPU_INIT_HW               ((ULONG)0x80000B80)   // CTL_CODE(0x8000, 0x2E0, 0, 0)
+#define IOCTL_GPU_READ_REG              ((ULONG)0x80000B88)   // CTL_CODE(0x8000, 0x2E2, 0, 0)
+#define IOCTL_GPU_WRITE_REG             ((ULONG)0x80000B8C)   // CTL_CODE(0x8000, 0x2E3, 0, 0)
+
+// GPU driver IOCTL for direct PSP mailbox (raw CTL_CODE with high function to avoid collision)
+#define IOCTL_GPU_PSP_LOAD_IP_FW        ((ULONG)0x80002480)   // CTL_CODE(0x8000, 0x920, 0, 0)
+#define IOCTL_GPU_PSP_SMU_MSG           ((ULONG)0x80002490)   // CTL_CODE(0x8000, 0x924, 0, 0)
+
+// IOCTL structures for GPU driver direct PSP mailbox (matching amdbc250_ioctl.h)
+typedef struct _AMDBC250_IOCTL_PSP_LOAD_IP_FW {
+    ULONG FwType;                       // Firmware type (1=ME, 2=PFP, 3=CE, 4=MEC, 8=RLC, 9=SDMA0)
+    ULONG FwSize;                       // Firmware blob size in bytes
+    ULONG Result;                       // OUT: 0=fail, 1=success
+    ULONG C2Pmsg35After;                // OUT: C2PMSG_35 after command
+    ULONG C2Pmsg81After;                // OUT: C2PMSG_81 after command
+    // Firmware data follows immediately after this struct
+} AMDBC250_IOCTL_PSP_LOAD_IP_FW;
+
+typedef struct _AMDBC250_IOCTL_PSP_SMU_MSG {
+    ULONG Message;                      // SMU message ID
+    ULONG Argument;                     // Argument
+    ULONG Response;                     // OUT: response from C2PMSG_82
+    ULONG ResponseStatus;               // OUT: C2PMSG_90 (1=OK, 0xFF=error)
+    ULONG Result;                       // OUT: 0=fail, 1=success
+} AMDBC250_IOCTL_PSP_SMU_MSG;
+
+// IOCTL structures for GPU driver INIT_HW (matching amdbc250_ioctl.h)
+typedef struct _AMDBC250_IOCTL_INIT_HARDWARE {
+    ULONG64 MmioPhysicalBase;           // Physical address of BAR5 (0=auto-detect)
+    ULONG MmioSize;                     // Size in bytes (0=default 512KB)
+    ULONG Flags;                        // 0=full init, 1=NBIO_MAP only
+    ULONG64 FbPhysicalBase;             // Framebuffer base (0=auto)
+    ULONG FbSize;                       // Framebuffer size (0=auto)
+} AMDBC250_IOCTL_INIT_HARDWARE;
+
+// IOCTL structures for GPU driver READ_REG / WRITE_REG
+typedef struct _AMDBC250_IOCTL_READ_REG {
+    ULONG Offset;
+    ULONG Value;                        // OUT
+    ULONG Status;                       // OUT (NTSTATUS)
+} AMDBC250_IOCTL_READ_REG;
+
+typedef struct _AMDBC250_IOCTL_WRITE_REG {
+    ULONG Offset;
+    ULONG Value;
+    ULONG Status;                       // OUT (NTSTATUS)
+} AMDBC250_IOCTL_WRITE_REG;
 
 // IOCTL codes (must match driver definitions)
 #define IOCTL_PSP_READ_REG    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -40,27 +94,8 @@ extern "C" {
 #define IOCTL_PSP_LOAD_IP_FW_DIRECT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_GPU_PM4_SUBMIT      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-#ifdef _NTDDK_
-typedef struct _DEVICE_EXTENSION {
-    PVOID       MmioBase;
-    ULONG       MmioSize;
-    PVOID       Bar0Base;
-    ULONG       Bar0Size;
-    PVOID       GpuMmioBase;
-    ULONG       GpuMmioSize;
-    PVOID       FwBuffer;
-    PHYSICAL_ADDRESS FwPhysical;
-    ULONG       FwSize;
-    ULONG       FwPaShifted;
-    PVOID       RingBuffer;
-    PHYSICAL_ADDRESS RingBufferPA;
-    ULONG       RingSize;
-    BOOLEAN     RingCreated;
-    KSPIN_LOCK  CommandLock;
-    PVOID       PciCfgBase;
-    ULONG       PciCfgSize;
-} DEVICE_EXTENSION, *PDEVICE_EXTENSION;
-#endif
+// DEVICE_EXTENSION removed — PSP driver is no longer a kernel driver.
+// Use GPU_DEVICE_NAME + IOCTL_GPU_PSP_* for direct mailbox access.
 
 // Timeout for PSP firmware commands (ms)
 #define PSP_FW_WAIT_MS               5000

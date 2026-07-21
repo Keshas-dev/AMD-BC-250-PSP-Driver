@@ -2,313 +2,93 @@
 setlocal enabledelayedexpansion
 
 echo ===================================================
-echo  AMD BC-250 PSP Driver - Build + Sign Script
+echo  AMD BC-250 PSP Test Tool — Build Script
+echo  (No kernel driver needed — uses GPU driver IOCTLs)
 echo ===================================================
 
 set "PROJECT_DIR=%~dp0"
 set "OUTPUT_DIR=%PROJECT_DIR%output"
-set "CERT_NAME=AMD-BC250-Signer"
 
-:: --- Detect Visual Studio 2022 ---
-:: Searches multiple drives and editions (Community, Professional, Enterprise)
-set "VSWHERE="
-for %%D in (C D E F G H) do (
-    if exist "%%D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-        set "VSWHERE=%%D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Community on %%D: drive
-        goto :SetupEnv
-    )
-    if exist "%%D:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-        set "VSWHERE=%%D:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Professional on %%D: drive
-        goto :SetupEnv
-    )
-    if exist "%%D:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-        set "VSWHERE=%%D:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Enterprise on %%D: drive
-        goto :SetupEnv
-    )
-    if exist "%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-        set "VSWHERE=%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Community on %%D: drive ^(x86^)
-        goto :SetupEnv
-    )
-    if exist "%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat" (
-        set "VSWHERE=%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Professional on %%D: drive ^(x86^)
-        goto :SetupEnv
-    )
-    if exist "%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
-        set "VSWHERE=%%D:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-        echo Found VS2022 Enterprise on %%D: drive ^(x86^)
-        goto :SetupEnv
-    )
-)
-echo ERROR: Visual Studio 2022 not found
-echo Searched: C:, D:, E:, F:, G:, H: drives
-echo Please install VS2022 with "Desktop development with C++" workload
-exit /b 1
+:: Detect VS2022 + SDK (always on E: for this setup)
+set "VS_DIR=E:\Program Files\Microsoft Visual Studio\2022\Community"
+set "VC_TOOLS=%VS_DIR%\VC\Tools\MSVC"
 
-:SetupEnv
-echo Setting up build environment...
-call "%VSWHERE%"
+:: Find MSVC toolchain version
+set "MSVC_VER="
+for /f "delims=" %%V in ('dir /b /ad "!VC_TOOLS!" 2^>nul ^| sort /r') do (
+    set "MSVC_VER=%%V"
+    goto :FoundMsvc
+)
+:FoundMsvc
+if "!MSVC_VER!"=="" echo ERROR: MSVC not found & exit /b 1
+echo MSVC version: !MSVC_VER!
 
-:: --- Detect Windows Kit (WDK) ---
-:: Searches multiple drives for Windows Kits
-set "WDK_ROOT="
-for %%D in (C D E F G H) do (
-    if exist "%%D:\Program Files (x86)\Windows Kits\10\Include" (
-        set "WDK_ROOT=%%D:\Program Files (x86)\Windows Kits\10"
-        echo Found Windows Kit on %%D: drive
-        goto :FoundWDKRoot
-    )
-    if exist "%%D:\Program Files\Windows Kits\10\Include" (
-        set "WDK_ROOT=%%D:\Program Files\Windows Kits\10"
-        echo Found Windows Kit on %%D: drive
-        goto :FoundWDKRoot
-    )
+:: Find Windows SDK version
+set "SDK_ROOT=E:\Program Files (x86)\Windows Kits\10"
+set "SDK_VER="
+for /f "delims=" %%V in ('dir /b /ad "!SDK_ROOT!\Include" 2^>nul ^| sort /r') do (
+    if not "%%V"=="wdf" set "SDK_VER=%%V" & goto :FoundSdk
 )
-echo ERROR: Windows Kit (WDK) not found
-echo Searched: C:, D:, E:, F:, G:, H: drives
-echo Please install Windows 11 SDK + WDK
-exit /b 1
+:FoundSdk
+if "!SDK_VER!"=="" echo ERROR: SDK not found & exit /b 1
+echo SDK version: !SDK_VER!
 
-:FoundWDKRoot
-set "WDK_VERSION="
-for /f "delims=" %%V in ('dir /b /ad "!WDK_ROOT!\Include" ^| sort /r') do (
-    if exist "!WDK_ROOT!\Include\%%V\km\ntddk.h" (
-        set "WDK_VERSION=%%V"
-        goto :FoundWDK
-    )
-)
-echo ERROR: No kernel headers (ntddk.h) found in WDK
-exit /b 1
+:: Set paths
+set "VC_BIN=!VC_TOOLS!\!MSVC_VER!\bin\Hostx64\x64"
+set "VC_INC=!VC_TOOLS!\!MSVC_VER!\include"
+set "VC_ATL_INC=!VC_TOOLS!\!MSVC_VER!\ATLMFC\include"
+set "SDK_INC=!SDK_ROOT!\Include\!SDK_VER!"
+set "VC_LIB=!VC_TOOLS!\!MSVC_VER!\lib\x64"
+set "SDK_LIB=!SDK_ROOT!\Lib\!SDK_VER!\um\x64"
+set "UCRT_LIB=!SDK_ROOT!\Lib\!SDK_VER!\ucrt\x64"
 
-:FoundWDK
-echo Using Windows Kit version %WDK_VERSION%
+set "CL_EXE=!VC_BIN!\cl.exe"
+if not exist "!CL_EXE!" (
+    echo ERROR: cl.exe not found at !CL_EXE!
+    exit /b 1
+)
+echo CL: !CL_EXE!
 
-:: --- Locate signing tools ---
-set "SIGNTOOLS="
-set "INF2CAT="
-if exist "%WDK_ROOT%\bin\%WDK_VERSION%\x64\signtool.exe" (
-    set "SIGNTOOLS=%WDK_ROOT%\bin\%WDK_VERSION%\x64"
-)
-if exist "%WDK_ROOT%\bin\%WDK_VERSION%\x64\Inf2Cat.exe" (
-    set "INF2CAT=%WDK_ROOT%\bin\%WDK_VERSION%\x64\Inf2Cat.exe"
-)
-if "%SIGNTOOLS%"=="" (
-    where signtool.exe >nul 2>&1 && set "SIGNTOOLS=." && echo Found signtool in PATH
-)
-if "%SIGNTOOLS%"=="" (
-    echo WARNING: signtool.exe not found - will skip signing
-)
-
-:: --- Also check older WDK bin path for signtool ---
-if "%SIGNTOOLS%"=="" (
-    for %%D in (C D E F G H) do (
-        for /f "delims=" %%V in ('dir /b /ad "%%D:\Program Files (x86)\Windows Kits\10\bin" 2^>nul') do (
-            if exist "%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\signtool.exe" (
-                set "SIGNTOOLS=%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64"
-                echo Found signtool in older WDK bin\%%V
-                goto :FoundSignTool
-            )
-        )
-    )
-)
-:FoundSignTool
-
-:: --- Also check older WDK bin path for Inf2Cat or makecat ---
-if "%INF2CAT%"=="" (
-    set "MAKECAT="
-    for %%D in (C D E F G H) do (
-        for /f "delims=" %%V in ('dir /b /ad "%%D:\Program Files (x86)\Windows Kits\10\bin" 2^>nul') do (
-            if exist "%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x86\Inf2Cat.exe" (
-                set "INF2CAT=%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x86\Inf2Cat.exe"
-                echo Found Inf2Cat in WDK bin\%%V\x86
-                goto :FoundCatalogTool
-            )
-            if exist "%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\Inf2Cat.exe" (
-                set "INF2CAT=%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\Inf2Cat.exe"
-                echo Found Inf2Cat in WDK bin\%%V\x64
-                goto :FoundCatalogTool
-            )
-        )
-    )
-    :: If no Inf2Cat found, search for makecat as fallback
-    for %%D in (C D E F G H) do (
-        for /f "delims=" %%V in ('dir /b /ad "%%D:\Program Files (x86)\Windows Kits\10\bin" 2^>nul') do (
-            if "%MAKECAT%"=="" if exist "%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\makecat.exe" (
-                set "MAKECAT=%%D:\Program Files (x86)\Windows Kits\10\bin\%%V\x64\makecat.exe"
-            )
-        )
-    )
-)
-:FoundCatalogTool
-
-:: --- Create output directory ---
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
 echo.
 echo ==========================================
-echo  BUILDING WDM Driver (PspDriver.sys)
+echo  BUILDING USER-MODE Test Tool (EXE)
 echo ==========================================
 echo.
 
-echo Building driver source files...
-for %%S in (
-  "%PROJECT_DIR%src\driver\PspDriver.c"
-  "%PROJECT_DIR%src\driver\PspCore.c"
-  "%PROJECT_DIR%src\driver\PspKiq.c"
-  "%PROJECT_DIR%src\driver\PspSmu.c"
-) do (
-  cl.exe /c /kernel /GS- /W3 /Zi /Od /DAMD64 /D_AMD64_ /DAMD_BC250_PSP_DRIVER ^
-    /I"%WDK_ROOT%\Include\%WDK_VERSION%\km" ^
-    /I"%WDK_ROOT%\Include\%WDK_VERSION%\km\crt" ^
-    /I"%WDK_ROOT%\Include\%WDK_VERSION%\shared" ^
-    /I"%PROJECT_DIR%inc" ^
-    "%%S"
-  if errorlevel 1 (
-    echo Compilation FAILED for %%S
-    pause
-    exit /b 1
-  )
-)
-
-echo Linking WDM driver...
-link.exe /DRIVER /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry ^
-  /OUT:"%OUTPUT_DIR%\PspDriver.sys" ^
-  PspDriver.obj PspCore.obj PspKiq.obj PspSmu.obj ^
-  ntoskrnl.lib wdm.lib hal.lib ^
-  /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VERSION%\km\x64" ^
-  /SECTION:Shared,RW
+"!CL_EXE!" /nologo /O2 /MT /W3 /Fe"%OUTPUT_DIR%\psp-test-tool.exe" ^
+  /I"%PROJECT_DIR%inc" ^
+  /I"!VC_INC!" /I"!VC_ATL_INC!" ^
+  /I"!SDK_INC!\um" /I"!SDK_INC!\shared" /I"!SDK_INC!\winrt" /I"!SDK_INC!\ucrt" ^
+  "%PROJECT_DIR%src\test\test-psp-driver.c" ^
+  /link /LIBPATH:"!VC_LIB!" /LIBPATH:"!SDK_LIB!" /LIBPATH:"!UCRT_LIB!" user32.lib
 
 if errorlevel 1 (
-    echo WDM linking FAILED!
-    pause
+    echo  BUILD FAILED!
     exit /b 1
 )
 
-echo Copying INF file...
-copy "%PROJECT_DIR%inf\PspDriver.inf" "%OUTPUT_DIR%\" >nul
-
-:: --- Sign driver ---
-if not "%SIGNTOOLS%"=="" (
-    echo.
-    echo ==========================================
-    echo  SIGNING DRIVERS
-    echo ==========================================
-    echo.
-
-    :: Sign driver (uses same cert as GPU driver)
-    echo Signing PspDriver.sys...
-    "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" /v ^
-      "%OUTPUT_DIR%\PspDriver.sys" > "%OUTPUT_DIR%\sign-kmd.log" 2>&1
-    if errorlevel 1 (
-        type "%OUTPUT_DIR%\sign-kmd.log"
-        echo FATAL: PSP signing FAILED!
-        echo.
-        echo Try: Run build.bat as Administrator, or sign manually:
-        echo   signtool sign /fd SHA256 /a /s My /n AMD-BC250-Signer output\PspDriver.sys
-        pause
-        exit /b 1
-    ) else (
-        echo   PSP signed OK
-    )
-
-    :: Verify signature
-    "%SIGNTOOLS%\signtool.exe" verify /pa /v "%OUTPUT_DIR%\PspDriver.sys" > "%OUTPUT_DIR%\verify-kmd.log" 2>&1
-    if errorlevel 1 (
-        echo   Signature applied (test cert - verify may fail without testsigning)
-    ) else (
-        echo   PSP signature verified OK
-    )
-
-    :: Generate catalog AFTER signing (so hashes match signed .sys)
-    if not "%INF2CAT%"=="" (
-        echo Generating catalog file with Inf2Cat...
-        "%INF2CAT%" /driver:"%OUTPUT_DIR%" /os:10_X64 /verbose
-        if errorlevel 1 (
-            echo   WARNING: Inf2Cat catalog generation failed
-        ) else (
-            echo   Catalog generated OK
-        )
-    ) else if not "%MAKECAT%"=="" (
-        echo Generating catalog file with makecat...
-        pushd "%OUTPUT_DIR%"
-        "%MAKECAT%" /v "%PROJECT_DIR%scripts\PspDriver.cdf" >nul 2>&1
-        if errorlevel 1 (
-            echo   WARNING: makecat catalog generation failed
-        ) else (
-            echo   Catalog generated OK
-        )
-        popd
-    ) else (
-        echo   WARNING: No catalog generation tool found - keeping existing .cat if present
-    )
-
-    :: Sign catalog (if generated)
-    if exist "%OUTPUT_DIR%\PspDriver.cat" (
-        "%SIGNTOOLS%\signtool.exe" sign /fd SHA256 /a /s My /n "%CERT_NAME%" ^
-          "%OUTPUT_DIR%\PspDriver.cat"
-        if errorlevel 1 (
-            echo   WARNING: Catalog signing failed
-        ) else (
-            echo   Catalog signed OK
-        )
-    )
-    goto :DoneSigning
-)
-
-echo WARNING: No signing tools found - driver is UNSIGNED!
-echo ----------------------------------------------------
-echo To load this driver, run as Administrator:
-echo   bcdedit /set testsigning on
-echo Then REBOOT
-echo ----------------------------------------------------
-
-:DoneSigning
-
-echo.
-echo ==========================================
-echo  EXTRACTING FIRMWARE .bin FILES
-echo ==========================================
-echo.
-
-:: Run firmware extraction
-python "%PROJECT_DIR%extract-firmware.py" >nul 2>&1
-if %errorlevel% equ 0 (
-    echo  Firmware extracted to %OUTPUT_DIR%\firmware\
-    :: Copy additional firmware (ASD, TA) if available
-    if exist "%OUTPUT_DIR%\asd_5.00.bin"  copy /y "%OUTPUT_DIR%\asd_5.00.bin"  "%OUTPUT_DIR%\firmware\Asd.bin" >nul
-    if exist "%OUTPUT_DIR%\ta_5.00.bin"   copy /y "%OUTPUT_DIR%\ta_5.00.bin"   "%OUTPUT_DIR%\firmware\Ta.bin" >nul
-    :: Copy firmware alongside INF for driver install
-    copy /y "%OUTPUT_DIR%\firmware\*.bin" "%OUTPUT_DIR%\" >nul 2>&1
-    dir /b "%OUTPUT_DIR%\firmware\*.bin"
-) else (
-    echo  WARNING: Firmware extraction failed
-)
+:: Copy firmware files for -A / -L commands
+if not exist "%OUTPUT_DIR%\firmware" mkdir "%OUTPUT_DIR%\firmware"
+copy /Y "%PROJECT_DIR%firmware\cyan_skillfish2_*.bin" "%OUTPUT_DIR%\firmware\" >nul 2>&1
+echo  Firmware files copied to output\firmware\
 
 echo.
 echo ==========================================
 echo  BUILD COMPLETED!
 echo ==========================================
 echo.
-echo  Output directory: %OUTPUT_DIR%
-echo    PspDriver.sys   - WDM driver (kernel-mode)
-echo    PspDriver.inf   - Device installation file
-echo    PspDriver.cat   - Catalog file (if generated)
-echo    firmware\       - Firmware .bin files
+echo  Output: %OUTPUT_DIR%\psp-test-tool.exe
 echo.
-echo  Install (run as Administrator):
-echo    1. Device Manager -^> Find "AMD BC-250 PSP"
-echo    2. Update Driver -^> Browse -^> %OUTPUT_DIR%
-echo    3. Reboot if prompted
+echo  Usage (requires atikmdag.sys loaded + BAR5 mapped):
+echo    psp-test-tool.exe -i 0xFE800000 0x80000        Init HW
+echo    psp-test-tool.exe -t                            Quick test
+echo    psp-test-tool.exe -L 8 cyan_skillfish2_rlc.bin  Load RLC FW
+echo    psp-test-tool.exe -S 0x02 0                     Get SMU version
 echo.
-echo  Post-install (copy firmware to system dir):
-echo    mkdir "%SystemRoot%\System32\drivers\bc-250\" 2^>nul
-echo    xcopy /y /i "%OUTPUT_DIR%\firmware\*.bin" "%SystemRoot%\System32\drivers\bc-250\"
+echo  NOTE: No INF needed. No kernel driver installation required.
+echo  The GPU driver (atikmdag.sys) provides all PSP mailbox access.
 echo.
-echo  Test:
-echo    output\test-psp-driver.exe
-echo.
+
 pause
