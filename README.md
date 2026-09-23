@@ -7,18 +7,49 @@ Provides low-level PSP/SMU access for register diagnostics, firmware loading, an
 exploration on the AMD BC-250 (Cyan Skillfish). Uses the same `AMD-BC250-Signer` test cert
 as the GPU driver — both coexist on the same system.
 
+**Current status (2026-09-23):** proxy-only build **deployed + hardware-verified** alongside GPU driver `4.3.0.11` — no 0x1E BSOD, all init/ring/SMU tests PASS.
+
 ## GitHub
 
 - **PSP Driver**: https://github.com/Keshas-dev/AMD-BC-250-PSP-Windows-Driver
 - **GPU Driver**: https://github.com/Keshas-dev/AMD-BC-250-Windows-Driver
 
+## Coexistence verification (2026-09-23)
+
+| Layer | Result |
+|-------|--------|
+| GPU INIT NBIO_MAP | `INIT OK`, GPU_ID=`0x9FFF9700`, process exits |
+| GPU INIT full Flags=0 | `SUCCESS — no TDR`, **deadlock fixed** (GPU repo) |
+| PSP status (`-s`) | Alive YES, C2PMSG_64=`0x80000000`, C2PMSG_81=`0x002C7A89` |
+| PSP GPU bridge | Own BAR0 `MmioVA=0xF8934000`, **no dual-map of 0xFE800000** |
+| NBIO SIGs (boot) | SIG1=`0xFEDCBAEF` SIG2=`0xFEDCBADF` present |
+| SPI_PG | **0 (gated)** — SOS-locked on Windows (expected) |
+| SMU | 88.6.0, 1500MHz, Features `0xDD602C7D`, **16/16 messages OK** |
+| PSP GPCOM ring | RING_INIT Result=1, GET_FW_ATTESTATION SUCCESS, WPTR advances |
+| 0x1E BSOD | **None** this session |
+
 ## Capabilities
 
-- **BAR5 MMIO mapping** via `MmMapIoSpace` (or GPU proxy fallback on Win11 26100)
+- **PSP BAR0 MMIO** `0xFE700000` via `MmMapIoSpace` + `PspEnablePciMemory()` (Command bit1 on 1022:143E)
+- **GPU BAR5 access via proxy only** (`0x900`/`0x901`) — never dual-maps `0xFE800000`
 - **SMU v88.6.0 mailbox** via SMN (NBIO 0x38/0x3C path) — frequency control, feature enable/disable
-- **PSP C2PMSG mailbox** — SOS boot, firmware loading (RLC, MEC, SDMA, etc.)
-- **GC/MMHUB/HDP/NBIO/DF register access** at corrected BC-250 offsets
+- **PSP C2PMSG mailbox** (0x58000 base) via proxy — firmware load paths
+- **GC/MMHUB/HDP/NBIO/DF register access** at corrected BC-250 offsets (through proxy)
 - **IOCTL interface** — register R/W, firmware load, SMU messages, KIQ submit
+
+### Latest Fix: GPU BAR5 dual-map removed (2026-09-23) — VERIFIED
+
+**Root cause of 0x1E BSOD:** `IOCTL_PSP_INIT_HW` with PA `0xFE800000` created a second `MmMapIoSpace` of GPU BAR5 (`g_Bar5Mapping`), bypassing the GPU driver's `DeviceMutex`. A/B test: PSP installed → 4× 0x1E; PSP removed → clean FurMark/`spi-pg-nbio-test`.
+
+**Fix:**
+1. PSP never maps GPU BAR5; all GPU MMIO = proxy `0x900`/`0x901`
+2. GPU driver wraps proxy cases in `ExAcquireFastMutex(DeviceMutex)`
+3. Legacy dual-map released under `g_Bar5MappingLock` on auto-init
+4. Mailbox macros, NBIO unlock, BOOT_SEQ, GET_STATUS, GET_GPU_INFO, REG_PROG, LOAD_TOC, READ/WRITE_REG all proxy-routed
+
+**Also fixed (GPU side):** INIT_HARDWARE full-init deadlock (mutex held across PSP `GET_GPU_INFO` → `0x900` re-acquire) — see GPU `README.md` / `AGENTS.md` (2026-09-23).
+
+**PSP still owns:** PCI enable on `1022:143E`, its own BAR0, future **pa_v1 platform mailbox (C2PMSG_28..30)** unlock path (Linux `pspv_bc250`; TEE ring not required).
 
 ## Latest Fix: Driver Signing (2026-07-08)
 
@@ -34,6 +65,20 @@ Inf2Cat's 4439 bytes). Windows rejected the System-class driver with "not digita
 2. Sign `.sys` FIRST, then generate `.cat` with Inf2Cat, then sign `.cat`
 3. Fixed OS parameter from invalid `11_X64` to valid `10_X64`
 4. Updated INF `DriverVer` to `07/08/2026,3.0.0.4`
+
+### Installed build changes (09/22/2026, PspDriver.sys 1 622 376 B)
+
+| Change | Was → Now |
+|--------|-----------|
+| Deferred BAR mapping | DriverEntry mapped hardcoded `0xFD600000` (BIOS moves BAR each boot → random memory); now `Bar0Base=NULL`, real BAR mapped in `INIT_HW` |
+| PCI memory enable | New `PspEnablePciMemory()`: scan `1022:143E`, Command bit1 ON before `MmMapIoSpace` (else windows read `0xFFFFFFFF`); reads real BAR0 = `0xFE700000` |
+| Boot sequence skip | `PspDoBootSequence()` skips if MMIO not up (SOS already alive from VBIOS). Was: 5s timeouts every boot at DriverEntry |
+| Blind ECAM removed | Was mapping `0xE0000000`/`0xC0000000`/… — `0xC0000000` is GPU VRAM aperture → garbage PCI_READ |
+| PCI slot encoding | `(slot<<3)\|func` → `(slot<<5)\|func` (correct HAL encoding) |
+| C2PMSG offsets | `0x1056C` family → **`0x58000` base** (verified by psp-ring tests) |
+| NULL guards | NBIO unlock / GET_STATUS no longer write through NULL `MmioBase` |
+| INF | `StartType=0` (BOOT), `ErrorControl=0`, `LoadOrderGroup=Cryptography`, class SecurityDevices, `PnpLockdown=1` |
+
 
 ## SMU v88.6.0 via SMN
 
@@ -81,7 +126,7 @@ NBIO's PCIE index/data registers at BAR5+0x38/0x3C:
 
 ## Prerequisites
 
-- **Visual Studio 2022** + **WDK 10.0.26100.0** (auto-detected on C:, D:, or E: drive)
+- **Visual Studio 2022** + **WDK 10.0.26100.0** (auto-detected; **F:** on this host)
 - Test signing: `bcdedit /set testsigning on`, Secure Boot OFF
 
 ## Building
@@ -160,16 +205,43 @@ See `inc/PspIoctl.h` for full definitions:
 | `PSP_KIQ_SUBMIT` | 0x818 | KIQ ring submit |
 | `PSP_INIT_TMR` | 0x819 | Init Trusted Memory Region |
 
-### GPU Driver Proxy IOCTLs (Windows 11 26100)
+### GPU Driver Proxy IOCTLs (required for all GPU BAR5 access)
 
-When BAR5 mapping fails, the PSP driver uses these GPU driver proxy IOCTLs:
+PSP **must not** map GPU BAR5 itself. Use these GPU driver proxy IOCTLs:
 
 | IOCTL | Code | Description |
 |-------|------|-------------|
 | `IOCTL_AMDBC250_BAR5_READ_PROXY` | 0x900 | Read BAR5 register via GPU driver |
 | `IOCTL_AMDBC250_BAR5_WRITE_PROXY` | 0x901 | Write BAR5 register via GPU driver |
 
-## Architecture
+Windows 11 26100: install **GPU driver first** (maps BAR5), then PSP (`ZwCreateFile` → `DeviceIoControl`).
+
+## Architecture (2026-09-23): two devices, no BAR5 dual-map
+
+**Critical fix:** the PSP driver must **never** `MmMapIoSpace(0xFE800000)`. GPU BAR5 belongs to `atikmdag.sys`. Dual-mapping raced the GPU driver and caused **bugcheck 0x1E** (A/B confirmed: 4 crashes with PSP installed, clean after uninstall).
+
+```
+PCI 1002:13FE  GPU BAR5  0xFE800000   ← GPU driver ONLY (DeviceMutex)
+PCI 1022:143E  PSP BAR0  0xFE700000   ← PspDriver (own window, pa_v1 future unlock)
+                     │
+PSP GPU reg access ──┴──► GPU proxy raw IOCTLs 0x900 / 0x901
+                          on \Device\AMDBC250DreamV43
+                          (serialized by GPU DeviceMutex)
+```
+
+| Role | Owner | Notes |
+|------|-------|-------|
+| GPU registers / rings / display | **GPU driver** | Own BAR5 map + `DeviceMutex` |
+| PSP BAR0 + platform mailbox | **PSP driver** | Linux `pspv_bc250` / pa_v1 C2PMSG_28..30 |
+| C2PMSG on GPU BAR5 (0x58000 base) | via **proxy only** | Never direct map |
+| NBIO sigs 0xC100/0xC180 | via **proxy** when GPU up | Dual-write was a conflict source |
+
+Install order: **GPU first**, then PSP. GPU proxy IOCTLs (raw, not `CTL_CODE`):
+
+| IOCTL | Code | Description |
+|-------|------|-------------|
+| `IOCTL_AMDBC250_BAR5_READ_PROXY` | `0x900` | Read GPU BAR5 register |
+| `IOCTL_AMDBC250_BAR5_WRITE_PROXY` | `0x901` | Write GPU BAR5 register |
 
 ```
 User Mode                    Kernel Mode (WDM)
@@ -177,51 +249,44 @@ User Mode                    Kernel Mode (WDM)
 test-psp-driver.exe  ---->   PspDriver.sys
 DeviceIoControl              ├─ DriverEntry (IoCreateDevice)
                              ├─ IOCTL dispatch
-                             │   ├─ INIT_HW (MmMapIoSpace BAR5 0xFE800000)
-                             │   │   └─ Falls back to GPU proxy if mapping fails
-                             │   ├─ READ_REG / WRITE_REG (direct BAR5 MMIO or GPU proxy)
-                             │   ├─ Mailbox C2PMSG (SYSDRV/SOS boot)
-                             │   ├─ NBIO unlock signature registers
-                             │   └─ Ring protocol (GPCOM, RBI)
-                             ├─ PSP proxy bridge (for GPU driver)
-                             │   ├─ GET_GPU_INFO → bridge info
-                             │   └─ REG_PROG via ring or mailbox
-                             └─ DriverUnload (free buffer + MMIO)
+                             │   ├─ INIT_HW → PSP BAR0 only + PspGpuProxyInit
+                             │   │   └─ NEVER maps 0xFE800000
+                             │   ├─ READ_REG / WRITE_REG / mailbox / NBIO / ring
+                             │   │   └─ GPU offsets → PspGpuProxy*(0x900/0x901)
+                             │   └─ Legacy GpuMmioBase unmapped if present
+                             └─ DriverUnload
 
 GPU Driver (atikmdag.sys)
-  └─ Amdbc250PspProxy  ────> \\.\AmdBcPsp
-      ├─ PSP_READ_REG       Direct BAR5 MMIO reads via PSP driver
-      ├─ PSP_WRITE_REG      Direct BAR5 MMIO writes via PSP driver
-      ├─ PSP_GET_GPU_INFO   Ring buffer PA, SOS status
-      └─ PSP_REG_PROG       Register programming (via ring or mailbox)
-
-Windows 11 26100 GPU Proxy Fallback:
-test-psp-driver.exe  ---->   PspDriver.sys  ---->   GPU Driver (atikmdag.sys)
-                           (ZwCreateFile)      (BAR5 proxy IOCTLs)
-                           (IOCTL_AMDBC250_*)    (MmioVirtualBase access)
+  ├─ Own BAR5 MmioVirtualBase + DeviceMutex
+  └─ cases 0x900/0x901 ── under DeviceMutex ──► BAR5 MMIO
 ```
 
 ## Current Status
 
-### What Works
-- ✅ **PSP driver loads, BAR5 maps**, SOS alive (C2PMSG_81=0xF0000010)
-- ✅ **SMU v88.6.0 mailbox via SMN** — TestMessage, GetSmuVersion, GetEnabledSmuFeatures, ForceGfxFreq
+### What Works (verified 2026-09-23)
+- ✅ **Both drivers coexist** — GPU 4.3.0.11 + PSP 3.0.0.4, **no 0x1E BSOD**
+- ✅ **PSP driver loads, PSP BAR0 maps**, SOS status via proxy (C2PMSG_81 via `0x900`)
+- ✅ **No GPU BAR5 dual-map** — proxy-only path implemented and tested
+- ✅ **GPU INIT deadlock fixed** — full-init Flags=0 returns SUCCESS, process exits (GPU repo fix)
+- ✅ **SMU v88.6.0 mailbox via SMN** — TestMessage, GetSmuVersion, GetEnabledSmuFeatures, ForceGfxFreq, **16/16 whitelist**
 - ✅ **Governor sequence safe** — Q3 temp → Q0 unforce → Q3 profile → Q0 force VID → Q0 force freq
 - ✅ **Frequency control** (1500→1166 MHz) — SMU accepts freq/voltage changes
 - ✅ **Feature enable/disable** via SMU Q2 (GFXOFF, CG, PG — all disableable)
-- ✅ **GC/MMHUB/HDP/NBIO/DF register access** at corrected BC-250 offsets
+- ✅ **GC/MMHUB/HDP/NBIO/DF register access** at corrected BC-250 offsets (via proxy)
 - ✅ **PSP mailbox firmware loading** — RLC, MEC, ME, PFP, CE, SDMA all load OK
+- ✅ **PSP GPCOM ring** — RING_INIT + GET_FW_ATTESTATION SUCCESS + WPTR advances
 - ✅ **IRP_MJ_DEVICE_CONTROL** — all 30+ IOCTL handlers operational
-- ✅ **GPU driver proxy bridge** for Win11 26100 fallback
+- ✅ **GPU driver proxy bridge** — raw `0x900`/`0x901`, GPU `DeviceMutex`-serialized
 - ✅ **Both drivers digitally signed** — Inf2Cat .cat generation fixed (x86 path)
 - ✅ **All code review bugs fixed** — IP FW load, ring size cap, proxy return checks, spinlock races, SMU protocol
 
 ### What Doesn't Work
-- ❌ **Compute/GFX execution** — WGPs permanently fused off (SPI_PG_MASK=RO 0)
-- ❌ **GPCOM/TOS ring protocol** — SOS doesn't support ring-based commands
-- ❌ **KIQ ring processing** — KIQ_BASE/KIQ_SIZE hardwired to 0
+- ❌ **Compute/GFX execution** — WGPs SOS-locked (SPI_PG=0 on Windows init order)
+- ❌ **GPCOM/TOS ring protocol** — SOS doesn't support ring-based commands (GPU-side ring works for attestation/TMR/IP-FW SMU)
+- ❌ **KIQ ring processing** — KIQ_SIZE/KIQ_BASE hardwired to 0
 - ❌ **DCN display output** — timing registers read-only (DMCUB FW not loaded)
 - ❌ **Mailbox-based PROG_REG** — PSP accepts command, write silently ignored
+- ❌ **NBIO re-unlock after boot** — gle=31 (SIGs already present from boot; re-issue fails, expected)
 
 ### Register Access Ranges
 | Block | BAR5 Offset | Access | Notes |
@@ -232,7 +297,7 @@ test-psp-driver.exe  ---->   PspDriver.sys  ---->   GPU Driver (atikmdag.sys)
 | MMHUB | 0x5000+ | R/W | Memory management |
 | NBIO | 0xC100+ | R/W | PCIe config |
 | DF | 0x1A000+ | Read | Data Fabric |
-| PSP | 0x1056C+ | R/W | C2PMSG mailbox |
+| PSP | BAR5 `0x58000+` (via proxy) | R/W | C2PMSG mailbox (0x58000 base) |
 
 ## Related Projects
 

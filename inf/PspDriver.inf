@@ -1,0 +1,62 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = SecurityDevices
+ClassGuid   = {d94ee5d8-d189-4994-83d2-f68d7d41b0e6}
+Provider    = %ManufacturerName%
+CatalogFile = PspDriver.cat
+DriverVer   = 07/08/2026,3.0.0.4
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+Firmware_Files = 12, bc-250
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+PspDriver.sys = 1
+Asd.bin = 1, firmware
+Ta.bin = 1, firmware
+Sysdrv.bin = 1, firmware
+Sos.bin = 1, firmware
+Smu.bin = 1, firmware
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = Psp_Device_Install, PCI\VEN_1022&DEV_143E&SUBSYS_00001022&REV_00
+
+[Psp_Device_Install.NT]
+CopyFiles = Drivers_Dir, Firmware_Files
+
+[Drivers_Dir]
+PspDriver.sys
+
+[Firmware_Files]
+Asd.bin
+Ta.bin
+Sysdrv.bin
+Sos.bin
+Smu.bin
+
+[Psp_Device_Install.NT.Services]
+AddService = PspDriver,%SPSVCINST_ASSOCSERVICE%,Psp_Service_Inst
+
+[Psp_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 0               ; SERVICE_BOOT_START
+ErrorControl   = 0               ; SERVICE_ERROR_CRITICAL
+ServiceBinary  = %12%\PspDriver.sys
+LoadOrderGroup = Cryptography
+
+
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "AMD BC-250 Custom Lab"
+DeviceDesc             = "AMD BC-250 PSP Driver Interface"
+ServiceDesc            = "AMD BC-250 PSP Driver Service"
+DiskName               = "AMD BC-250 PSP Driver Installation Disk"

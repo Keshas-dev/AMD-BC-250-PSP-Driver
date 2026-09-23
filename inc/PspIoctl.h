@@ -9,62 +9,8 @@
 extern "C" {
 #endif
 
-// GPU driver device (replaces separate PSP driver — direct BAR5 mailbox IOCTLs)
-#define GPU_DEVICE_NAME    L"\\\\.\\AMDBC250DreamV43"
-
-// GPU driver raw IOCTL codes (0x900+ are raw, not CTL_CODE-packed)
-#define IOCTL_GPU_BAR5_READ_PROXY_RAW   0x900   // IN: ULONG offset → OUT: ULONG value
-#define IOCTL_GPU_BAR5_WRITE_PROXY_RAW  0x901   // IN: ULONG[2] {offset, value} → OUT: none
-
-// GPU driver CTL_CODE-based IOCTLs using FILE_DEVICE_AMDBC250(0x8000) + IOCTL_INDEX(0x270)
-// These values come from the GPU driver's amdbc250_ioctl.h
-#define IOCTL_GPU_INIT_HW               ((ULONG)0x80000B80)   // CTL_CODE(0x8000, 0x2E0, 0, 0)
-#define IOCTL_GPU_READ_REG              ((ULONG)0x80000B88)   // CTL_CODE(0x8000, 0x2E2, 0, 0)
-#define IOCTL_GPU_WRITE_REG             ((ULONG)0x80000B8C)   // CTL_CODE(0x8000, 0x2E3, 0, 0)
-
-// GPU driver IOCTL for direct PSP mailbox (raw CTL_CODE with high function to avoid collision)
-#define IOCTL_GPU_PSP_LOAD_IP_FW        ((ULONG)0x80002480)   // CTL_CODE(0x8000, 0x920, 0, 0)
-#define IOCTL_GPU_PSP_SMU_MSG           ((ULONG)0x80002490)   // CTL_CODE(0x8000, 0x924, 0, 0)
-
-// IOCTL structures for GPU driver direct PSP mailbox (matching amdbc250_ioctl.h)
-typedef struct _AMDBC250_IOCTL_PSP_LOAD_IP_FW {
-    ULONG FwType;                       // Firmware type (1=ME, 2=PFP, 3=CE, 4=MEC, 8=RLC, 9=SDMA0)
-    ULONG FwSize;                       // Firmware blob size in bytes
-    ULONG Result;                       // OUT: 0=fail, 1=success
-    ULONG C2Pmsg35After;                // OUT: C2PMSG_35 after command
-    ULONG C2Pmsg81After;                // OUT: C2PMSG_81 after command
-    // Firmware data follows immediately after this struct
-} AMDBC250_IOCTL_PSP_LOAD_IP_FW;
-
-typedef struct _AMDBC250_IOCTL_PSP_SMU_MSG {
-    ULONG Message;                      // SMU message ID
-    ULONG Argument;                     // Argument
-    ULONG Response;                     // OUT: response from C2PMSG_82
-    ULONG ResponseStatus;               // OUT: C2PMSG_90 (1=OK, 0xFF=error)
-    ULONG Result;                       // OUT: 0=fail, 1=success
-} AMDBC250_IOCTL_PSP_SMU_MSG;
-
-// IOCTL structures for GPU driver INIT_HW (matching amdbc250_ioctl.h)
-typedef struct _AMDBC250_IOCTL_INIT_HARDWARE {
-    ULONG64 MmioPhysicalBase;           // Physical address of BAR5 (0=auto-detect)
-    ULONG MmioSize;                     // Size in bytes (0=default 512KB)
-    ULONG Flags;                        // 0=full init, 1=NBIO_MAP only
-    ULONG64 FbPhysicalBase;             // Framebuffer base (0=auto)
-    ULONG FbSize;                       // Framebuffer size (0=auto)
-} AMDBC250_IOCTL_INIT_HARDWARE;
-
-// IOCTL structures for GPU driver READ_REG / WRITE_REG
-typedef struct _AMDBC250_IOCTL_READ_REG {
-    ULONG Offset;
-    ULONG Value;                        // OUT
-    ULONG Status;                       // OUT (NTSTATUS)
-} AMDBC250_IOCTL_READ_REG;
-
-typedef struct _AMDBC250_IOCTL_WRITE_REG {
-    ULONG Offset;
-    ULONG Value;
-    ULONG Status;                       // OUT (NTSTATUS)
-} AMDBC250_IOCTL_WRITE_REG;
+// Device name and symbolic link
+#define PSP_DEVICE_NAME    L"\\\\.\\AmdBcPsp"
 
 // IOCTL codes (must match driver definitions)
 #define IOCTL_PSP_READ_REG    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -94,26 +40,47 @@ typedef struct _AMDBC250_IOCTL_WRITE_REG {
 #define IOCTL_PSP_LOAD_IP_FW_DIRECT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_GPU_PM4_SUBMIT      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// DEVICE_EXTENSION removed — PSP driver is no longer a kernel driver.
-// Use GPU_DEVICE_NAME + IOCTL_GPU_PSP_* for direct mailbox access.
+#ifdef _NTDDK_
+typedef struct _DEVICE_EXTENSION {
+    PVOID       MmioBase;
+    ULONG       MmioSize;
+    PVOID       Bar0Base;
+    ULONG       Bar0Size;
+    PVOID       GpuMmioBase;
+    ULONG       GpuMmioSize;
+    PVOID       FwBuffer;
+    PHYSICAL_ADDRESS FwPhysical;
+    ULONG       FwSize;
+    ULONG       FwPaShifted;
+    PVOID       RingBuffer;
+    PHYSICAL_ADDRESS RingBufferPA;
+    ULONG       RingSize;
+    BOOLEAN     RingCreated;
+    KMUTEX    CommandLock; /* 2026-09-23: KMUTEX not spinlock — proxy Zw needs PASSIVE */
+    PVOID       PciCfgBase;
+    ULONG       PciCfgSize;
+} DEVICE_EXTENSION, *PDEVICE_EXTENSION;
+#endif
 
 // Timeout for PSP firmware commands (ms)
 #define PSP_FW_WAIT_MS               5000
 
-// PSP Mailbox register offsets (relative to BAR0 base)
-// These match the hardware addresses documented in the spec
-#define PSP_C2PMSG_35_OFFSET  0x1056C   // Command register
-#define PSP_C2PMSG_36_OFFSET  0x10570   // Data register (PA low 32b)
-#define PSP_C2PMSG_37_OFFSET  0x10574   // Data register (PA high 32b)
-#define PSP_C2PMSG_64_OFFSET  0x105E0   // Ring control register
-#define PSP_C2PMSG_65_OFFSET  0x105E4   // RBI wptr
-#define PSP_C2PMSG_66_OFFSET  0x105E8   // RBI rptr
-#define PSP_C2PMSG_67_OFFSET  0x105EC   // GPCOM wptr
-#define PSP_C2PMSG_68_OFFSET  0x105F0   // GPCOM rptr
-#define PSP_C2PMSG_69_OFFSET  0x105F4   // Ring buffer addr lo
-#define PSP_C2PMSG_70_OFFSET  0x105F8   // Ring buffer addr hi
-#define PSP_C2PMSG_71_OFFSET  0x105FC   // Ring buffer size
-#define PSP_C2PMSG_81_OFFSET  0x10614   // Status register
+// PSP Mailbox register offsets (GPU MP0 block in GPU BAR5)
+// FIXED 2026-08-21: old values (0x1056C family) were from the WRONG base era
+// (0x103D0/0x103E0 guesses + CPU-PSP style layout). Verified live base is
+// 0x58000 (= ip_discovery MP0 dword 0x16000 x4) per psp-ring tests.
+#define PSP_C2PMSG_35_OFFSET  0x5818C   // Bootloader command register
+#define PSP_C2PMSG_36_OFFSET  0x58190   // Data register (PA low 32b)
+#define PSP_C2PMSG_37_OFFSET  0x58194   // Data register (PA high 32b)
+#define PSP_C2PMSG_64_OFFSET  0x58200   // Ring control / TOS-ready (bit31)
+#define PSP_C2PMSG_65_OFFSET  0x58204
+#define PSP_C2PMSG_66_OFFSET  0x58208
+#define PSP_C2PMSG_67_OFFSET  0x5820C   // GPCOM wptr
+#define PSP_C2PMSG_68_OFFSET  0x58210   // GPCOM rptr
+#define PSP_C2PMSG_69_OFFSET  0x58214   // Ring buffer addr lo
+#define PSP_C2PMSG_70_OFFSET  0x58218   // Ring buffer addr hi
+#define PSP_C2PMSG_71_OFFSET  0x5821C   // Ring buffer size
+#define PSP_C2PMSG_81_OFFSET  0x58244   // SOS status (non-zero = alive; bit31 NOT flag)
 
 // SMU v11.8 Mailbox offsets (MP1_BASE = 0x16000 on BC-250)
 // Used for SMU communication: C2PMSG_66->90 at MP1_BASE offset
