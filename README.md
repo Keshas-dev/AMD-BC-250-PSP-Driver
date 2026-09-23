@@ -7,7 +7,17 @@ Provides low-level PSP/SMU access for register diagnostics, firmware loading, an
 exploration on the AMD BC-250 (Cyan Skillfish). Uses the same `AMD-BC250-Signer` test cert
 as the GPU driver — both coexist on the same system.
 
-**Current status (2026-09-23):** proxy-only build **deployed + hardware-verified** alongside GPU driver `4.3.0.11` — no 0x1E BSOD, all init/ring/SMU tests PASS.
+**Current status (2026-09-23):** **BAR2 auto-init fix built** (`pspdriver.sys` SHA256 `D8DC9423…01FE5`) — reinstall via Device Manager. Previous proxy-only build was hardware-verified alongside GPU `4.3.0.11` (no 0x1E, all init/ring/SMU PASS).
+
+### BAR2 auto-init fix (2026-09-23) — pending reinstall
+On this unit **PCI BAR0 = 0**; the pa_v1 1MB window is **BAR2 @ 0x18 = `0xFE700000`** (Linux binds BAR2 too). Old driver:
+1. `#define PCIConfiguration 0` → `HalGetBusDataByOffset` read **CMOS**, not PCI (never found `1022:143E`)
+2. Wrong slot encoding `(dev<<5)|func` → missed **B1.D0.F2**
+3. BAR0=0 → mapped dead **`0xFD600000`** → auto-init reads all `0xFF`
+
+**Now:** real `PCIConfiguration` + `(func<<5)|device` + BAR2 fallback + no `0xFD600000`. Also: no NBIO raw Bar0 write (proxy/ready only), alias-aware unload, INIT_HW fail-path clears stale maps. Code Reviewer PASS.
+
+**After install:** `output\test-psp-driver.exe -s` once — expect live BAR0/`0xFE700000` map, pa_v1 regs readable (bootloader `0x001C0102`).
 
 ## GitHub
 

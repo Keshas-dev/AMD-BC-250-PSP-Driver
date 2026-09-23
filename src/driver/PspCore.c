@@ -6,8 +6,10 @@
 
 #define GPU_BAR5_SIZE          0x80000ULL
 
-// BUS_DATA_TYPE for PCI config access via HAL
-#define PCIConfiguration 0
+/* PCIConfiguration comes from ntddk.h BUS_DATA_TYPE enum (= 4).
+ * FIX 2026-09-23: old `#define PCIConfiguration 0` overrode it with 0 (Cmos),
+ * so every HalGetBusDataByOffset read CMOS instead of PCI config space —
+ * 1022:143E scan always returned NOT FOUND. */
 
 // LKML-discovered PSP BAR0 (Mattia Tadini 2026-09-19): fe700000 [1MB]
 #define PSP_LKML_BAR0          0xFE700000ULL
@@ -467,40 +469,64 @@ VOID PspFreeTmr(VOID)
  * Returns: physical address of PSP BAR0, or 0 if not found. */
 static ULONGLONG PspEnablePciMemory(VOID)
 {
-    /* Scan bus 0-1 for VEN_1022 DEV_143E (CPU PSP) */
-    for (ULONG bus = 0; bus < 2; bus++) {
-        for (ULONG slot = 0; slot < 32; slot++) {
+    /* PCI_SLOT_NUMBER: DeviceNumber=bits0-4, FunctionNumber=bits5-7
+     * → SlotNumber = (function << 5) | device.  BUGFIX 2026-09-23:
+     * old code used (device << 5) | function which never hit Bx.D0.F2
+     * (1022:143E is B1.D0.F2) → device not found → stale 0xFD600000 map. */
+    for (ULONG bus = 0; bus < 4; bus++) {
+        for (ULONG device = 0; device < 32; device++) {
             for (ULONG func = 0; func < 8; func++) {
-                ULONG devFn = (slot << 5) | func;
+                ULONG slotNumber = (func << 5) | device;
                 ULONG idReg = 0;
-                HalGetBusDataByOffset(PCIConfiguration, bus, devFn, &idReg, 0, sizeof(ULONG));
+                HalGetBusDataByOffset(PCIConfiguration, bus, slotNumber, &idReg, 0, sizeof(ULONG));
                 if (idReg == 0xFFFFFFFF || idReg == 0) continue;
                 /* VEN_1022 = low 16 bits, DEV_143E = high 16 bits */
                 if ((idReg & 0xFFFF) == 0x1022 && ((idReg >> 16) & 0xFFFF) == 0x143E) {
                     /* Read current Command register (offset 0x04) */
                     ULONG cmd = 0;
-                    HalGetBusDataByOffset(PCIConfiguration, bus, devFn, &cmd, 0x04, sizeof(ULONG));
-                    KdPrint(("PSP_PCI: Found 1022:143E at B%u.D%u.F%u cmd=0x%08X\n", bus, slot, func, cmd));
+                    HalGetBusDataByOffset(PCIConfiguration, bus, slotNumber, &cmd, 0x04, sizeof(ULONG));
+                    KdPrint(("PSP_PCI: Found 1022:143E at B%u.D%u.F%u cmd=0x%08X\n", bus, device, func, cmd));
                     /* Enable IO Space (bit0) + Memory Space (bit1) + Bus Master (bit2) */
                     ULONG newCmd = cmd | 0x7;
                     if (newCmd != cmd) {
-                        HalSetBusDataByOffset(PCIConfiguration, bus, devFn, &newCmd, 0x04, sizeof(ULONG));
+                        HalSetBusDataByOffset(PCIConfiguration, bus, slotNumber, &newCmd, 0x04, sizeof(ULONG));
                         KeStallExecutionProcessor(100);
-                        HalGetBusDataByOffset(PCIConfiguration, bus, devFn, &cmd, 0x04, sizeof(ULONG));
+                        HalGetBusDataByOffset(PCIConfiguration, bus, slotNumber, &cmd, 0x04, sizeof(ULONG));
                         KdPrint(("PSP_PCI: Enabled memory, cmd now=0x%08X\n", cmd));
                     }
                     /* Read BAR0 (offset 0x10) for real PSP MMIO base */
                     ULONG bar0 = 0;
-                    HalGetBusDataByOffset(PCIConfiguration, bus, devFn, &bar0, 0x10, sizeof(ULONG));
-                    /* Mask out type bits [2:0] (0=32-bit, 1=64-bit, 2=64-bit prefetch) */
+                    HalGetBusDataByOffset(PCIConfiguration, bus, slotNumber, &bar0, 0x10, sizeof(ULONG));
                     ULONGLONG bar0Phys = (ULONGLONG)(bar0 & ~0xFU);
+                    /* 64-bit BAR: high dword at offset 0x14 */
+                    if ((bar0 & 0x6) == 0x4) {
+                        ULONG bar0Hi = 0;
+                        HalGetBusDataByOffset(PCIConfiguration, bus, slotNumber, &bar0Hi, 0x14, sizeof(ULONG));
+                        bar0Phys |= ((ULONG64)bar0Hi << 32);
+                    }
                     KdPrint(("PSP_PCI: BAR0 raw=0x%08X phys=0x%llX\n", bar0, bar0Phys));
+                    /* BUGFIX 2026-09-23: on this unit BAR0 is unprogrammed (0);
+                     * pa-v1 1MB window is BAR2 @ 0x18 (high @ 0x1C) = 0xFE700000
+                     * (verified pa-v1-diag2: BAR0=0, BAR2=0xFE700000, BAR5=0xFE884000).
+                     * Old code returned 0 → PspAutoInitialize fell back to dead
+                     * 0xFD600000 → all auto-init MMIO reads 0xFF. */
+                    if (bar0Phys == 0) {
+                        ULONG bar2 = 0;
+                        HalGetBusDataByOffset(PCIConfiguration, bus, slotNumber, &bar2, 0x18, sizeof(ULONG));
+                        bar0Phys = (ULONGLONG)(bar2 & ~0xFU);
+                        if ((bar2 & 0x6) == 0x4) {
+                            ULONG bar2Hi = 0;
+                            HalGetBusDataByOffset(PCIConfiguration, bus, slotNumber, &bar2Hi, 0x1C, sizeof(ULONG));
+                            bar0Phys |= ((ULONG64)bar2Hi << 32);
+                        }
+                        KdPrint(("PSP_PCI: BAR0=0, BAR2 raw=0x%08X phys=0x%llX\n", bar2, bar0Phys));
+                    }
                     return bar0Phys;
                 }
             }
         }
     }
-    KdPrint(("PSP_PCI: 1022:143E not found on bus 0-1\n"));
+    KdPrint(("PSP_PCI: 1022:143E not found on bus 0-3\n"));
     return 0;
 }
 
@@ -511,24 +537,28 @@ NTSTATUS PspAutoInitialize(PDEVICE_EXTENSION devExt)
         ULONGLONG pspBar0 = PspEnablePciMemory();
 
         PHYSICAL_ADDRESS physAddr;
-        if (pspBar0 != 0) {
-            /* Use the discovered BAR0 (fe700000) */
+        ULONG mapSize = PSP_BAR0_SIZE;
+        if (pspBar0 == 0) {
+            /* FIX Code Reviewer 2026-09-23: do NOT map stale 0xFD600000 —
+             * known garbage from earlier sessions (no device behind it). */
+            KdPrint(("PSP: 1022:143E BAR0=0 and BAR2=0 — no map, auto-init fails\n"));
+            /* fall through to fail path below (Bar0Base stays NULL) */
+        } else {
             physAddr.QuadPart = (LONGLONG)pspBar0;
-            KdPrint(("PSP: mapping discovered BAR0 at 0x%llX\n", physAddr.QuadPart));
-        } else {
-            /* Fallback to stale hardcoded address */
-            physAddr.QuadPart = PSP_BAR0_PHYSICAL;
-            KdPrint(("PSP: 1022:143E not found, fallback to 0x%llX\n", physAddr.QuadPart));
-        }
-        devExt->Bar0Base = MmMapIoSpace(physAddr, PSP_BAR0_SIZE, MmNonCached);
-        if (devExt->Bar0Base == NULL) {
-            KdPrint(("PSP: BAR0 map failed at 0x%llX\n", physAddr.QuadPart));
-        } else {
-            devExt->Bar0Size = PSP_BAR0_SIZE;
-            devExt->MmioBase = devExt->Bar0Base;
-            devExt->MmioSize = PSP_BAR0_SIZE;
-            KdPrint(("PSP: BAR0 mapped: PA=0x%llX VA=%p size=%u\n",
-                physAddr.QuadPart, devExt->Bar0Base, devExt->Bar0Size));
+            if (pspBar0 == PSP_LKML_BAR0)
+                mapSize = (ULONG)PSP_LKML_BAR0_SIZE;
+            KdPrint(("PSP: mapping discovered BAR at 0x%llX size=0x%X\n",
+                physAddr.QuadPart, mapSize));
+            devExt->Bar0Base = MmMapIoSpace(physAddr, mapSize, MmNonCached);
+            if (devExt->Bar0Base == NULL) {
+                KdPrint(("PSP: BAR0 map failed at 0x%llX\n", physAddr.QuadPart));
+            } else {
+                devExt->Bar0Size = mapSize;
+                devExt->MmioBase = devExt->Bar0Base;
+                devExt->MmioSize = mapSize;
+                KdPrint(("PSP: BAR0 mapped: PA=0x%llX VA=%p size=%u\n",
+                    physAddr.QuadPart, devExt->Bar0Base, devExt->Bar0Size));
+            }
         }
     }
 

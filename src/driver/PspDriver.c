@@ -24,8 +24,9 @@ HANDLE g_GpuDriverHandle = NULL;
 #define PSP_GPU_DRIVER_SYM_NAME   L"\\DosDevices\\AMDBC250DreamV43"
 #define PSP_IOCTL_READ_REG_PROXY  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// BUS_DATA_TYPE for PCI config access via HAL
-#define PCIConfiguration 0
+/* PCIConfiguration comes from ntddk.h BUS_DATA_TYPE enum (= 4).
+ * FIX 2026-09-23: old `#define PCIConfiguration 0` overrode it with 0 (Cmos),
+ * so IOCTL_PSP_PCI_READ/WRITE hit CMOS bus data, never PCI config space. */
 
 // NBIO signature registers for firewall unlock
 #define NBIO_SIG1_OFFSET       0xC100
@@ -442,19 +443,30 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
         devExt->PciCfgBase = NULL;
     }
 
-    if (devExt->Bar0Base != NULL) {
-        MmUnmapIoSpace(devExt->Bar0Base, devExt->Bar0Size);
-        devExt->Bar0Base = NULL;
-    }
-
-    if (devExt->GpuMmioBase != NULL && devExt->GpuMmioBase != devExt->Bar0Base) {
-        MmUnmapIoSpace(devExt->GpuMmioBase, devExt->GpuMmioSize);
-        devExt->GpuMmioBase = NULL;
-    }
-
-    if (devExt->MmioBase != NULL && devExt->MmioBase != devExt->Bar0Base) {
-        MmUnmapIoSpace(devExt->MmioBase, devExt->MmioSize);
-        devExt->MmioBase = NULL;
+    /* FIX Code Reviewer 2026-09-23: alias-aware unmap — after successful map
+     * Bar0Base == MmioBase; nulling Bar0Base first broke the != guard and
+     * double-unmapped the same VA on unload (sc stop / uninstall path). */
+    {
+        PVOID oldBar0 = devExt->Bar0Base;
+        PVOID oldMmio = devExt->MmioBase;
+        PVOID oldGpu = devExt->GpuMmioBase;
+        if (oldBar0 != NULL) {
+            if (oldMmio == oldBar0) { oldMmio = NULL; devExt->MmioBase = NULL; }
+            if (oldGpu == oldBar0)  { oldGpu = NULL;  devExt->GpuMmioBase = NULL; }
+            MmUnmapIoSpace(oldBar0, devExt->Bar0Size);
+            devExt->Bar0Base = NULL;
+            devExt->Bar0Size = 0;
+        }
+        if (oldMmio != NULL) {
+            MmUnmapIoSpace(oldMmio, devExt->MmioSize);
+            devExt->MmioBase = NULL;
+            devExt->MmioSize = 0;
+        }
+        if (oldGpu != NULL) {
+            MmUnmapIoSpace(oldGpu, devExt->GpuMmioSize);
+            devExt->GpuMmioBase = NULL;
+            devExt->GpuMmioSize = 0;
+        }
     }
     KdPrint(("BAR5 resources released\n"));
 
@@ -535,22 +547,35 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
          * stale — BIOS reassigns BARs per boot). Now ANY address that is not
          * the GPU BAR5 maps as PSP BAR0, so the real CPU-PSP BAR can be
          * passed at runtime once discovered. */
+        /* FIX Code Reviewer 2026-09-23: on intentional remap, unmap old VA
+         * (when it was distinct) then set BOTH Bar0Base and MmioBase together —
+         * old path left MmioBase pointing at the previous PA after re-INIT. */
         if (physAddr.QuadPart != (LONGLONG)GPU_BAR5_PHYSICAL) {
-            if (devExt->Bar0Base != NULL && devExt->Bar0Base != devExt->MmioBase) {
-                MmUnmapIoSpace(devExt->Bar0Base, devExt->Bar0Size);
+            PVOID oldBar0 = devExt->Bar0Base;
+            ULONG oldBar0Size = devExt->Bar0Size;
+            PVOID oldMmio = devExt->MmioBase;
+            ULONG oldMmioSize = devExt->MmioSize;
+            if (oldBar0 != NULL) {
+                MmUnmapIoSpace(oldBar0, oldBar0Size);
+            }
+            if (oldMmio != NULL && oldMmio != oldBar0) {
+                MmUnmapIoSpace(oldMmio, oldMmioSize);
             }
             devExt->Bar0Base = MmMapIoSpace(physAddr, size, MmNonCached);
             devExt->Bar0Size = size;
             if (devExt->Bar0Base == NULL) {
+                /* FIX Code Reviewer 2026-09-23: clear Mmio too — old maps
+                 * already unmapped above; leave all-NULL for auto-init retry. */
+                devExt->Bar0Size = 0;
+                devExt->MmioBase = NULL;
+                devExt->MmioSize = 0;
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 KdPrint(("INIT_HW: PSP BAR0 map failed at 0x%llX\n", physAddr.QuadPart));
                 KeReleaseMutex(&devExt->CommandLock, FALSE);
                 break;
             }
-            if (devExt->MmioBase == NULL) {
-                devExt->MmioBase = devExt->Bar0Base;
-                devExt->MmioSize = size;
-            }
+            devExt->MmioBase = devExt->Bar0Base;
+            devExt->MmioSize = size;
             KdPrint(("INIT_HW: PSP BAR0 mapped at 0x%llX VA=%p size=%u\n",
                 physAddr.QuadPart, devExt->Bar0Base, size));
         } else {
@@ -593,10 +618,10 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             devExt->PciCfgBase = NULL;
         }
 
-        bytesReturned = sizeof(ULONG);
         if (outputLength >= sizeof(ULONG)) {
             /* Proxy-only: GpuMmioBase stays 0; 1 = proxy ready, 0 = not */
             ((PULONG)outputBuffer)[0] = g_GpuProxyAvailable ? 1U : 0U;
+            bytesReturned = sizeof(ULONG);
         }
         status = STATUS_SUCCESS;
         KeReleaseMutex(&devExt->CommandLock, FALSE);
@@ -612,25 +637,50 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         }
         ULONG offset = ((PULONG)inputBuffer)[0];
 
-        /* NBIO SIG window: prefer proxy (BAR5 owner = GPU). Bar0 fallback only. */
-        if (offset >= 0xC000 && offset < 0xC200 && g_GpuProxyAvailable) {
-            if (outputLength < sizeof(ULONG)) {
-                status = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-            ((PULONG)outputBuffer)[0] = PspGpuProxyReadRegister(offset);
-            bytesReturned = sizeof(ULONG);
-            status = STATUS_SUCCESS;
-            break;
-        }
-        if (offset >= 0xC000 && offset < 0xC200 && devExt->Bar0Base &&
-            devExt->Bar0Size >= 4 && (offset + 4) <= devExt->Bar0Size) {
+        /* CPU-PSP BAR0 native window (pa_v1 platform mailbox + CCP regs).
+         * Offsets 0x10000-0x10FFF: C2PMSG_28/29/30 (0x10570/74/78), inten/intsts
+         * (0x10690/64), bootloader (0x109ec), feature (0x109fc), doorbell
+         * (0x10a24/a40). These LIVE on Bar0Base (1022:143E BAR0 @ fe700000),
+         * NOT on GPU BAR5 — must not go through GPU proxy. */
+        if (devExt->Bar0Base && offset >= 0x10000 && offset < 0x11000 &&
+            (offset + 4) <= devExt->Bar0Size) {
             if (outputLength < sizeof(ULONG)) {
                 status = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
             ULONG value = READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->Bar0Base + offset));
             ((PULONG)outputBuffer)[0] = value;
+            bytesReturned = sizeof(ULONG);
+            status = STATUS_SUCCESS;
+            KdPrint(("READ_REG: BAR0 pa_v1 off=0x%X val=0x%08X\n", offset, value));
+            break;
+        }
+
+        /* NBIO SIG window: proxy ONLY (BAR5 owner = GPU).
+         * FIX Code Reviewer 2026-09-23: removed Bar0 fallback for 0xC000-0xC1FF —
+         * those are GPU NBIO offsets; writing them into PSP BAR0 hits live PSP regs. */
+        if (offset >= 0xC000 && offset < 0xC200) {
+            if (outputLength < sizeof(ULONG)) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+            if (!g_GpuProxyAvailable) {
+                NTSTATUS proxyStatus = PspGpuProxyInit(devExt);
+                if (!NT_SUCCESS(proxyStatus)) {
+                    KdPrint(("READ_REG: NBIO proxy init failed: 0x%08X\n", proxyStatus));
+                    status = STATUS_DEVICE_NOT_READY;
+                    break;
+                }
+            }
+            /* FIX Code Reviewer 2026-09-23: 0xFFFFFFFF = proxy-dead sentinel
+             * (real SIGs are 0xFEDCBAEF/0xFEDCBADF). Treat as not-ready. */
+            ULONG nbioValue = PspGpuProxyReadRegister(offset);
+            if (nbioValue == 0xFFFFFFFF) {
+                KdPrint(("READ_REG: NBIO proxy dead (0xFFFFFFFF)\n"));
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            ((PULONG)outputBuffer)[0] = nbioValue;
             bytesReturned = sizeof(ULONG);
             status = STATUS_SUCCESS;
             break;
@@ -673,7 +723,18 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         ULONG offset = params[0];
         ULONG value = params[1];
 
-        /* NBIO SIG + all GPU regs: proxy only when GPU driver is up. */
+        /* CPU-PSP BAR0 native window (pa_v1) — write via Bar0Base, never GPU proxy. */
+        if (devExt->Bar0Base && offset >= 0x10000 && offset < 0x11000 &&
+            (offset + 4) <= devExt->Bar0Size) {
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->Bar0Base + offset), value);
+            KdPrint(("WRITE_REG: BAR0 pa_v1 off=0x%X val=0x%08X\n", offset, value));
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        /* NBIO SIG + all GPU regs: proxy only — NO Bar0 fallback.
+         * FIX Code Reviewer 2026-09-23: old Bar0 write for 0xC000-0xC1FF put
+         * GPU NBIO signature values into live PSP BAR0 registers (wrong window). */
         if (!g_GpuProxyAvailable) {
             NTSTATUS proxyStatus = PspGpuProxyInit(devExt);
             if (!NT_SUCCESS(proxyStatus)) {
@@ -681,12 +742,6 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 status = STATUS_DEVICE_NOT_READY;
                 break;
             }
-        }
-        if (offset >= 0xC000 && offset < 0xC200 && devExt->Bar0Base && !g_GpuProxyAvailable &&
-            devExt->Bar0Size >= 4 && (offset + 4) <= devExt->Bar0Size) {
-            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->Bar0Base + offset), value);
-            status = STATUS_SUCCESS;
-            break;
         }
         if (!PspGpuProxyWriteRegister(offset, value)) {
             KdPrint(("WRITE_REG: GPU proxy write failed offset=0x%X\n", offset));
@@ -771,9 +826,12 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
             }
         }
         if (value == 0xFFFFFFFF) {
-            ULONG slot = (devFn >> 3) & 0x1F;
+            /* Input devFn = Linux-style (device << 3) | function.
+             * HalGetBusData needs PCI_SLOT_NUMBER = (function << 5) | device. */
+            ULONG device = (devFn >> 3) & 0x1F;
             ULONG func = devFn & 7;
-            HalGetBusDataByOffset(PCIConfiguration, bus, (slot << 5) | func /* FIX: PCI slot = dev<<5|func */, &value, off & ~3, sizeof(ULONG));
+            ULONG slotNumber = (func << 5) | device;
+            HalGetBusDataByOffset(PCIConfiguration, bus, slotNumber, &value, off & ~3, sizeof(ULONG));
         }
         KdPrint(("PCI_READ: B%d.D%d.F%d off=0x%X => 0x%08X\n", bus, (devFn>>3)&0x1F, devFn&7, off, value));
         if (outputLength >= sizeof(ULONG)) {
@@ -798,9 +856,11 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
                 WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->PciCfgBase + addr), value);
             }
         } else {
-            ULONG slot = (devFn >> 3) & 0x1F;
+            /* Same encoding fix as PCI_READ: PCI_SLOT_NUMBER = (function << 5) | device */
+            ULONG device = (devFn >> 3) & 0x1F;
             ULONG func = devFn & 7;
-            HalSetBusDataByOffset(PCIConfiguration, bus, (slot << 5) | func /* FIX: PCI slot = dev<<5|func */, &value, off & ~3, sizeof(ULONG));
+            ULONG slotNumber = (func << 5) | device;
+            HalSetBusDataByOffset(PCIConfiguration, bus, slotNumber, &value, off & ~3, sizeof(ULONG));
         }
         KdPrint(("PCI_WRITE: B%d.D%d.F%d off=0x%X <= 0x%08X\n", bus, (devFn>>3)&0x1F, devFn&7, off, value));
         status = STATUS_SUCCESS;

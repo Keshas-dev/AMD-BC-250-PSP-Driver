@@ -1,4 +1,27 @@
-## ⭐⭐⭐ DEADLOCK FIX VERIFIED + BOTH DRIVERS COEXIST (2026-09-23) — README FIRST
+## ⭐⭐⭐⭐ BAR2 auto-init FIX + pa_v1 (2026-09-23) — README FIRST
+
+### Built: `output\pspdriver.sys` SHA256 `D8DC9423A19ACC2B09B92C536862A5CDF9C0FC6D2860D3E605DF80E6C0E01FE5`
+- **AWAITS reinstall** (Device Manager, Delete → reboot → browse `output\` → reboot). Installed may still be old `A979F906...`.
+- **Code Reviewer PASS** (3 rounds: NBIO→Bar0 write blocker, DriverUnload double-unmap, 0xFFFFFFFF sentinel → all fixed).
+
+### Bugs fixed (PspCore.c + PspDriver.c)
+| # | Bug | Was → Now |
+|---|-----|-----------|
+| 1 | `#define PCIConfiguration 0` (Cmos!) | removed — use ntddk.h `PCIConfiguration`=4 |
+| 2 | PCI slot `(dev<<5)\|func` | `(func<<5)\|device` — finds **B1.D0.F2** |
+| 3 | BAR0 only @0x10 → 0 | **BAR2 fallback @0x18** (+64-bit high) = `0xFE700000` 1MB (pa-v1 window); no dead `0xFD600000` map |
+| 4 | NBIO 0xC000-0xC1FF Bar0 write/read | proxy-only; fail → `STATUS_DEVICE_NOT_READY` (was 0xFFFFFFFF) |
+| 5 | DriverUnload double `MmUnmapIoSpace` (Bar0==MmioBase) | snapshot-then-null-alias (PspDriver.c ~446-470) |
+| 6 | INIT_HW map-fail path left stale Bar0Base | clears Bar0Base/MmioBase/MmioSize on fail; success sets both together |
+
+### Hardware (pa-v1-diag2 PASS, not rerun after rebuild)
+- PCI: BAR0=0, **BAR2=0xFE700000** (1MB), BAR5=0xFE884000 (8KB), cmd=0x00100007, CAP_PTR=0x48
+- pa_v1 offsets in 1MB window: cmdresp `0x10570`, inten `0x10690`, bootloader `0x109ec`=`0x001C0102`, feature `0x109fc`=2, doorbell `0x10a24`/`0x10a40`
+- After reinstall run `output\test-psp-driver.exe -s` once — expect live BAR0 map (not 0xFF FF… auto-init)
+
+---
+
+## ⭐⭐⭐ DEADLOCK FIX VERIFIED + BOTH DRIVERS COEXIST (2026-09-23)
 
 ### Status: deployed + hardware-verified
 - **GPU driver 4.3.0.11** (SHA `0E69D7D3...`) + **PSP driver 3.0.0.4** both installed, no 0x1E BSOD.
