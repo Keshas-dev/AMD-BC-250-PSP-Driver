@@ -39,6 +39,8 @@ extern "C" {
 #define IOCTL_PSP_KIQ_GET_STATUS      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x823, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_LOAD_IP_FW_DIRECT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_PSP_GPU_PM4_SUBMIT      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_PCI_SMN_UNLOCK      CTL_CODE(FILE_DEVICE_UNKNOWN, 0x826, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PSP_PA_SEND             CTL_CODE(FILE_DEVICE_UNKNOWN, 0x827, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #ifdef _NTDDK_
 typedef struct _DEVICE_EXTENSION {
@@ -252,6 +254,52 @@ typedef struct _PSP_LOAD_IP_FW_RESPONSE {
     ULONG C2Pmsg81;         // PSP status after command
     ULONG Reserved;
 } PSP_LOAD_IP_FW_RESPONSE, *PPSP_LOAD_IP_FW_RESPONSE;
+
+// Input for IOCTL_PSP_PCI_SMN_UNLOCK — 8-core unlock via Host Bridge PCI config.
+// Gated in-driver to the single documented op: Q3 msg 0x98 writes fixed 0x00FF
+// to SMN 0x0115A870. SmnValue must be 0xFF (expected readback low byte).
+typedef struct _PSP_PCI_SMN_UNLOCK_REQUEST {
+    ULONG SmnAddr;           // must be 0x0115A870
+    ULONG SmnValue;          // must be 0xFF
+    ULONG SmuMsg;            // must be 0x98
+    ULONG Reserved;          // must be 0
+} PSP_PCI_SMN_UNLOCK_REQUEST, *PPSP_PCI_SMN_UNLOCK_REQUEST;
+
+typedef struct _PSP_PCI_SMN_UNLOCK_RESPONSE {
+    ULONG Status;            // NTSTATUS equivalent
+    ULONG SmuResponse;       // SMU response (0x01=OK, 0xFC..0xFF=error)
+    ULONG SmnReadback;       // SMN register readback after unlock
+} PSP_PCI_SMN_UNLOCK_RESPONSE, *PPSP_PCI_SMN_UNLOCK_RESPONSE;
+
+// pa_v1 platform mailbox (Linux drivers/crypto/ccp, Mattia Tadini pspv_bc250).
+// BAR2 offsets: cmd 0x10570 (C2PMSG_28), lo 0x10574 (29), hi 0x10578 (30).
+// DBC GET_NONCE = 0x65. Request buffer (flat, DMA): header{payload_size,
+// status} + dbc_user_nonce{auth_needed, nonce[16], sig[32]} (52 B).
+// payload_size = 8 + 52 = 60. Linux on BC-250 gets PSP error 0x4
+// (EXCESS_DATA) — a structured rejection ALSO proves the channel is live.
+#define PSP_PA_MSG_DBC_GET_NONCE  0x65
+#define PSP_PA_MSG_HSTI_QUERY     0x14
+#define PSP_PA_MBOX_CMD_REG       0x10570
+#define PSP_PA_MBOX_LO_REG        0x10574
+#define PSP_PA_MBOX_HI_REG        0x10578
+#define PSP_PA_REQ_BUF_SIZE       4096
+#define PSP_PA_NONCE_SIZE         16
+#define PSP_PA_SIG_SIZE           32
+
+typedef struct _PSP_PA_SEND_REQUEST {
+    ULONG Msg;               // gated: 0x65 (DBC nonce) or 0x14 (HSTI query)
+    ULONG AuthNeeded;        // nonce only (0/1); ignored for HSTI (must be 0)
+    ULONG Reserved[2];       // must be 0
+} PSP_PA_SEND_REQUEST, *PPSP_PA_SEND_REQUEST;
+
+typedef struct _PSP_PA_SEND_RESPONSE {
+    ULONG Status;            // NTSTATUS equivalent
+    ULONG MailboxStatus;     // PSP status field (0x4 on BC-250 DBC; 0+Hsti on HSTI ok)
+    ULONG PayloadSize;       // echoed payload_size
+    UCHAR Nonce[16];         // nonce output (DBC only; zero if rejected)
+    ULONG Hsti;              // HSTI dword (HSTI query only; security bits)
+    ULONG CmdRespRaw;        // raw cmd reg after completion
+} PSP_PA_SEND_RESPONSE, *PPSP_PA_SEND_RESPONSE;
 
 // Input for IOCTL_PSP_GPU_PM4_SUBMIT — submit GPU PM4 via PSP KIQ ring
 typedef struct _PSP_GPU_PM4_SUBMIT_REQUEST {

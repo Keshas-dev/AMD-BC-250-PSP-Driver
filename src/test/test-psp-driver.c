@@ -630,6 +630,136 @@ BOOL SmuWake(HANDLE hDevice, ULONG message, ULONG argument)
     return ok;
 }
 
+/* --- 8-core unlock via Host Bridge PCI config 0xB8/0xBC (GabriWar path) --- */
+
+static BOOL PciCfgReadVal(HANDLE h, ULONG bus, ULONG devFn, ULONG off, ULONG *out)
+{
+    ULONG args[3] = { bus, devFn, off };
+    ULONG resp = 0xFFFFFFFF;
+    DWORD returned = 0;
+    BOOL ok = DeviceIoControl(h, IOCTL_PSP_PCI_READ,
+        args, sizeof(args), &resp, sizeof(resp), &returned, NULL);
+    if (ok && returned >= sizeof(ULONG)) { *out = resp; return TRUE; }
+    return FALSE;
+}
+
+static BOOL PciCfgWriteVal(HANDLE h, ULONG bus, ULONG devFn, ULONG off, ULONG val)
+{
+    ULONG args[4] = { bus, devFn, off, val };
+    DWORD returned = 0;
+    return DeviceIoControl(h, IOCTL_PSP_PCI_WRITE,
+        args, sizeof(args), NULL, 0, &returned, NULL);
+}
+
+/* Find Host Bridge 1022:13E0. Returns TRUE + bus/devFn (Linux-style (dev<<3)|fn). */
+static BOOL FindHostBridge(HANDLE h, ULONG *busOut, ULONG *dfOut)
+{
+    ULONG b, d, f;
+    for (b = 0; b < 8; b++) {
+        for (d = 0; d < 32; d++) {
+            for (f = 0; f < 8; f++) {
+                ULONG df = (d << 3) | f;
+                ULONG id = 0;
+                if (!PciCfgReadVal(h, b, df, 0, &id)) continue;
+                if (id == 0xFFFFFFFF || id == 0) continue;
+                if ((id & 0xFFFF) == 0x1022 && ((id >> 16) & 0xFFFF) == 0x13E0) {
+                    *busOut = b; *dfOut = df;
+                    return TRUE;
+                }
+            }
+        }
+    }
+    return FALSE;
+}
+
+/* Read an SMN register via Host Bridge 0xB8/0xBC (save/select/read/restore). Read-only. */
+static BOOL SmnReadViaPci(HANDLE h, ULONG smnAddr, ULONG *out)
+{
+    ULONG bus, df, saved = 0, val = 0;
+    if (!FindHostBridge(h, &bus, &df)) {
+        Log("  Host Bridge 1022:13E0 not found\n");
+        return FALSE;
+    }
+    if (!PciCfgReadVal(h, bus, df, 0xB8, &saved)) return FALSE;
+    if (!PciCfgWriteVal(h, bus, df, 0xB8, smnAddr)) return FALSE;
+    if (!PciCfgReadVal(h, bus, df, 0xBC, &val)) return FALSE;
+    PciCfgWriteVal(h, bus, df, 0xB8, saved); /* best-effort restore */
+    *out = val;
+    return TRUE;
+}
+
+BOOL EightCoreStatus(HANDLE hDevice)
+{
+    ULONG mask = 0;
+    int i;
+    Log("8CORE STATUS: reading SMN 0x0115A870 via Host Bridge PCI 0xB8/0xBC...\n");
+    if (!SmnReadViaPci(hDevice, 0x0115A870, &mask)) {
+        Log("  FAILED to read core mask\n");
+        return FALSE;
+    }
+    mask &= 0xFF;
+    Log("  SMN 0x0115A870 = 0x%02X  enabled=[", mask);
+    for (i = 0; i < 8; i++) if ((mask >> i) & 1) Log("%d ", i);
+    Log("] disabled=[");
+    for (i = 0; i < 8; i++) if (!((mask >> i) & 1)) Log("%d ", i);
+    Log("]\n");
+    if (mask == 0xFF) Log("  state: UNLOCKED (all 8 cores)\n");
+    else if (mask == 0x77) Log("  state: STOCK (6 cores) — run '-8core apply' to unlock\n");
+    else Log("  state: UNKNOWN mask (refusing to guess)\n");
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        Log("  logical processors visible: %u%s\n", (unsigned)si.dwNumberOfProcessors,
+            (mask == 0xFF && si.dwNumberOfProcessors < 16) ?
+            "  (mask set but firmware has not re-enumerated — warm reboot needed)" : "");
+    }
+    return TRUE;
+}
+
+BOOL EightCoreApply(HANDLE hDevice)
+{
+    PSP_PCI_SMN_UNLOCK_REQUEST req;
+    PSP_PCI_SMN_UNLOCK_RESPONSE resp;
+    DWORD returned = 0;
+    ULONG mask = 0;
+
+    Log("8CORE APPLY: checking current mask first...\n");
+    if (SmnReadViaPci(hDevice, 0x0115A870, &mask)) {
+        mask &= 0xFF;
+        Log("  before: 0x%02X\n", mask);
+        if (mask == 0xFF) { Log("  already unlocked, nothing to do\n"); return TRUE; }
+        if (mask != 0x77) {
+            Log("  REFUSING: unexpected mask 0x%02X (expected 0x77)\n", mask);
+            return FALSE;
+        }
+    } else {
+        Log("  WARNING: could not read mask, proceeding to SMU command anyway\n");
+    }
+
+    RtlZeroMemory(&req, sizeof(req));
+    req.SmnAddr = 0x0115A870;
+    req.SmnValue = 0xFF;
+    req.SmuMsg = 0x98;
+    req.Reserved = 0;
+    RtlZeroMemory(&resp, sizeof(resp));
+    Log("8CORE APPLY: sending Q3 msg 0x98 via PCI config 0xB8/0xBC...\n");
+    if (!DeviceIoControl(hDevice, IOCTL_PSP_PCI_SMN_UNLOCK,
+        &req, sizeof(req), &resp, sizeof(resp), &returned, NULL)) {
+        Log("  IOCTL FAILED (err=%lu)\n", GetLastError());
+        return FALSE;
+    }
+    Log("  SMU response=0x%02X readback=0x%08X status=0x%08X\n",
+        resp.SmuResponse, resp.SmnReadback, resp.Status);
+    if ((resp.SmnReadback & 0xFF) == 0xFF) {
+        Log("  UNLOCKED. Cores appear after a WARM reboot (cold boot reverts to 6).\n");
+        return TRUE;
+    }
+    Log("  UNLOCK FAILED — mask unchanged, nothing broken\n");
+    return FALSE;
+}
+
+/* --- end 8-core --- */
+
 void PrintUsage(const char *prog)
 {
     printf("Usage: %s [options]\n", prog);
@@ -659,6 +789,9 @@ void PrintUsage(const char *prog)
     printf("  -k <dwords...>     Submit PM4 commands via KIQ ring (hex dwords, up to 64)\n");
     printf("  -Q <type> <file>   Load GPU FW via KIQ ring (type: 1=ME 2=PFP 3=CE 4=MEC 5=MEC2 8=RLC 9=SDMA 10=SDMA1)\n");
     printf("  -S <msg> <arg>     Send SMU wake command (hex msgID, hex arg)\n");
+    printf("  -8core status|apply  8-core unlock via Host Bridge PCI 0xB8/0xBC (Q3 msg 0x98)\n");
+    printf("  -pa-nonce            DBC GET_NONCE via pa_v1 mailbox (channel prove, expect mbox 0x4)\n");
+    printf("  -pa-hsti             HSTI QUERY via pa_v1 mailbox (security bits, may be empty)\n");
     printf("  -l <logfile>       Write log to file\n");
     printf("\nExamples:\n");
     printf("  %s -i 0xFE800000 0x100000     Init HW with BAR5 at 0xFE800000\n", prog);
@@ -956,6 +1089,81 @@ int main(int argc, char *argv[])
                 }
             }
             i += 2;
+        }
+        else if (strcmp(argv[i], "-8core") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "status") == 0) {
+                ok = EightCoreStatus(h);
+                if (!ok) { ret = 1; }
+            } else if (strcmp(argv[i + 1], "apply") == 0) {
+                ok = EightCoreApply(h);
+                if (!ok) { ret = 1; }
+            } else {
+                Log("ERROR: -8core needs 'status' or 'apply'\n");
+                ret = 1;
+            }
+            i += 1;
+        }
+        else if (strcmp(argv[i], "-pa-nonce") == 0) {
+            PSP_PA_SEND_REQUEST preq;
+            PSP_PA_SEND_RESPONSE presp;
+            DWORD pret = 0;
+            int n;
+            RtlZeroMemory(&preq, sizeof(preq));
+            preq.Msg = PSP_PA_MSG_DBC_GET_NONCE;
+            preq.AuthNeeded = 0;
+            RtlZeroMemory(&presp, sizeof(presp));
+            Log("PA_SEND: DBC GET_NONCE via pa_v1 mailbox (expect mbox 0x4 on BC-250)...\n");
+            ok = DeviceIoControl(h, IOCTL_PSP_PA_SEND,
+                &preq, sizeof(preq), &presp, sizeof(presp), &pret, NULL);
+            if (!ok) {
+                Log("  IOCTL FAILED (err=%lu)\n", GetLastError());
+                ret = 1;
+            } else {
+                Log("  Status=0x%08X MailboxStatus=0x%X Payload=%u CmdRaw=0x%08X\n",
+                    presp.Status, presp.MailboxStatus, presp.PayloadSize, presp.CmdRespRaw);
+                Log("  Nonce: ");
+                for (n = 0; n < 16; n++) Log("%02X", presp.Nonce[n]);
+                Log("\n");
+                if (presp.MailboxStatus == 0x4)
+                    Log("  = Linux behavior reproduced (rejected 0x4, channel LIVE)\n");
+                else if (presp.MailboxStatus == 0)
+                    Log("  = command ACCEPTED (unexpected on BC-250!)\n");
+            }
+        }
+        else if (strcmp(argv[i], "-pa-hsti") == 0) {
+            PSP_PA_SEND_REQUEST preq;
+            PSP_PA_SEND_RESPONSE presp;
+            DWORD pret = 0;
+            RtlZeroMemory(&preq, sizeof(preq));
+            preq.Msg = PSP_PA_MSG_HSTI_QUERY;
+            preq.AuthNeeded = 0;
+            RtlZeroMemory(&presp, sizeof(presp));
+            Log("PA_SEND: HSTI QUERY via pa_v1 mailbox...\n");
+            ok = DeviceIoControl(h, IOCTL_PSP_PA_SEND,
+                &preq, sizeof(preq), &presp, sizeof(presp), &pret, NULL);
+            if (!ok) {
+                Log("  IOCTL FAILED (err=%lu)\n", GetLastError());
+                ret = 1;
+            } else {
+                Log("  Status=0x%08X MailboxStatus=0x%X Payload=%u CmdRaw=0x%08X\n",
+                    presp.Status, presp.MailboxStatus, presp.PayloadSize, presp.CmdRespRaw);
+                Log("  HSTI=0x%08X\n", presp.Hsti);
+                if (presp.MailboxStatus == 0) {
+                    /* Verified layout (union psp_cap_register): hsti bit N ->
+                     * capability bit N+8: b0=fused_part b1=boot_integrity
+                     * b2=debug_lock_on b5=tsme b7=anti_rollback
+                     * b8=rpmc_prod b9=rpmc_spi b10=tpm b11=rom_armor */
+                    ULONG hsti = presp.Hsti;
+                    Log("  fused_part=%u boot_integrity=%u debug_lock_on=%u\n",
+                        (hsti >> 0) & 1, (hsti >> 1) & 1, (hsti >> 2) & 1);
+                    Log("  tsme=%u anti_rollback=%u rpmc_prod=%u rpmc_spi=%u tpm=%u rom_armor=%u\n",
+                        (hsti >> 5) & 1, (hsti >> 7) & 1, (hsti >> 8) & 1,
+                        (hsti >> 9) & 1, (hsti >> 10) & 1, (hsti >> 11) & 1);
+                }
+                if (presp.MailboxStatus != 0) {
+                    Log("  = HSTI rejected/absent (Tadini: HSTI empty on BC-250)\n");
+                }
+            }
         }
         else if (strcmp(argv[i], "-l") == 0) {
             i++; // Skip logfile argument (already handled)

@@ -1,7 +1,7 @@
 ## ⭐⭐⭐⭐ BAR2 auto-init FIX + pa_v1 (2026-09-23) — README FIRST
 
 ### Built: `output\pspdriver.sys` SHA256 `D8DC9423A19ACC2B09B92C536862A5CDF9C0FC6D2860D3E605DF80E6C0E01FE5`
-- **AWAITS reinstall** (Device Manager, Delete → reboot → browse `output\` → reboot). Installed may still be old `A979F906...`.
+- **INSTALLED + VERIFIED** (user Device Manager reinstall; installed SHA == output). Service RUNNING.
 - **Code Reviewer PASS** (3 rounds: NBIO→Bar0 write blocker, DriverUnload double-unmap, 0xFFFFFFFF sentinel → all fixed).
 
 ### Bugs fixed (PspCore.c + PspDriver.c)
@@ -14,10 +14,15 @@
 | 5 | DriverUnload double `MmUnmapIoSpace` (Bar0==MmioBase) | snapshot-then-null-alias (PspDriver.c ~446-470) |
 | 6 | INIT_HW map-fail path left stale Bar0Base | clears Bar0Base/MmioBase/MmioSize on fail; success sets both together |
 
-### Hardware (pa-v1-diag2 PASS, not rerun after rebuild)
+### Hardware (all ONE-SHOT this session — DO NOT RERUN)
 - PCI: BAR0=0, **BAR2=0xFE700000** (1MB), BAR5=0xFE884000 (8KB), cmd=0x00100007, CAP_PTR=0x48
 - pa_v1 offsets in 1MB window: cmdresp `0x10570`, inten `0x10690`, bootloader `0x109ec`=`0x001C0102`, feature `0x109fc`=2, doorbell `0x10a24`/`0x10a40`
-- After reinstall run `output\test-psp-driver.exe -s` once — expect live BAR0 map (not 0xFF FF… auto-init)
+- **Post-reinstall verification DONE (2026-09-23):**
+  - `test-psp-driver -s` FIRST run (before GPU map): all C2PMSG/NBIO/GRBM = **0xFFFFFFFF**, Alive NO, MMIO VA=0x89800000 Size=1048576 (BAR2 map OK, proxy not yet up — expected post-reboot).
+  - Direct pa_v1 READ_REG OK: `0x109EC=0x001C0102`, `0x109FC=0x2`, `0x10570=0x80000000`, `0x10690=0x1`.
+  - After `gpu-init-explicit` (NBIO_MAP): `-s` **PASS** — Alive **YES** (C2PMSG_64=`0x80000000`, C2PMSG_81 live), NBIO SIG1/SIG2=`0xFEDCBAEF/EF`, GRBM **UNLOCKED**, GC=`0` HDP=`0x70000` MMHUB=`0x4000`, MMIO VA=1MB.
+  - C2PMSG_35/36=`0xFFFFFFFF` is **normal** (bootloader gone, SOS alive). FW Loaded NO / Ring NO expected.
+- **Rule:** after reboot, run GPU `gpu-init-explicit` FIRST, then PSP `-s` once for proxy.
 
 ---
 

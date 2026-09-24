@@ -638,10 +638,15 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         ULONG offset = ((PULONG)inputBuffer)[0];
 
         /* CPU-PSP BAR0 native window (pa_v1 platform mailbox + CCP regs).
-         * Offsets 0x10000-0x10FFF: C2PMSG_28/29/30 (0x10570/74/78), inten/intsts
-         * (0x10690/64), bootloader (0x109ec), feature (0x109fc), doorbell
-         * (0x10a24/a40). These LIVE on Bar0Base (1022:143E BAR0 @ fe700000),
-         * NOT on GPU BAR5 — must not go through GPU proxy. */
+         * VERIFIED against kernel sp-pci.c pa_v1 (2026-09-24): mailbox regs are
+         * cmdresp 0x10570 (C2PMSG_28), cmdbuff lo/hi 0x10574/78 (C2PMSG_29/30),
+         * doorbell button/cmd 0x10A24/40 (C2PMSG_73/80). Live readings:
+         * 0x10570=0x80000000 (RESP ready), 0x10574=stale phys (bootloader-era),
+         * inten 0x10690=1, bootloader 0x109EC=0x001C0102, feature 0x109FC=2.
+         * ("C2PMSG_n" numbering is window-relative, NOT global: C2PMSG_59 is
+         * 0x109EC in the 0x10900 frame. Do NOT "fix" 28/29/30 to 0x10970.)
+         * These LIVE on Bar0Base (1022:143E BAR2 @ fe700000), NOT on GPU
+         * BAR5 — must not go through GPU proxy. */
         if (devExt->Bar0Base && offset >= 0x10000 && offset < 0x11000 &&
             (offset + 4) <= devExt->Bar0Size) {
             if (outputLength < sizeof(ULONG)) {
@@ -1689,6 +1694,50 @@ NTSTATUS PspDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
         RtlCopyMemory(req->Commands, savedCmds, saveCount * sizeof(ULONG));
         status = PspGpuPm4Submit(devExt, req, resp);
         bytesReturned = sizeof(PSP_GPU_PM4_SUBMIT_RESPONSE);
+        break;
+    }
+
+    case IOCTL_PSP_PA_SEND:
+    {
+        if (inputLength < sizeof(PSP_PA_SEND_REQUEST)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PSP_PA_SEND_REQUEST* pareq = (PSP_PA_SEND_REQUEST*)inputBuffer;
+        PSP_PA_SEND_RESPONSE paresp;
+        RtlZeroMemory(&paresp, sizeof(paresp));
+        KdPrint(("IOCTL_PSP_PA_SEND: Msg=0x%X Auth=%u\n",
+            pareq->Msg, pareq->AuthNeeded));
+        status = PspPaSendNonce(devExt, pareq, &paresp);
+        if (outputLength >= sizeof(PSP_PA_SEND_RESPONSE)) {
+            PSP_PA_SEND_RESPONSE* outp = (PSP_PA_SEND_RESPONSE*)outputBuffer;
+            *outp = paresp;
+            bytesReturned = sizeof(PSP_PA_SEND_RESPONSE);
+        }
+        KdPrint(("IOCTL_PSP_PA_SEND: status=0x%08X mbox=0x%X\n",
+            status, paresp.MailboxStatus));
+        break;
+    }
+
+    case IOCTL_PSP_PCI_SMN_UNLOCK:
+    {
+        if (inputLength < sizeof(PSP_PCI_SMN_UNLOCK_REQUEST)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PSP_PCI_SMN_UNLOCK_REQUEST* req = (PSP_PCI_SMN_UNLOCK_REQUEST*)inputBuffer;
+        PSP_PCI_SMN_UNLOCK_RESPONSE resp;
+        RtlZeroMemory(&resp, sizeof(resp));
+        KdPrint(("IOCTL_PSP_PCI_SMN_UNLOCK: SmnAddr=0x%08X SmnVal=0x%08X\n",
+            req->SmnAddr, req->SmnValue));
+        status = PspSmnUnlockViaPci(devExt, req, &resp);
+        if (outputLength >= sizeof(PSP_PCI_SMN_UNLOCK_RESPONSE)) {
+            PSP_PCI_SMN_UNLOCK_RESPONSE* outp = (PSP_PCI_SMN_UNLOCK_RESPONSE*)outputBuffer;
+            *outp = resp;
+            bytesReturned = sizeof(PSP_PCI_SMN_UNLOCK_RESPONSE);
+        }
+        KdPrint(("IOCTL_PSP_PCI_SMN_UNLOCK: status=0x%08X resp=0x%08X readback=0x%08X\n",
+            status, resp.SmuResponse, resp.SmnReadback));
         break;
     }
 

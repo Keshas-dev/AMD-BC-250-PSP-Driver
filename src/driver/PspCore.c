@@ -655,3 +655,335 @@ NTSTATUS PspLoadFirmwareFromFile(PCWSTR FileName, PUCHAR* OutData, PULONG OutSiz
     *OutSize = fileSize;
     return STATUS_SUCCESS;
 }
+
+/* +++ PCI config SMN unlock (Host Bridge 00:00.0, 0xB8/0xBC) +++ */
+/* Path used by GabriWar's bc250-8core-unlock.sh via setpci. */
+/* Bypasses the NBIO BAR5+0x38/0x3C path entirely. */
+
+static BOOLEAN PspHostBridgeFind(ULONG* bus, ULONG* slot)
+{
+    for (ULONG b = 0; b < 8; b++) {
+        for (ULONG d = 0; d < 32; d++) {
+            for (ULONG f = 0; f < 8; f++) {
+                ULONG slotNum = (f << 5) | d;
+                ULONG idReg = 0;
+                ULONG got;
+                got = HalGetBusDataByOffset(PCIConfiguration, b, slotNum, &idReg, 0, sizeof(ULONG));
+                if (got != sizeof(ULONG)) continue;
+                if (idReg == 0xFFFFFFFF || idReg == 0) continue;
+                if ((idReg & 0xFFFF) == 0x1022 && ((idReg >> 16) & 0xFFFF) == 0x13E0) {
+                    *bus = b;
+                    *slot = slotNum;
+                    KdPrint(("PCI_SMN: Host Bridge 1022:13E0 at B%u.D%u.F%u slot=%u\n", b, d, f, slotNum));
+                    return TRUE;
+                }
+            }
+        }
+    }
+    KdPrint(("PCI_SMN: Host Bridge 1022:13E0 not found\n"));
+    return FALSE;
+}
+
+static BOOLEAN PspPciSmnWrite(ULONG bus, ULONG slot, ULONG offset, ULONG value)
+{
+    ULONG written;
+    ULONG readback = 0;
+    ULONG got;
+    written = HalSetBusDataByOffset(PCIConfiguration, bus, slot, &value, offset, sizeof(ULONG));
+    if (written != sizeof(ULONG)) {
+        KdPrint(("PCI_SMN: HalSetBusDataByOffset(0x%08X) wrote %u/4\n", offset, written));
+        return FALSE;
+    }
+    /* 0xBC is a side-effect data port (RSP cleared/consumed, ARG/MSG latched)
+     * — readback-verify is only valid for the 0xB8 index port. */
+    if (offset != 0xB8) {
+        return TRUE;
+    }
+    got = HalGetBusDataByOffset(PCIConfiguration, bus, slot, &readback, offset, sizeof(ULONG));
+    if (got != sizeof(ULONG) || readback != value) {
+        KdPrint(("PCI_SMN: 0x%08X mismatch: wrote=0x%08X read=0x%08X\n", offset, value, readback));
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static ULONG PspPciCfgRead(ULONG bus, ULONG slot, ULONG offset)
+{
+    ULONG value = 0xFFFFFFFF;
+    ULONG got;
+    got = HalGetBusDataByOffset(PCIConfiguration, bus, slot, &value, offset, sizeof(ULONG));
+    if (got != sizeof(ULONG)) {
+        return 0xFFFFFFFF;
+    }
+    return value;
+}
+
+NTSTATUS PspSmnUnlockViaPci(PDEVICE_EXTENSION devExt, PPSP_PCI_SMN_UNLOCK_REQUEST req, PPSP_PCI_SMN_UNLOCK_RESPONSE resp)
+{
+    ULONG bus = 0, slot = 0;
+    ULONG timeout;
+    ULONG rsp = 0;
+    ULONG savedIdx = 0;
+    ULONG got;
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOLEAN locked = FALSE;
+
+    if (req == NULL || resp == NULL || devExt == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(resp, sizeof(*resp));
+
+    /* Gate: only the documented 8-core unlock op is allowed.
+     * SMU msg 0x98 writes fixed 0x00FF to the target SMN addr. */
+    if (req->SmuMsg != 0x98 || req->SmnAddr != 0x0115A870 ||
+        req->SmnValue != 0xFF || req->Reserved != 0) {
+        KdPrint(("PCI_SMN: refused — Msg=0x%08X Addr=0x%08X Val=0x%08X (only 0x98/0x0115A870/0xFF)\n",
+            req->SmuMsg, req->SmnAddr, req->SmnValue));
+        resp->Status = (ULONG)STATUS_INVALID_PARAMETER;
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KdPrint(("PCI_SMN: Unlock — SmnAddr=0x%08X Msg=0x98\n", req->SmnAddr));
+
+    /* Serialize the shared 0xB8/0xBC index/data port pair (KMUTEX, PASSIVE-safe) */
+    (void)KeWaitForSingleObject(&devExt->CommandLock, Executive, KernelMode, FALSE, NULL);
+    locked = TRUE;
+
+    if (!PspHostBridgeFind(&bus, &slot)) {
+        status = STATUS_DEVICE_NOT_READY;
+        goto cleanup;
+    }
+
+    got = HalGetBusDataByOffset(PCIConfiguration, bus, slot, &savedIdx, 0xB8, sizeof(ULONG));
+    if (got != sizeof(ULONG)) {
+        savedIdx = 0;
+    }
+
+    /* Mailbox sequence via PCI config 0xB8/0xBC (fixed Q3 regs) */
+    (void)PspPciSmnWrite(bus, slot, 0xB8, 0x03B10A80);  /* select RSP */
+    (void)PspPciSmnWrite(bus, slot, 0xBC, 0);            /* clear RSP */
+
+    (void)PspPciSmnWrite(bus, slot, 0xB8, 0x03B10A88);   /* select arg0 */
+    (void)PspPciSmnWrite(bus, slot, 0xBC, req->SmnAddr); /* arg0 = target SMN addr */
+
+    (void)PspPciSmnWrite(bus, slot, 0xB8, 0x03B10A8C);   /* select arg1 */
+    (void)PspPciSmnWrite(bus, slot, 0xBC, 0);            /* arg1 = 0 */
+
+    (void)PspPciSmnWrite(bus, slot, 0xB8, 0x03B10A20);   /* select msg */
+    (void)PspPciSmnWrite(bus, slot, 0xBC, req->SmuMsg);  /* message 0x98 */
+
+    KeStallExecutionProcessor(10000);
+
+    for (timeout = 0; timeout < 3000; timeout++) {
+        (void)PspPciSmnWrite(bus, slot, 0xB8, 0x03B10A80);
+        rsp = PspPciCfgRead(bus, slot, 0xBC);
+        if (rsp == 0x01) {
+            resp->SmuResponse = 0x01;
+            (void)PspPciSmnWrite(bus, slot, 0xB8, req->SmnAddr);
+            resp->SmnReadback = PspPciCfgRead(bus, slot, 0xBC);
+            KdPrint(("PCI_SMN: UNLOCK OK — resp=0x%02X SMN 0x%08X=0x%08X\n", rsp, req->SmnAddr, resp->SmnReadback));
+            if ((resp->SmnReadback & 0xFF) != 0xFF) {
+                KdPrint(("PCI_SMN: readback mismatch — expected low byte 0xFF\n"));
+                status = STATUS_UNSUCCESSFUL;
+                goto cleanup;
+            }
+            status = STATUS_SUCCESS;
+            goto cleanup;
+        }
+        if (rsp != 0xFFFFFFFF && rsp >= 0xFC && rsp <= 0xFF) {
+            KdPrint(("PCI_SMN: UNLOCK ERROR — resp=0x%02X\n", rsp));
+            resp->SmuResponse = rsp;
+            status = STATUS_UNSUCCESSFUL;
+            goto cleanup;
+        }
+        KeStallExecutionProcessor(1000);
+    }
+
+    KdPrint(("PCI_SMN: UNLOCK TIMEOUT — last resp=0x%02X\n", rsp));
+    resp->SmuResponse = rsp;
+    status = STATUS_TIMEOUT;
+
+cleanup:
+    if (locked) {
+        (void)PspPciSmnWrite(bus, slot, 0xB8, savedIdx);
+        KeReleaseMutex(&devExt->CommandLock, FALSE);
+    }
+    resp->Status = (ULONG)status;
+    return status;
+}
+
+/* --- end PCI config SMN unlock --- */
+
+/* +++ pa_v1 platform mailbox send (DBC GET_NONCE probe) +++
+ * Port of Linux psp_send_platform_access_msg() (drivers/crypto/ccp) for the
+ * pa_v1 mailbox: cmd 0x10570, lo 0x10574, hi 0x10578 (all Bar0Base/BAR2).
+ * Bitfields from include/linux/psp.h: STS[15:0], CMD[23:16], RECOVERY b30,
+ * RESP b31. Timeout 500ms like PSP_CMD_TIMEOUT_US. Request buffer is flat:
+ * header{payload_size, status} + dbc_user_nonce{auth_needed, nonce[16],
+ * sig[32]} in a 4KB non-cached contiguous DMA buffer (PSP maps the PA).
+ * BC-250 firmware answers 0x4 (EXCESS_DATA) — a structured rejection that
+ * still proves the channel is live in both directions. */
+
+#define PA_CMDRESP_STS_MASK   0xFFFFUL
+#define PA_CMDRESP_CMD_SHIFT  16
+#define PA_CMDRESP_RECOVERY   (1UL << 30)
+#define PA_CMDRESP_RESP       (1UL << 31)
+#define PA_POLL_MS            500
+
+static ULONG PaBar0Read(PDEVICE_EXTENSION devExt, ULONG offset)
+{
+    return READ_REGISTER_ULONG((PULONG)((PUCHAR)devExt->Bar0Base + offset));
+}
+
+static VOID PaBar0Write(PDEVICE_EXTENSION devExt, ULONG offset, ULONG value)
+{
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)devExt->Bar0Base + offset), value);
+}
+
+/* Poll Bar0 cmd reg until RESP bit sets. Returns last value; *ready=1 if set. */
+static ULONG PaWaitReady(PDEVICE_EXTENSION devExt, ULONG cmdOff, PBOOLEAN ready)
+{
+    ULONG v = 0;
+    ULONG i;
+    for (i = 0; i < PA_POLL_MS; i++) {
+        v = PaBar0Read(devExt, cmdOff);
+        if (v & PA_CMDRESP_RESP) {
+            *ready = TRUE;
+            return v;
+        }
+        KeStallExecutionProcessor(1000);
+    }
+    *ready = FALSE;
+    return v;
+}
+
+NTSTATUS PspPaSendNonce(PDEVICE_EXTENSION devExt, PPSP_PA_SEND_REQUEST req, PPSP_PA_SEND_RESPONSE resp)
+{
+    PHYSICAL_ADDRESS lowAddr, highAddr, boundary, pa;
+    PVOID buf = NULL;
+    PULONG hdr;
+    PUCHAR payload;
+    ULONG v, lo, hi;
+    BOOLEAN ready = FALSE;
+    NTSTATUS status;
+
+    if (req == NULL || resp == NULL || devExt == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    RtlZeroMemory(resp, sizeof(*resp));
+
+    /* Gate: DBC GET_NONCE probe or HSTI query only. */
+    if ((req->Msg != PSP_PA_MSG_DBC_GET_NONCE &&
+         req->Msg != PSP_PA_MSG_HSTI_QUERY) ||
+        (req->AuthNeeded != 0 && req->AuthNeeded != 1) ||
+        req->Reserved[0] != 0 || req->Reserved[1] != 0) {
+        KdPrint(("PA_SEND: refused Msg=0x%X Auth=%u\n", req->Msg, req->AuthNeeded));
+        resp->Status = (ULONG)STATUS_INVALID_PARAMETER;
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (req->Msg == PSP_PA_MSG_HSTI_QUERY && req->AuthNeeded != 0) {
+        resp->Status = (ULONG)STATUS_INVALID_PARAMETER;
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (devExt->Bar0Base == NULL || devExt->Bar0Size < 0x11000) {
+        resp->Status = (ULONG)STATUS_DEVICE_NOT_READY;
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    /* DMA buffer: 4KB non-cached contiguous (PSP maps the physical address). */
+    lowAddr.QuadPart = 0x10000;
+    highAddr.QuadPart = 0x100000000ULL;
+    boundary.QuadPart = 0;
+    buf = MmAllocateContiguousMemorySpecifyCache(PSP_PA_REQ_BUF_SIZE,
+        lowAddr, highAddr, boundary, MmNonCached);
+    if (buf == NULL) {
+        lowAddr.QuadPart = 0;
+        highAddr.QuadPart = 0xFFFFFFFFFFFFFFFFULL;
+        buf = MmAllocateContiguousMemorySpecifyCache(PSP_PA_REQ_BUF_SIZE,
+            lowAddr, highAddr, boundary, MmNonCached);
+    }
+    if (buf == NULL) {
+        resp->Status = (ULONG)STATUS_INSUFFICIENT_RESOURCES;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(buf, PSP_PA_REQ_BUF_SIZE);
+    hdr = (PULONG)buf;
+    payload = (PUCHAR)buf + 8;
+    if (req->Msg == PSP_PA_MSG_HSTI_QUERY) {
+        hdr[0] = 8 + 4; /* payload_size = sizeof(hsti_request) = 12 */
+    } else {
+        hdr[0] = 8 + 4 + PSP_PA_NONCE_SIZE + PSP_PA_SIG_SIZE; /* = 60 */
+    }
+    hdr[1] = 0;                                          /* status */
+    *(PULONG)payload = req->AuthNeeded;                  /* auth_needed / hsti in */
+    pa = MmGetPhysicalAddress(buf);
+    if (pa.QuadPart == 0) {
+        MmFreeContiguousMemory(buf);
+        resp->Status = (ULONG)STATUS_INSUFFICIENT_RESOURCES;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    lo = (ULONG)(pa.QuadPart & 0xFFFFFFFF);
+    hi = (ULONG)(pa.QuadPart >> 32);
+
+    KdPrint(("PA_SEND: nonce probe, buf PA=0x%llX\n", pa.QuadPart));
+
+    (void)KeWaitForSingleObject(&devExt->CommandLock, Executive, KernelMode, FALSE, NULL);
+
+    /* Recovery must be 0 to start. */
+    v = PaBar0Read(devExt, PSP_PA_MBOX_CMD_REG);
+    if (v & PA_CMDRESP_RECOVERY) {
+        KdPrint(("PA_SEND: mailbox in recovery (0x%08X)\n", v));
+        status = STATUS_DEVICE_BUSY;
+        goto out;
+    }
+
+    /* Mailbox ready? (RESP set = previous command consumed) */
+    v = PaWaitReady(devExt, PSP_PA_MBOX_CMD_REG, &ready);
+    if (!ready) {
+        KdPrint(("PA_SEND: mailbox never ready (0x%08X)\n", v));
+        status = STATUS_DEVICE_BUSY;
+        goto out;
+    }
+
+    /* Address of command-response buffer, then trigger. */
+    PaBar0Write(devExt, PSP_PA_MBOX_LO_REG, lo);
+    PaBar0Write(devExt, PSP_PA_MBOX_HI_REG, hi);
+    PaBar0Write(devExt, PSP_PA_MBOX_CMD_REG, (req->Msg << PA_CMDRESP_CMD_SHIFT));
+
+    v = PaWaitReady(devExt, PSP_PA_MBOX_CMD_REG, &ready);
+    resp->CmdRespRaw = v;
+    if (!ready) {
+        KdPrint(("PA_SEND: response timeout\n"));
+        status = STATUS_TIMEOUT;
+        goto out;
+    }
+
+    /* Ensure the answer belongs to this driver (lo/hi echo). */
+    if (PaBar0Read(devExt, PSP_PA_MBOX_LO_REG) != lo ||
+        PaBar0Read(devExt, PSP_PA_MBOX_HI_REG) != hi) {
+        KdPrint(("PA_SEND: addr echo mismatch (other client?)\n"));
+        status = STATUS_DEVICE_BUSY;
+        goto out;
+    }
+
+    /* Firmware status field; copy result payload per message type. */
+    resp->MailboxStatus = v & PA_CMDRESP_STS_MASK;
+    resp->PayloadSize = hdr[0];
+    if (req->Msg == PSP_PA_MSG_HSTI_QUERY) {
+        resp->Hsti = *(PULONG)payload; /* hsti dword (security bits) */
+    } else {
+        RtlCopyMemory(resp->Nonce, payload + 4, PSP_PA_NONCE_SIZE);
+    }
+    KdPrint(("PA_SEND: done mboxStatus=0x%X payload=%u\n",
+        resp->MailboxStatus, resp->PayloadSize));
+    status = STATUS_SUCCESS;
+
+out:
+    KeReleaseMutex(&devExt->CommandLock, FALSE);
+    MmFreeContiguousMemory(buf);
+    resp->Status = (ULONG)status;
+    return status;
+}
+
+/* --- end pa_v1 platform mailbox send --- */
